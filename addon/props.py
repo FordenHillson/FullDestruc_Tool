@@ -204,9 +204,18 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_inward_ratio: FloatProperty(
         name="Inward Depth",
-        description="Proportion of jagged concrete fracture eating inward from the outer surface (0% = off, 100% = deepest)",
+        description="Default inward scale-down depth for new rough cutters (0% = full size, 100% = shrunk to core)",
         subtype="FACTOR",
-        default=0.35,
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        update=_on_live_setting_changed,
+    )
+    rough_jaggedness: FloatProperty(
+        name="Jaggedness",
+        description="Default jagged fracture amplitude for new rough cutters (0% = smooth, 100% = deep jagged)",
+        subtype="FACTOR",
+        default=0.45,
         min=0.0,
         max=1.0,
         update=_on_live_setting_changed,
@@ -230,7 +239,7 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_scale: FloatProperty(
         name="Noise Scale",
-        description="Chunk frequency of fracture noise (lower = bigger low-poly chunks, higher = finer)",
+        description="Default chunk frequency of fracture noise for new rough cutters",
         default=1.5,
         min=0.2,
         max=15.0,
@@ -247,7 +256,7 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_subdiv: IntProperty(
         name="Detail",
-        description="Low-poly mesh detail level (1 = ultra low-poly ~48 tris, 2 = game-ready ~192 tris, 3 = detailed ~768 tris)",
+        description="Default low-poly mesh detail level for new rough cutters (1-3)",
         default=2,
         min=1,
         max=3,
@@ -740,12 +749,68 @@ class FDT_RebarSettings(bpy.types.PropertyGroup):
     rebar_status: StringProperty(name="Rebar Status", default="")
 
 
-CLASSES = (FDT_SceneSettings, FDT_RebarSettings)
+_LOADING_CUTTER_ROUGH = False
+
+
+def _on_cutter_rough_changed(self, context):
+    if _LOADING_CUTTER_ROUGH:
+        return
+    if context is not None and context.scene is not None:
+        apple_bite.rebuild_session(context)
+
+
+class FDT_CutterRoughSettings(bpy.types.PropertyGroup):
+    """Per-cutter independent Rough Cut settings stored directly on each cutter Object."""
+
+    inward_depth: FloatProperty(
+        name="Inward Depth",
+        description="Uniformly scale the jagged cutter inward toward its center (preserves exact jagged pattern)",
+        subtype="FACTOR",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        update=_on_cutter_rough_changed,
+    )
+    jaggedness: FloatProperty(
+        name="Jaggedness",
+        description="Fracture depth of the jagged edge around this cutter (0% = flat, 100% = deep jagged)",
+        subtype="FACTOR",
+        default=0.45,
+        min=0.0,
+        max=1.0,
+        update=_on_cutter_rough_changed,
+    )
+    noise_scale: FloatProperty(
+        name="Noise Scale",
+        description="Chunk size of fracture noise on this cutter (lower = bigger low-poly chunks)",
+        default=1.5,
+        min=0.2,
+        max=15.0,
+        update=_on_cutter_rough_changed,
+    )
+    detail: IntProperty(
+        name="Detail",
+        description="Low-poly subdivision level on this cutter (1 = ~48 tris, 2 = ~192 tris, 3 = ~768 tris)",
+        default=2,
+        min=1,
+        max=3,
+        update=_on_cutter_rough_changed,
+    )
+    seed: FloatProperty(
+        name="Seed",
+        description="Random seed for fracture variation on this cutter",
+        default=0.0,
+        update=_on_cutter_rough_changed,
+    )
+
+
+CLASSES = (FDT_CutterRoughSettings, FDT_SceneSettings, FDT_RebarSettings)
 
 
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    bpy.types.Object.fdt_rough = PointerProperty(type=FDT_CutterRoughSettings)
     bpy.types.Scene.fdt_settings = PointerProperty(type=FDT_SceneSettings)
     bpy.types.Scene.fdt_rebar_settings = PointerProperty(type=FDT_RebarSettings)
 
@@ -755,5 +820,7 @@ def unregister():
         del bpy.types.Scene.fdt_rebar_settings
     if hasattr(bpy.types.Scene, "fdt_settings"):
         del bpy.types.Scene.fdt_settings
+    if hasattr(bpy.types.Object, "fdt_rough"):
+        del bpy.types.Object.fdt_rough
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

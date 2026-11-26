@@ -14,7 +14,7 @@ GN_MARK_ORIG = "FDT_GN_MarkOrig"
 GN_ROUGH_CUTTER = "FDT_GN_RoughCutter"
 GN_CUT_FACE_UV = "FDT_GN_CutFaceUV"
 
-ROUGH_CUTTER_VERSION = 5
+ROUGH_CUTTER_VERSION = 6
 
 ORIG_ATTR_NAME = "fdt_orig"
 UV_ATTR_NAME = "UVMap0"
@@ -82,18 +82,20 @@ def ensure_mark_orig_group() -> bpy.types.NodeTree:
 
 
 def ensure_rough_cutter_group() -> bpy.types.NodeTree:
-    """Create or return FDT_GN_RoughCutter (v5) for clean low-poly faceted fracture cuts.
+    """Create or return FDT_GN_RoughCutter (v6) for per-cutter low-poly faceted fracture cuts.
 
-    Uses low-poly Subdivide Mesh (Level 1-3) + bold inward-only 4D Noise/Voronoi displacement
-    clamped safely to 42% of cutter thickness (zero self-intersection) + Triangulate (shortest
-    diagonal) + Merge by Distance + Flat Shading. Produces crisp, game-ready low-poly concrete
-    fracture edges with zero Marching-Cubes slivers or cracked cut faces.
+    1. Subdivides cleanly (Level 1-3) and carves jagged concrete facets strictly inward according
+       to `Jaggedness` (4D Noise + 4D Voronoi F1, clamped safely to 38% of min cutter dimension).
+    2. Uniformly scales the jagged shape inward toward its bounding-box center by `Inward Depth`
+       (`scale = 1.0 - Inward Depth * 0.85`), preserving the exact jagged silhouette without
+       flattening or swimming.
+    3. Finishes with shortest-diagonal Triangulate + Merge by Distance + Flat Shading.
     """
     existing = bpy.data.node_groups.get(GN_ROUGH_CUTTER)
     if existing is not None:
         if int(existing.get("fdt_gn_version", 1)) >= ROUGH_CUTTER_VERSION:
             return existing
-        # Upgrade legacy v1-v4 node group in-place so existing modifier links stay intact
+        # Upgrade legacy v1-v5 node group in-place so existing modifier links stay intact
         ng = existing
         ng.links.clear()
         ng.nodes.clear()
@@ -104,13 +106,21 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
 
     ng.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
 
-    s_inward = ng.interface.new_socket(name="Inward Ratio", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_inward.default_value = 0.35
+    s_inward = ng.interface.new_socket(name="Inward Depth", in_out="INPUT", socket_type="NodeSocketFloat")
+    s_inward.default_value = 0.0
     if hasattr(s_inward, "min_value"):
         s_inward.min_value = 0.0
         s_inward.max_value = 1.0
     if hasattr(s_inward, "subtype"):
         s_inward.subtype = "FACTOR"
+
+    s_jagged = ng.interface.new_socket(name="Jaggedness", in_out="INPUT", socket_type="NodeSocketFloat")
+    s_jagged.default_value = 0.45
+    if hasattr(s_jagged, "min_value"):
+        s_jagged.min_value = 0.0
+        s_jagged.max_value = 1.0
+    if hasattr(s_jagged, "subtype"):
+        s_jagged.subtype = "FACTOR"
 
     s_scale = ng.interface.new_socket(name="Noise Scale", in_out="INPUT", socket_type="NodeSocketFloat")
     s_scale.default_value = 1.5
@@ -135,45 +145,57 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     n_in = nodes.new("NodeGroupInput")
     n_in.location = (-1400, 0)
 
-    # 1. Compute safe max inward depth = 0.42 * min(bbox_size) so opposite faces never cross
+    # 1. Bounding Box -> center (for inward scaling) & safe max jagged amplitude (0.38 * min_dim)
     n_bbox = nodes.new("GeometryNodeBoundBox")
-    n_bbox.location = (-1140, 320)
+    n_bbox.location = (-1140, 360)
     links.new(n_in.outputs["Geometry"], n_bbox.inputs["Geometry"])
 
+    n_center_sum = nodes.new("ShaderNodeVectorMath")
+    n_center_sum.location = (-920, 480)
+    n_center_sum.operation = "ADD"
+    links.new(n_bbox.outputs["Min"], n_center_sum.inputs[0])
+    links.new(n_bbox.outputs["Max"], n_center_sum.inputs[1])
+
+    n_center = nodes.new("ShaderNodeVectorMath")
+    n_center.location = (-720, 480)
+    n_center.operation = "SCALE"
+    n_center.inputs["Scale"].default_value = 0.5
+    links.new(n_center_sum.outputs["Vector"], n_center.inputs[0])
+
     n_size = nodes.new("ShaderNodeVectorMath")
-    n_size.location = (-920, 320)
+    n_size.location = (-920, 300)
     n_size.operation = "SUBTRACT"
     links.new(n_bbox.outputs["Max"], n_size.inputs[0])
     links.new(n_bbox.outputs["Min"], n_size.inputs[1])
 
     n_sep_sz = nodes.new("ShaderNodeSeparateXYZ")
-    n_sep_sz.location = (-720, 320)
+    n_sep_sz.location = (-720, 300)
     links.new(n_size.outputs["Vector"], n_sep_sz.inputs["Vector"])
 
     n_min_xy = nodes.new("ShaderNodeMath")
-    n_min_xy.location = (-520, 360)
+    n_min_xy.location = (-520, 340)
     n_min_xy.operation = "MINIMUM"
     links.new(n_sep_sz.outputs["X"], n_min_xy.inputs[0])
     links.new(n_sep_sz.outputs["Y"], n_min_xy.inputs[1])
 
     n_min_xyz = nodes.new("ShaderNodeMath")
-    n_min_xyz.location = (-340, 320)
+    n_min_xyz.location = (-340, 300)
     n_min_xyz.operation = "MINIMUM"
     links.new(n_min_xy.outputs["Value"], n_min_xyz.inputs[0])
     links.new(n_sep_sz.outputs["Z"], n_min_xyz.inputs[1])
 
-    n_max_depth = nodes.new("ShaderNodeMath")
-    n_max_depth.location = (-140, 320)
-    n_max_depth.operation = "MULTIPLY"
-    n_max_depth.inputs[1].default_value = 0.42
-    links.new(n_min_xyz.outputs["Value"], n_max_depth.inputs[0])
+    n_max_amp = nodes.new("ShaderNodeMath")
+    n_max_amp.location = (-140, 300)
+    n_max_amp.operation = "MULTIPLY"
+    n_max_amp.inputs[1].default_value = 0.38
+    links.new(n_min_xyz.outputs["Value"], n_max_amp.inputs[0])
 
-    # depth = max_depth * Inward Ratio (single main control for both depth & jaggedness!)
-    n_depth = nodes.new("ShaderNodeMath")
-    n_depth.location = (60, 260)
-    n_depth.operation = "MULTIPLY"
-    links.new(n_max_depth.outputs["Value"], n_depth.inputs[0])
-    links.new(n_in.outputs["Inward Ratio"], n_depth.inputs[1])
+    # jagged_amp = 0.38 * min_dim * Jaggedness
+    n_jagged_amp = nodes.new("ShaderNodeMath")
+    n_jagged_amp.location = (60, 260)
+    n_jagged_amp.operation = "MULTIPLY"
+    links.new(n_max_amp.outputs["Value"], n_jagged_amp.inputs[0])
+    links.new(n_in.outputs["Jaggedness"], n_jagged_amp.inputs[1])
 
     # 2. Low-poly clean subdivision (Level 1 = 48 tris, Level 2 = 192 tris, Level 3 = 768 tris on a box)
     n_subdiv = nodes.new("GeometryNodeSubdivideMesh")
@@ -217,7 +239,6 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     links.new(n_vor.outputs["Distance"], n_blend.inputs[0])
     links.new(n_n_w.outputs["Value"], n_blend.inputs[2])
 
-    # Stretch contrast so black stays at outer boundary (0.0) and white carves full depth (1.0)
     n_contrast = nodes.new("ShaderNodeMapRange")
     n_contrast.location = (-40, -280)
     n_contrast.data_type = "FLOAT"
@@ -229,67 +250,87 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     n_contrast.inputs["To Max"].default_value = 1.0
     links.new(n_blend.outputs["Value"], n_contrast.inputs["Value"])
 
-    # 4. Strictly inward displacement along -Normal (never bulges outside cutter bounds)
+    # 4. Inward jagged fracture displacement along -Normal
     n_disp = nodes.new("ShaderNodeMath")
-    n_disp.location = (240, -140)
+    n_disp.location = (220, -140)
     n_disp.operation = "MULTIPLY"
     links.new(n_contrast.outputs["Result"], n_disp.inputs[0])
-    links.new(n_depth.outputs["Value"], n_disp.inputs[1])
+    links.new(n_jagged_amp.outputs["Value"], n_disp.inputs[1])
 
     n_neg = nodes.new("ShaderNodeMath")
-    n_neg.location = (420, -140)
+    n_neg.location = (400, -140)
     n_neg.operation = "MULTIPLY"
     n_neg.inputs[1].default_value = -1.0
     links.new(n_disp.outputs["Value"], n_neg.inputs[0])
 
     n_norm = nodes.new("GeometryNodeInputNormal")
-    n_norm.location = (420, -320)
+    n_norm.location = (400, -320)
 
     n_vec_scale = nodes.new("ShaderNodeVectorMath")
-    n_vec_scale.location = (620, -200)
+    n_vec_scale.location = (580, -200)
     n_vec_scale.operation = "SCALE"
     links.new(n_norm.outputs["Normal"], n_vec_scale.inputs[0])
     links.new(n_neg.outputs["Value"], n_vec_scale.inputs["Scale"])
 
-    n_set_pos = nodes.new("GeometryNodeSetPosition")
-    n_set_pos.location = (840, 80)
-    links.new(n_subdiv.outputs["Mesh"], n_set_pos.inputs["Geometry"])
-    links.new(n_vec_scale.outputs["Vector"], n_set_pos.inputs["Offset"])
+    n_set_jagged = nodes.new("GeometryNodeSetPosition")
+    n_set_jagged.location = (780, 80)
+    links.new(n_subdiv.outputs["Mesh"], n_set_jagged.inputs["Geometry"])
+    links.new(n_vec_scale.outputs["Vector"], n_set_jagged.inputs["Offset"])
 
-    # 5. Clean planar low-poly triangulation + weld degenerate slivers + crisp flat normals
+    # 5. Inward Depth: uniform scale around bbox center (preserves exact jagged silhouette!)
+    # scale_factor = 1.0 - Inward Depth * 0.85
+    n_inward_scale = nodes.new("ShaderNodeMath")
+    n_inward_scale.location = (580, 360)
+    n_inward_scale.operation = "MULTIPLY_ADD"
+    n_inward_scale.inputs[1].default_value = -0.85
+    n_inward_scale.inputs[2].default_value = 1.0
+    links.new(n_in.outputs["Inward Depth"], n_inward_scale.inputs[0])
+
+    n_pos2 = nodes.new("GeometryNodeInputPosition")
+    n_pos2.location = (580, 520)
+
+    n_rel = nodes.new("ShaderNodeVectorMath")
+    n_rel.location = (780, 480)
+    n_rel.operation = "SUBTRACT"
+    links.new(n_pos2.outputs["Position"], n_rel.inputs[0])
+    links.new(n_center.outputs["Vector"], n_rel.inputs[1])
+
+    n_rel_scaled = nodes.new("ShaderNodeVectorMath")
+    n_rel_scaled.location = (960, 440)
+    n_rel_scaled.operation = "SCALE"
+    links.new(n_rel.outputs["Vector"], n_rel_scaled.inputs[0])
+    links.new(n_inward_scale.outputs["Value"], n_rel_scaled.inputs["Scale"])
+
+    n_pos_final = nodes.new("ShaderNodeVectorMath")
+    n_pos_final.location = (1140, 440)
+    n_pos_final.operation = "ADD"
+    links.new(n_rel_scaled.outputs["Vector"], n_pos_final.inputs[0])
+    links.new(n_center.outputs["Vector"], n_pos_final.inputs[1])
+
+    n_set_scale = nodes.new("GeometryNodeSetPosition")
+    n_set_scale.location = (1140, 80)
+    links.new(n_set_jagged.outputs["Geometry"], n_set_scale.inputs["Geometry"])
+    links.new(n_pos_final.outputs["Vector"], n_set_scale.inputs["Position"])
+
+    # 6. Clean planar low-poly triangulation + weld degenerate slivers + crisp flat normals
     n_tri = nodes.new("GeometryNodeTriangulate")
-    n_tri.location = (1060, 80)
+    n_tri.location = (1360, 80)
     _set_node_enum(n_tri, "quad_method", "Quad Method", "SHORTEST_DIAGONAL")
-    links.new(n_set_pos.outputs["Geometry"], n_tri.inputs["Mesh"])
+    links.new(n_set_scale.outputs["Geometry"], n_tri.inputs["Mesh"])
 
     n_merge = nodes.new("GeometryNodeMergeByDistance")
-    n_merge.location = (1280, 80)
-    n_merge.inputs["Distance"].default_value = 0.015
+    n_merge.location = (1580, 80)
+    n_merge.inputs["Distance"].default_value = 0.01
     links.new(n_tri.outputs["Mesh"], n_merge.inputs["Geometry"])
 
     n_flat = nodes.new("GeometryNodeSetShadeSmooth")
-    n_flat.location = (1500, 80)
+    n_flat.location = (1800, 80)
     n_flat.inputs["Shade Smooth"].default_value = False
     links.new(n_merge.outputs["Geometry"], n_flat.inputs["Geometry"])
 
-    # 6. Clean bypass when Inward Ratio == 0.0
-    n_ratio_on = nodes.new("FunctionNodeCompare")
-    n_ratio_on.location = (1500, -140)
-    n_ratio_on.data_type = "FLOAT"
-    n_ratio_on.operation = "GREATER_THAN"
-    n_ratio_on.inputs["B"].default_value = 0.001
-    links.new(n_in.outputs["Inward Ratio"], n_ratio_on.inputs["A"])
-
-    n_sw = nodes.new("GeometryNodeSwitch")
-    n_sw.location = (1740, 80)
-    n_sw.input_type = "GEOMETRY"
-    links.new(n_ratio_on.outputs["Result"], n_sw.inputs["Switch"])
-    links.new(n_in.outputs["Geometry"], n_sw.inputs["False"])
-    links.new(n_flat.outputs["Geometry"], n_sw.inputs["True"])
-
     n_out = nodes.new("NodeGroupOutput")
-    n_out.location = (1960, 80)
-    links.new(n_sw.outputs["Output"], n_out.inputs["Geometry"])
+    n_out.location = (2020, 80)
+    links.new(n_flat.outputs["Geometry"], n_out.inputs["Geometry"])
 
     ng["fdt_gn_version"] = ROUGH_CUTTER_VERSION
     return ng

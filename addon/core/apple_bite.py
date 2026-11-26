@@ -418,6 +418,66 @@ def assign_cut_material_to_objects(
     return True, f"ใส่ Material '{material.name}' ให้หน้าตัด {total_faces} หน้า ({updated_objs} ชิ้น) แล้ว", updated_objs
 
 
+def init_cutter_rough_settings(
+    cutter: bpy.types.Object,
+    scene: bpy.types.Scene | None,
+    ref_cutter: bpy.types.Object | None = None,
+) -> None:
+    """Initialize a newly created cutter's per-object fdt_rough from ref_cutter or scene defaults."""
+    cr = getattr(cutter, "fdt_rough", None)
+    if cr is None:
+        return
+    from .. import props as _props
+
+    prev = getattr(_props, "_LOADING_CUTTER_ROUGH", False)
+    _props._LOADING_CUTTER_ROUGH = True
+    try:
+        ref_r = getattr(ref_cutter, "fdt_rough", None) if ref_cutter is not None else None
+        if ref_r is not None:
+            cr.inward_depth = float(ref_r.inward_depth)
+            cr.jaggedness = float(ref_r.jaggedness)
+            cr.noise_scale = float(ref_r.noise_scale)
+            cr.detail = max(1, min(3, int(ref_r.detail)))
+            cr.seed = float(ref_r.seed)
+            return
+        settings = _get_settings(scene) if scene is not None else None
+        if settings is not None:
+            cr.inward_depth = float(getattr(settings, "rough_inward_ratio", 0.0))
+            cr.jaggedness = float(getattr(settings, "rough_jaggedness", 0.45))
+            cr.noise_scale = float(getattr(settings, "rough_scale", 1.5))
+            cr.detail = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
+            cr.seed = float(getattr(settings, "rough_seed", 0.0))
+    finally:
+        _props._LOADING_CUTTER_ROUGH = prev
+
+
+def get_active_rough_cutter(
+    context: bpy.types.Context | None,
+    session: AppleBiteSession | None,
+) -> tuple[bpy.types.Object | None, bool]:
+    """Return (cutter_obj, is_rough) for the active/selected cutter in the session (or first rough cutter)."""
+    if session is None or not session.cutters:
+        return None, False
+    by_name = {c.name: c for c in session.cutters}
+
+    active = getattr(context, "active_object", None) if context is not None else None
+    if active is not None and active.name in by_name:
+        return active, bool(by_name[active.name].rough)
+
+    selected = list(getattr(context, "selected_objects", []) or []) if context is not None else []
+    for obj in selected:
+        if obj is not None and obj.name in by_name:
+            return obj, bool(by_name[obj.name].rough)
+
+    # Fallback: first rough cutter in the session
+    for entry in session.cutters:
+        if entry.rough:
+            obj = bpy.data.objects.get(entry.name)
+            if obj is not None:
+                return obj, True
+    return None, False
+
+
 def _ensure_rough_modifier(
     cutter: bpy.types.Object,
     scene: bpy.types.Scene,
@@ -439,12 +499,27 @@ def _ensure_rough_modifier(
         mod = cutter.modifiers.new(name=mod_name, type="NODES")
     mod.node_group = ensure_rough_cutter_group()
 
-    if settings is not None:
-        detail_level = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
-        set_modifier_socket(mod, "Inward Ratio", float(getattr(settings, "rough_inward_ratio", 0.35)))
-        set_modifier_socket(mod, "Noise Scale", float(settings.rough_scale))
-        set_modifier_socket(mod, "Detail", detail_level)
-        set_modifier_socket(mod, "Seed", float(settings.rough_seed))
+    cr = getattr(cutter, "fdt_rough", None)
+    if cr is not None:
+        inward = float(cr.inward_depth)
+        jagged = float(cr.jaggedness)
+        scale = float(cr.noise_scale)
+        detail = max(1, min(3, int(cr.detail)))
+        seed = float(cr.seed)
+    elif settings is not None:
+        inward = float(getattr(settings, "rough_inward_ratio", 0.0))
+        jagged = float(getattr(settings, "rough_jaggedness", 0.45))
+        scale = float(getattr(settings, "rough_scale", 1.5))
+        detail = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
+        seed = float(getattr(settings, "rough_seed", 0.0))
+    else:
+        return
+
+    set_modifier_socket(mod, "Inward Depth", inward)
+    set_modifier_socket(mod, "Jaggedness", jagged)
+    set_modifier_socket(mod, "Noise Scale", scale)
+    set_modifier_socket(mod, "Detail", detail)
+    set_modifier_socket(mod, "Seed", seed)
 
 
 def _ensure_mark_and_uv_stack(
@@ -991,6 +1066,7 @@ def add_box_cutter(
     cutter[CUTTER_PROP] = True
     cutter[CUTTER_ZONE_PROP] = zone_id
     cutter[CUTTER_ROUGH_PROP] = default_rough
+    init_cutter_rough_settings(cutter, scene)
     cutter[OBJ_SESSION_ID_PROP] = session.session_id
     apply_cutter_visuals(cutter, zone_id, muted=False)
 
@@ -1052,6 +1128,7 @@ def add_mesh_data_cutter(
     cutter[CUTTER_PROP] = True
     cutter[CUTTER_ZONE_PROP] = zone_id
     cutter[CUTTER_ROUGH_PROP] = default_rough
+    init_cutter_rough_settings(cutter, scene)
     cutter[OBJ_SESSION_ID_PROP] = session.session_id
     apply_cutter_visuals(cutter, zone_id, muted=False)
 
@@ -1440,6 +1517,7 @@ def add_adjacent_box_cutter(
     cutter[CUTTER_PROP] = True
     cutter[CUTTER_ZONE_PROP] = zone_id
     cutter[CUTTER_ROUGH_PROP] = default_rough
+    init_cutter_rough_settings(cutter, scene, ref_cutter=ref_cutter)
     cutter[OBJ_SESSION_ID_PROP] = session.session_id
     apply_cutter_visuals(cutter, zone_id, muted=False)
 
@@ -1483,6 +1561,7 @@ def add_custom_mesh_cutters(
         obj[CUTTER_PROP] = True
         obj[CUTTER_ZONE_PROP] = zone_id
         obj[CUTTER_ROUGH_PROP] = default_rough
+        init_cutter_rough_settings(obj, scene)
         obj[OBJ_SESSION_ID_PROP] = session.session_id
         apply_cutter_visuals(obj, zone_id, muted=False)
         session.cutters.insert(0, CutterEntry(name=obj.name, zone=zone_id, muted=False, rough=default_rough))

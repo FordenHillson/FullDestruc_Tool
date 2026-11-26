@@ -596,25 +596,49 @@ class FullDestrucWindow(QtWidgets.QWidget):
         rp_layout.setContentsMargins(8, 6, 8, 6)
         rp_layout.setSpacing(5)
 
-        # Inward Depth (0-100%)
+        self.lbl_rough_target = QtWidgets.QLabel("Cutter: -")
+        self.lbl_rough_target.setStyleSheet("color: #c4b5fd; font-weight: bold; font-size: 11px;")
+        rp_layout.addRow(self.lbl_rough_target)
+
+        # Inward Depth (0-100%, uniform scale inward preserving jagged pattern)
         inward_row = QtWidgets.QHBoxLayout()
         inward_row.setContentsMargins(0, 0, 0, 0)
         inward_row.setSpacing(6)
         self.sld_rough_inward = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sld_rough_inward.setRange(0, 100)
-        self.sld_rough_inward.setValue(35)
+        self.sld_rough_inward.setValue(0)
         self.spn_rough_inward = QtWidgets.QDoubleSpinBox()
         self.spn_rough_inward.setRange(0.0, 100.0)
         self.spn_rough_inward.setSingleStep(5.0)
         self.spn_rough_inward.setDecimals(0)
         self.spn_rough_inward.setSuffix("%")
-        self.spn_rough_inward.setValue(35.0)
+        self.spn_rough_inward.setValue(0.0)
         self.spn_rough_inward.setFixedWidth(64)
         self.sld_rough_inward.valueChanged.connect(self._on_rough_inward_slider_changed)
         self.spn_rough_inward.valueChanged.connect(self._on_rough_inward_spin_changed)
         inward_row.addWidget(self.sld_rough_inward, 1)
         inward_row.addWidget(self.spn_rough_inward)
         rp_layout.addRow("Inward Depth:", inward_row)
+
+        # Jaggedness (0-100%, fracture depth around edges)
+        jagged_row = QtWidgets.QHBoxLayout()
+        jagged_row.setContentsMargins(0, 0, 0, 0)
+        jagged_row.setSpacing(6)
+        self.sld_rough_jagged = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sld_rough_jagged.setRange(0, 100)
+        self.sld_rough_jagged.setValue(45)
+        self.spn_rough_jagged = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_jagged.setRange(0.0, 100.0)
+        self.spn_rough_jagged.setSingleStep(5.0)
+        self.spn_rough_jagged.setDecimals(0)
+        self.spn_rough_jagged.setSuffix("%")
+        self.spn_rough_jagged.setValue(45.0)
+        self.spn_rough_jagged.setFixedWidth(64)
+        self.sld_rough_jagged.valueChanged.connect(self._on_rough_jagged_slider_changed)
+        self.spn_rough_jagged.valueChanged.connect(self._on_rough_jagged_spin_changed)
+        jagged_row.addWidget(self.sld_rough_jagged, 1)
+        jagged_row.addWidget(self.spn_rough_jagged)
+        rp_layout.addRow("Jaggedness:", jagged_row)
 
         # Noise Scale (lower = bigger low-poly chunks)
         self.spn_rough_scale = QtWidgets.QDoubleSpinBox()
@@ -623,7 +647,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.spn_rough_scale.setDecimals(2)
         self.spn_rough_scale.setValue(1.5)
         self.spn_rough_scale.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("rough_scale", float(v))
+            lambda v: self._on_rough_param_changed("noise_scale", float(v))
         )
         rp_layout.addRow("Noise Scale:", self.spn_rough_scale)
 
@@ -632,7 +656,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.spn_rough_subdiv.setRange(1, 3)
         self.spn_rough_subdiv.setValue(2)
         self.spn_rough_subdiv.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("rough_subdiv", int(v))
+            lambda v: self._on_rough_param_changed("detail", int(v))
         )
         rp_layout.addRow("Detail (1-3):", self.spn_rough_subdiv)
 
@@ -643,7 +667,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.spn_rough_seed.setDecimals(2)
         self.spn_rough_seed.setValue(0.0)
         self.spn_rough_seed.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("rough_seed", float(v))
+            lambda v: self._on_rough_param_changed("seed", float(v))
         )
         rp_layout.addRow("Seed:", self.spn_rough_seed)
 
@@ -743,17 +767,38 @@ class FullDestrucWindow(QtWidgets.QWidget):
         _tag_all_view3d_redraw()
         self.refresh_from_blender()
 
+    _ROUGH_SCENE_FALLBACK = {
+        "inward_depth": "rough_inward_ratio",
+        "jaggedness": "rough_jaggedness",
+        "noise_scale": "rough_scale",
+        "detail": "rough_subdiv",
+        "seed": "rough_seed",
+    }
+
     def _on_rough_param_changed(self, prop_name: str, value) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
-            if settings is not None and hasattr(settings, prop_name):
-                cur = getattr(settings, prop_name)
+            ctx = bpy.context
+            scene = ctx.scene
+            session = load_session(scene)
+            target_cutter, _is_rough = apple_bite.get_active_rough_cutter(ctx, session)
+            cr = getattr(target_cutter, "fdt_rough", None) if target_cutter is not None else None
+            if cr is not None and hasattr(cr, prop_name):
+                cur = getattr(cr, prop_name)
                 if isinstance(value, int) and not isinstance(value, bool):
                     if int(cur) != value:
-                        setattr(settings, prop_name, value)
+                        setattr(cr, prop_name, value)
                 elif abs(float(cur) - float(value)) > 1e-6:
-                    setattr(settings, prop_name, float(value))
+                    setattr(cr, prop_name, float(value))
+            else:
+                settings = getattr(scene, "fdt_settings", None)
+                scene_prop = self._ROUGH_SCENE_FALLBACK.get(prop_name, prop_name)
+                if settings is not None and hasattr(settings, scene_prop):
+                    cur = getattr(settings, scene_prop)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        if int(cur) != value:
+                            setattr(settings, scene_prop, value)
+                    elif abs(float(cur) - float(value)) > 1e-6:
+                        setattr(settings, scene_prop, float(value))
         _tag_all_view3d_redraw()
 
     def _on_rough_inward_slider_changed(self, pct: int) -> None:
@@ -761,7 +806,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
             self.spn_rough_inward.blockSignals(True)
             self.spn_rough_inward.setValue(float(pct))
             self.spn_rough_inward.blockSignals(False)
-        self._on_rough_param_changed("rough_inward_ratio", float(pct) / 100.0)
+        self._on_rough_param_changed("inward_depth", float(pct) / 100.0)
 
     def _on_rough_inward_spin_changed(self, pct: float) -> None:
         ipct = int(round(pct))
@@ -769,7 +814,22 @@ class FullDestrucWindow(QtWidgets.QWidget):
             self.sld_rough_inward.blockSignals(True)
             self.sld_rough_inward.setValue(ipct)
             self.sld_rough_inward.blockSignals(False)
-        self._on_rough_param_changed("rough_inward_ratio", float(pct) / 100.0)
+        self._on_rough_param_changed("inward_depth", float(pct) / 100.0)
+
+    def _on_rough_jagged_slider_changed(self, pct: int) -> None:
+        if abs(self.spn_rough_jagged.value() - float(pct)) > 1e-6:
+            self.spn_rough_jagged.blockSignals(True)
+            self.spn_rough_jagged.setValue(float(pct))
+            self.spn_rough_jagged.blockSignals(False)
+        self._on_rough_param_changed("jaggedness", float(pct) / 100.0)
+
+    def _on_rough_jagged_spin_changed(self, pct: float) -> None:
+        ipct = int(round(pct))
+        if self.sld_rough_jagged.value() != ipct:
+            self.sld_rough_jagged.blockSignals(True)
+            self.sld_rough_jagged.setValue(ipct)
+            self.sld_rough_jagged.blockSignals(False)
+        self._on_rough_param_changed("jaggedness", float(pct) / 100.0)
 
     def _on_auto_fill_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
@@ -1109,7 +1169,28 @@ class FullDestrucWindow(QtWidgets.QWidget):
                 if self.rough_params_box.isVisible() != any_rough:
                     self.rough_params_box.setVisible(any_rough)
                 if any_rough:
-                    inward_pct = float(getattr(settings, "rough_inward_ratio", 0.35)) * 100.0
+                    target_cutter, target_is_rough = apple_bite.get_active_rough_cutter(bpy.context, session)
+                    cr = getattr(target_cutter, "fdt_rough", None) if target_cutter is not None else None
+                    if cr is not None:
+                        status = "" if target_is_rough else " (OFF)"
+                        lbl_txt = f"Cutter: {target_cutter.name}{status}"
+                        inward_val = float(cr.inward_depth)
+                        jagged_val = float(cr.jaggedness)
+                        r_scl = float(cr.noise_scale)
+                        r_sub = max(1, min(3, int(cr.detail)))
+                        r_seed = float(cr.seed)
+                    else:
+                        lbl_txt = "Default Rough (New Cutters)"
+                        inward_val = float(getattr(settings, "rough_inward_ratio", 0.0))
+                        jagged_val = float(getattr(settings, "rough_jaggedness", 0.45))
+                        r_scl = float(getattr(settings, "rough_scale", 1.5))
+                        r_sub = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
+                        r_seed = float(getattr(settings, "rough_seed", 0.0))
+
+                    if self.lbl_rough_target.text() != lbl_txt:
+                        self.lbl_rough_target.setText(lbl_txt)
+
+                    inward_pct = inward_val * 100.0
                     inward_ipct = int(round(inward_pct))
                     if not self.sld_rough_inward.isSliderDown() and self.sld_rough_inward.value() != inward_ipct:
                         self.sld_rough_inward.blockSignals(True)
@@ -1120,19 +1201,27 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         self.spn_rough_inward.setValue(inward_pct)
                         self.spn_rough_inward.blockSignals(False)
 
-                    r_scl = float(getattr(settings, "rough_scale", 1.5))
+                    jagged_pct = jagged_val * 100.0
+                    jagged_ipct = int(round(jagged_pct))
+                    if not self.sld_rough_jagged.isSliderDown() and self.sld_rough_jagged.value() != jagged_ipct:
+                        self.sld_rough_jagged.blockSignals(True)
+                        self.sld_rough_jagged.setValue(jagged_ipct)
+                        self.sld_rough_jagged.blockSignals(False)
+                    if not self.spn_rough_jagged.hasFocus() and abs(self.spn_rough_jagged.value() - jagged_pct) > 0.5:
+                        self.spn_rough_jagged.blockSignals(True)
+                        self.spn_rough_jagged.setValue(jagged_pct)
+                        self.spn_rough_jagged.blockSignals(False)
+
                     if not self.spn_rough_scale.hasFocus() and abs(self.spn_rough_scale.value() - r_scl) > 1e-4:
                         self.spn_rough_scale.blockSignals(True)
                         self.spn_rough_scale.setValue(r_scl)
                         self.spn_rough_scale.blockSignals(False)
 
-                    r_sub = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
                     if not self.spn_rough_subdiv.hasFocus() and self.spn_rough_subdiv.value() != r_sub:
                         self.spn_rough_subdiv.blockSignals(True)
                         self.spn_rough_subdiv.setValue(r_sub)
                         self.spn_rough_subdiv.blockSignals(False)
 
-                    r_seed = float(getattr(settings, "rough_seed", 0.0))
                     if not self.spn_rough_seed.hasFocus() and abs(self.spn_rough_seed.value() - r_seed) > 1e-4:
                         self.spn_rough_seed.blockSignals(True)
                         self.spn_rough_seed.setValue(r_seed)

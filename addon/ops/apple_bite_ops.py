@@ -185,19 +185,21 @@ def _build_zone_grid_cache(context, session, shader) -> list[tuple[object, str, 
         if c_obj is None:
             continue
         tok = live_sync._cutter_state_token(c_obj)
-        cutter_sig.append((entry.name, entry.zone, entry.muted, entry.rough, tok))
-    settings = getattr(context.scene, "fdt_settings", None)
-    rough_sig = (
-        (
-            bool(settings.enable_rough),
-            round(float(getattr(settings, "rough_inward_ratio", 0.35)), 4),
-            round(float(settings.rough_scale), 4),
-            int(getattr(settings, "rough_subdiv", 2)),
-            round(float(settings.rough_seed), 4),
+        cr = getattr(c_obj, "fdt_rough", None)
+        cr_sig = (
+            (
+                round(float(cr.inward_depth), 4),
+                round(float(cr.jaggedness), 4),
+                round(float(cr.noise_scale), 4),
+                int(cr.detail),
+                round(float(cr.seed), 4),
+            )
+            if cr is not None
+            else ()
         )
-        if settings is not None
-        else ()
-    )
+        cutter_sig.append((entry.name, entry.zone, entry.muted, entry.rough, cr_sig, tok))
+    settings = getattr(context.scene, "fdt_settings", None)
+    rough_sig = (bool(settings.enable_rough),) if settings is not None else ()
     piece_names = tuple(o.name for o in pieces_col.objects)
     sig = (session.session_id, _zone_grid_deps_rev, piece_names, rough_sig, tuple(cutter_sig))
 

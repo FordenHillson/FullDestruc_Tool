@@ -635,59 +635,72 @@ def test_20_edge_band_inward_rough_cut() -> None:
     ok, msg, _ = apple_bite.enter_session(ctx, target_objects=[wall])
     assert ok, msg
 
-    # 2x2x2 cube centered at origin -> local bounds [-1, +1] on every axis
-    ok, msg, cutter = apple_bite.add_box_cutter(ctx, location=(0, 0, 0), size=2.0, zone="A")
-    assert ok and cutter is not None, msg
+    # Two independent 2x2x2 box cutters
+    ok, msg, c1 = apple_bite.add_box_cutter(ctx, location=(-1.5, 0, 0), size=2.0, zone="A")
+    assert ok and c1 is not None, msg
+    ok, msg, c2 = apple_bite.add_box_cutter(ctx, location=(1.5, 0, 0), size=2.0, zone="B")
+    assert ok and c2 is not None, msg
 
-    settings = ctx.scene.fdt_settings
-    settings.rough_inward_ratio = 0.35
-    settings.rough_scale = 1.5
-    settings.rough_subdiv = 2
-    settings.rough_seed = 1.0
+    ok, r1 = apple_bite.toggle_cutter_rough(ctx, c1.name)
+    assert ok and r1 is True
+    ok, r2 = apple_bite.toggle_cutter_rough(ctx, c2.name)
+    assert ok and r2 is True
 
-    ok, is_rough = apple_bite.toggle_cutter_rough(ctx, cutter.name)
-    assert ok and is_rough is True
+    # Configure c1 and c2 with different per-cutter rough settings
+    c1.fdt_rough.inward_depth = 0.0
+    c1.fdt_rough.jaggedness = 0.45
+    c1.fdt_rough.noise_scale = 1.5
+    c1.fdt_rough.detail = 2
+    c1.fdt_rough.seed = 1.0
 
-    mod = cutter.modifiers.get("FDT_RoughCutter")
-    assert mod is not None and mod.node_group is not None
-    assert int(mod.node_group.get("fdt_gn_version", 1)) == geonodes.ROUGH_CUTTER_VERSION
+    c2.fdt_rough.inward_depth = 0.5
+    c2.fdt_rough.jaggedness = 0.65
+    c2.fdt_rough.noise_scale = 2.5
+    c2.fdt_rough.detail = 1
+    c2.fdt_rough.seed = 7.0
+
+    apple_bite.rebuild_session(ctx)
+
+    mod1 = c1.modifiers.get("FDT_RoughCutter")
+    assert mod1 is not None and mod1.node_group is not None
+    assert int(mod1.node_group.get("fdt_gn_version", 1)) == geonodes.ROUGH_CUTTER_VERSION
 
     input_names = {
         item.name
-        for item in mod.node_group.interface.items_tree
+        for item in mod1.node_group.interface.items_tree
         if item.item_type == "SOCKET" and item.in_out == "INPUT"
     }
-    for expected in ("Geometry", "Inward Ratio", "Noise Scale", "Detail", "Seed"):
+    for expected in ("Geometry", "Inward Depth", "Jaggedness", "Noise Scale", "Detail", "Seed"):
         assert expected in input_names, f"Missing socket: {expected}"
 
-    def _eval_local_mesh():
+    def _eval_local_mesh(obj):
         deps = ctx.evaluated_depsgraph_get()
-        eval_obj = cutter.evaluated_get(deps)
+        eval_obj = obj.evaluated_get(deps)
         mesh = eval_obj.to_mesh()
         try:
             return [tuple(v.co) for v in mesh.vertices], len(mesh.polygons)
         finally:
             eval_obj.to_mesh_clear()
 
-    # 1. True Low-Poly budget: Detail=2 box cutter stays <= 220 clean triangles (vs thousands in VolumeToMesh)
-    verts, poly_count = _eval_local_mesh()
-    assert 24 <= poly_count <= 220, f"Expected low-poly cutter (24..220 polys), got {poly_count}"
+    # 1. Per-cutter independence: c1 (Detail=2, full size) vs c2 (Detail=1, scaled inward)
+    v1_0, p1 = _eval_local_mesh(c1)
+    v2, p2 = _eval_local_mesh(c2)
+    assert 24 <= p1 <= 220, f"Expected low-poly Detail=2 on c1, got {p1}"
+    assert 12 <= p2 <= 60, f"Expected ultra low-poly Detail=1 on c2, got {p2}"
+    max_abs_1 = max(max(abs(x), abs(y), abs(z)) for x, y, z in v1_0)
+    max_abs_2 = max(max(abs(x), abs(y), abs(z)) for x, y, z in v2)
+    assert max_abs_1 <= 1.0005 and max_abs_1 > 0.85, f"c1 at Inward Depth=0 should span full box: {max_abs_1:.4f}"
+    assert max_abs_2 < 0.65, f"c2 at Inward Depth=0.5 should scale inward (~0.575): {max_abs_2:.4f}"
 
-    # 2. Inward-only guarantee: no vertex may bulge outside [-1.0, +1.0]
-    max_abs = max(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
-    assert max_abs <= 1.0005, f"Rough cutter bulged outward beyond box bounds: max_abs={max_abs:.5f}"
-
-    # 3. Bold inward fracture without penetrating core
-    min_max_axis = min(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
-    carved_depth = 1.0 - min_max_axis
-    assert carved_depth > 0.05, f"Expected noticeable inward fracture depth, got {carved_depth:.4f}"
-    assert min_max_axis >= 0.50, f"Fracture penetrated too deep into core: min_max_axis={min_max_axis:.4f}"
-
-    # 4. Inward Ratio = 0.0 -> bypasses cleanly (original 8 cube verts)
-    settings.rough_inward_ratio = 0.0
+    # 2. Inward Depth scales c1 uniformly inward while preserving jagged shape (ratio ~ 1 - 0.5*0.85 = 0.575)
+    c1.fdt_rough.inward_depth = 0.5
     apple_bite.rebuild_session(ctx)
-    verts_zero, _ = _eval_local_mesh()
-    assert len(verts_zero) == 8, f"Expected untouched 8-vert cube at Inward Ratio=0.0, got {len(verts_zero)}"
+    v1_half, _ = _eval_local_mesh(c1)
+    max_abs_1_half = max(max(abs(x), abs(y), abs(z)) for x, y, z in v1_half)
+    expected_scale = 1.0 - 0.5 * 0.85
+    assert abs((max_abs_1_half / max_abs_1) - expected_scale) < 0.03, (
+        f"Expected uniform inward scale {expected_scale:.3f}, got {max_abs_1_half / max_abs_1:.3f}"
+    )
 
 
 ALL_TESTS = [

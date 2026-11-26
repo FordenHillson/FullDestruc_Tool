@@ -292,13 +292,26 @@ class FDT_PT_main_panel(bpy.types.Panel):
             step3.label(text="3. Tune & Apply", icon="CHECKMARK")
 
             step3.prop(settings, "enable_rough", text="Rough Cut Edge (All)")
+            target_cutter, target_is_rough = apple_bite.get_active_rough_cutter(context, session)
             any_rough = settings.enable_rough or any(c.rough for c in session.cutters)
             if any_rough:
                 rbox = step3.box()
-                rbox.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
-                rbox.prop(settings, "rough_scale", text="Noise Scale")
-                rbox.prop(settings, "rough_subdiv", text="Detail (1-3)")
-                rbox.prop(settings, "rough_seed", text="Seed")
+                cr = getattr(target_cutter, "fdt_rough", None) if target_cutter is not None else None
+                if cr is not None:
+                    status = "" if target_is_rough else " (OFF)"
+                    rbox.label(text=f"Cutter: {target_cutter.name}{status}", icon="MOD_DISPLACE")
+                    rbox.prop(cr, "inward_depth", text="Inward Depth", slider=True)
+                    rbox.prop(cr, "jaggedness", text="Jaggedness", slider=True)
+                    rbox.prop(cr, "noise_scale", text="Noise Scale")
+                    rbox.prop(cr, "detail", text="Detail (1-3)")
+                    rbox.prop(cr, "seed", text="Seed")
+                else:
+                    rbox.label(text="Default Rough (New Cutters)", icon="MOD_DISPLACE")
+                    rbox.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
+                    rbox.prop(settings, "rough_jaggedness", text="Jaggedness", slider=True)
+                    rbox.prop(settings, "rough_scale", text="Noise Scale")
+                    rbox.prop(settings, "rough_subdiv", text="Detail (1-3)")
+                    rbox.prop(settings, "rough_seed", text="Seed")
 
             draw_cut_material_row(step3, settings, text="Cut Material")
             row_uv = step3.row(align=True)

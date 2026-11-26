@@ -59,13 +59,25 @@ class FDT_OT_quick_popup(bpy.types.Operator):
         layout.prop(settings, "enable_rough", text="Rough Cut Edge")
         from ..core.session import load_session
         session = load_session(context.scene)
+        target_cutter, target_is_rough = apple_bite.get_active_rough_cutter(context, session)
         any_rough = settings.enable_rough or (session is not None and any(c.rough for c in session.cutters))
         if any_rough:
             box = layout.box()
-            box.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
-            box.prop(settings, "rough_scale", text="Noise Scale")
-            box.prop(settings, "rough_subdiv", text="Detail (1-3)")
-            box.prop(settings, "rough_seed", text="Seed")
+            cr = getattr(target_cutter, "fdt_rough", None) if target_cutter is not None else None
+            if cr is not None:
+                status = "" if target_is_rough else " (OFF)"
+                box.label(text=f"Cutter: {target_cutter.name}{status}", icon="MOD_DISPLACE")
+                box.prop(cr, "inward_depth", text="Inward Depth", slider=True)
+                box.prop(cr, "jaggedness", text="Jaggedness", slider=True)
+                box.prop(cr, "noise_scale", text="Noise Scale")
+                box.prop(cr, "detail", text="Detail (1-3)")
+                box.prop(cr, "seed", text="Seed")
+            else:
+                box.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
+                box.prop(settings, "rough_jaggedness", text="Jaggedness", slider=True)
+                box.prop(settings, "rough_scale", text="Noise Scale")
+                box.prop(settings, "rough_subdiv", text="Detail (1-3)")
+                box.prop(settings, "rough_seed", text="Seed")
         draw_cut_material_row(layout, settings, text="Cut Material")
         row = layout.row(align=True)
         row.prop(settings, "texel_per_meter", text="Texel")
