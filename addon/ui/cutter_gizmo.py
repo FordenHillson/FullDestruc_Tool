@@ -362,6 +362,39 @@ def _draw_2d_pill_badge(
     blf.draw(font_id, text)
 
 
+def _ray_intersect_local_aabb(
+    origin: Vector,
+    direction: Vector,
+    bound_box,
+) -> tuple[bool, Vector | None]:
+    """Exact slab ray-AABB intersection in object-local space (fallback when obj.ray_cast fails)."""
+    if not bound_box:
+        return False, None
+    xs = [c[0] for c in bound_box]
+    ys = [c[1] for c in bound_box]
+    zs = [c[2] for c in bound_box]
+    bmin = (min(xs), min(ys), min(zs))
+    bmax = (max(xs), max(ys), max(zs))
+    tmin = 0.0
+    tmax = float("inf")
+    for i in range(3):
+        o = origin[i]
+        d = direction[i]
+        if abs(d) < 1e-8:
+            if o < bmin[i] or o > bmax[i]:
+                return False, None
+        else:
+            t1 = (bmin[i] - o) / d
+            t2 = (bmax[i] - o) / d
+            if t1 > t2:
+                t1, t2 = t2, t1
+            tmin = max(tmin, t1)
+            tmax = min(tmax, t2)
+            if tmin > tmax:
+                return False, None
+    return True, origin + direction * tmin
+
+
 class FDT_OT_applebite_pick_layer_target(bpy.types.Operator):
     """Interactive 3D Cutter Picker: click any other cutter box to place the source cutter ABOVE or BELOW it."""
 
@@ -452,6 +485,7 @@ class FDT_OT_applebite_pick_layer_target(bpy.types.Operator):
         # 2. 3D raycast against each candidate cutter mesh / volume (closest hit wins!)
         ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse)
         ray_dir = view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse).normalized()
+        depsgraph = context.evaluated_depsgraph_get()
         best_ray = None
         best_ray_dist = float("inf")
         for _idx, entry, obj in candidates:
@@ -460,9 +494,18 @@ class FDT_OT_applebite_pick_layer_target(bpy.types.Operator):
             except ValueError:
                 continue
             lo = inv_m @ ray_origin
-            ld = (inv_m.to_3x3() @ ray_dir).normalized()
-            hit, loc, _nrm, _fidx = obj.ray_cast(lo, ld)
-            if hit:
+            ld_raw = inv_m.to_3x3() @ ray_dir
+            if ld_raw.length < 1e-8:
+                continue
+            ld = ld_raw.normalized()
+            hit = False
+            loc = None
+            try:
+                hit, loc, _nrm, _fidx = obj.ray_cast(lo, ld, depsgraph=depsgraph)
+            except RuntimeError:
+                # Unevaluated / BOUNDS / empty-eval cutter: fall back to exact local AABB slab test
+                hit, loc = _ray_intersect_local_aabb(lo, ld, obj.bound_box)
+            if hit and loc is not None:
                 world_hit = obj.matrix_world @ loc
                 dist = (world_hit - ray_origin).length
                 if dist < best_ray_dist:
