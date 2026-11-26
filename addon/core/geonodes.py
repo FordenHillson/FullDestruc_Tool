@@ -197,7 +197,7 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
 
     # Compute exact selection probability = target_cuts / max(point_count, 1)
     # Detail 1 -> ~12 cuts, Detail 2 -> ~20 cuts, Detail 3 -> ~28 cuts (safe on any custom mesh!)
-    n_dom = nodes.new("GeometryNodeDomainSize")
+    n_dom = nodes.new("GeometryNodeAttributeDomainSize")
     n_dom.location = (-1100, 220)
     _set_node_enum(n_dom, "component", "Component", "MESH")
     links.new(n_subdiv.outputs["Mesh"], n_dom.inputs["Geometry"])
