@@ -755,6 +755,9 @@ _LOADING_CUTTER_ROUGH = False
 def _on_cutter_rough_changed(self, context):
     if _LOADING_CUTTER_ROUGH:
         return
+    owner = getattr(self, "id_data", None)
+    if owner is not None and getattr(owner, "type", "") == "MESH":
+        apple_bite.flash_rough_wire_preview(owner.name, duration=1.5)
     if context is not None and context.scene is not None:
         apple_bite.rebuild_session(context)
 

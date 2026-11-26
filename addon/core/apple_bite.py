@@ -74,9 +74,78 @@ def _resolve_zone_id(scene: bpy.types.Scene | None, zone: str | None) -> str:
     return zone_registry.resolve_zone(raw, scene).key
 
 
-def apply_cutter_visuals(cutter: bpy.types.Object, zone: str, muted: bool = False) -> None:
-    """Style a cutter as colored wireframe matching its Zone ID (in-front ONLY while in Edit Mode)."""
-    cutter.display_type = "WIRE"
+_ROUGH_WIRE_PREVIEW_UNTIL: dict[str, float] = {}
+_ROUGH_WIRE_TIMER_ACTIVE: bool = False
+
+
+def is_rough_wire_visible(cutter: bpy.types.Object, is_rough: bool) -> bool:
+    """Return True if the cutter should render its full WIRE mesh; False hides rough mesh as clean BOUNDS."""
+    if not is_rough:
+        return True
+    if cutter.mode == "EDIT":
+        return True
+    until = _ROUGH_WIRE_PREVIEW_UNTIL.get(cutter.name, 0.0)
+    return until > 0.0 and time.monotonic() < until
+
+
+def _rough_wire_hide_timer() -> float | None:
+    """Debounced timer that hides rough wireframes back to BOUNDS once setting tweaks stop."""
+    global _ROUGH_WIRE_TIMER_ACTIVE
+    now = time.monotonic()
+    next_wait: float | None = None
+    for cname in list(_ROUGH_WIRE_PREVIEW_UNTIL.keys()):
+        rem = _ROUGH_WIRE_PREVIEW_UNTIL[cname] - now
+        if rem > 0.01:
+            next_wait = rem if next_wait is None else min(next_wait, rem)
+            continue
+        _ROUGH_WIRE_PREVIEW_UNTIL.pop(cname, None)
+        obj = bpy.data.objects.get(cname)
+        if obj is not None and obj.type == "MESH":
+            is_rough = bool(obj.get(CUTTER_ROUGH_PROP, False))
+            want_disp = "WIRE" if is_rough_wire_visible(obj, is_rough) else "BOUNDS"
+            if obj.display_type != want_disp:
+                obj.display_type = want_disp
+    if next_wait is not None:
+        return min(max(next_wait, 0.05), 1.0)
+    _ROUGH_WIRE_TIMER_ACTIVE = False
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is not None:
+        for win in wm.windows:
+            if win.screen is None:
+                continue
+            for area in win.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    return None
+
+
+def flash_rough_wire_preview(cutter_name: str | None = None, duration: float = 1.5) -> None:
+    """Temporarily reveal a rough cutter's wireframe while actively tweaking its Rough settings."""
+    global _ROUGH_WIRE_TIMER_ACTIVE
+    if cutter_name:
+        _ROUGH_WIRE_PREVIEW_UNTIL[cutter_name] = time.monotonic() + float(duration)
+        obj = bpy.data.objects.get(cutter_name)
+        if obj is not None and obj.type == "MESH" and obj.display_type != "WIRE":
+            obj.display_type = "WIRE"
+    if not bpy.app.background and not _ROUGH_WIRE_TIMER_ACTIVE and _ROUGH_WIRE_PREVIEW_UNTIL:
+        _ROUGH_WIRE_TIMER_ACTIVE = True
+        try:
+            bpy.app.timers.register(_rough_wire_hide_timer, first_interval=min(float(duration), 0.5))
+        except Exception:
+            _ROUGH_WIRE_TIMER_ACTIVE = False
+
+
+def apply_cutter_visuals(
+    cutter: bpy.types.Object,
+    zone: str,
+    muted: bool = False,
+    is_rough: bool | None = None,
+) -> None:
+    """Style a cutter matching its Zone ID; hide noisy black rough wireframe when idle."""
+    rough_flag = bool(cutter.get(CUTTER_ROUGH_PROP, False)) if is_rough is None else bool(is_rough)
+    want_disp = "WIRE" if is_rough_wire_visible(cutter, rough_flag) else "BOUNDS"
+    if cutter.display_type != want_disp:
+        cutter.display_type = want_disp
     cutter.show_in_front = cutter.mode == "EDIT"
     cutter.hide_render = True
     r, g, b, _ = get_zone_color(zone)
@@ -1681,6 +1750,8 @@ def toggle_cutter_rough(context: bpy.types.Context, cutter_name: str) -> tuple[b
     for entry in session.cutters:
         if entry.name == cutter_name:
             entry.rough = not entry.rough
+            if not entry.rough:
+                _ROUGH_WIRE_PREVIEW_UNTIL.pop(cutter_name, None)
             obj = bpy.data.objects.get(cutter_name)
             if obj is not None:
                 obj[CUTTER_ROUGH_PROP] = entry.rough
@@ -1700,6 +1771,8 @@ def set_all_cutters_rough(context: bpy.types.Context, enabled: bool) -> int:
     val = bool(enabled)
     for entry in session.cutters:
         entry.rough = val
+        if not val:
+            _ROUGH_WIRE_PREVIEW_UNTIL.pop(entry.name, None)
         obj = bpy.data.objects.get(entry.name)
         if obj is not None:
             obj[CUTTER_ROUGH_PROP] = val

@@ -702,6 +702,12 @@ def test_20_edge_band_inward_rough_cut() -> None:
         f"Expected uniform inward scale {expected_scale:.3f}, got {max_abs_1_half / max_abs_1:.3f}"
     )
 
+    # 3. Rough wireframe visibility: active tweak shows WIRE; idle hides black rough wire as BOUNDS
+    assert c1.display_type == "WIRE", f"Expected WIRE while tweaking rough settings, got {c1.display_type}"
+    apple_bite._ROUGH_WIRE_PREVIEW_UNTIL.clear()
+    apple_bite.rebuild_session(ctx)
+    assert c1.display_type == "BOUNDS", f"Expected BOUNDS when rough cutter is idle, got {c1.display_type}"
+
 
 ALL_TESTS = [
     test_1_enter_exit_cancel_lifecycle,

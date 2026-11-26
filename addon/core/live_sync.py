@@ -326,13 +326,19 @@ def _on_depsgraph_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph)
     if session is None:
         return
 
-    # Auto-enable show_in_front ONLY while editing a cutter in Edit Mode (restores False in Object Mode!)
+    # Auto-enable show_in_front ONLY while editing a cutter in Edit Mode, and hide noisy rough
+    # black wireframes (BOUNDS) whenever a rough cutter is idle (neither Edit Mode nor tuning).
+    from . import apple_bite as _ab
+
     for entry in session.cutters:
         c_obj = bpy.data.objects.get(entry.name)
         if c_obj is not None and c_obj.type == "MESH":
             want_front = c_obj.mode == "EDIT"
             if bool(c_obj.show_in_front) != want_front:
                 c_obj.show_in_front = want_front
+            want_disp = "WIRE" if _ab.is_rough_wire_visible(c_obj, bool(entry.rough)) else "BOUNDS"
+            if c_obj.display_type != want_disp:
+                c_obj.display_type = want_disp
 
     settings = getattr(scene, "fdt_settings", None)
     # In Direct Mesh mode + Piece Only, keep visible pieces synced to the selected cutter zone(s)
