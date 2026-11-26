@@ -195,12 +195,29 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         max=50.0,
     )
 
-    # Rough edge (Geometry Nodes displacement)
+    # Rough edge (Edge-band inward Geometry Nodes displacement)
     enable_rough: BoolProperty(
         name="Rough Edge (All)",
         description="Toggle rough noise edge on all cutters (each cutter can also be toggled individually)",
         default=False,
         update=_on_global_rough_changed,
+    )
+    rough_inward_ratio: FloatProperty(
+        name="Inward Ratio",
+        description="Proportion of rough noise band eating inward from the outer sharp edges (0% = off, 100% = full face)",
+        subtype="FACTOR",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        update=_on_live_setting_changed,
+    )
+    rough_strength: FloatProperty(
+        name="Rough Strength",
+        description="Inward carving depth of rough cut edges (meters)",
+        default=0.08,
+        min=0.0,
+        max=2.0,
+        update=_on_live_setting_changed,
     )
     rough_scale: FloatProperty(
         name="Noise Scale",
@@ -210,17 +227,26 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         max=50.0,
         update=_on_live_setting_changed,
     )
-    rough_strength: FloatProperty(
-        name="Rough Strength",
-        description="Displacement depth of rough cut edges (meters)",
-        default=0.08,
+    rough_detail: FloatProperty(
+        name="Noise Detail",
+        description="Jaggedness and fine detail of rough cut noise (controls Noise Detail & Roughness)",
+        subtype="FACTOR",
+        default=0.5,
         min=0.0,
-        max=2.0,
+        max=1.0,
+        update=_on_live_setting_changed,
+    )
+    rough_subdiv: IntProperty(
+        name="Resolution",
+        description="Mesh subdivision level for rough cut edge detail (WYSIWYG in live preview & apply, 1-5)",
+        default=3,
+        min=1,
+        max=5,
         update=_on_live_setting_changed,
     )
     rough_voxel_size: FloatProperty(
         name="Voxel Size",
-        description="Resolution of rough cutter mesh (smaller = finer detail)",
+        description="Deprecated legacy resolution parameter kept for backward compatibility",
         default=0.06,
         min=0.01,
         max=0.5,

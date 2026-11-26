@@ -14,8 +14,19 @@ GN_MARK_ORIG = "FDT_GN_MarkOrig"
 GN_ROUGH_CUTTER = "FDT_GN_RoughCutter"
 GN_CUT_FACE_UV = "FDT_GN_CutFaceUV"
 
+ROUGH_CUTTER_VERSION = 2
+
 ORIG_ATTR_NAME = "fdt_orig"
 UV_ATTR_NAME = "UVMap0"
+
+
+def _get_socket(sockets, *names: str, index: int = 0):
+    """Look up a node socket by candidate names with positional fallback (Blender 4.x/5.2+ safe)."""
+    for name in names:
+        sock = sockets.get(name)
+        if sock is not None:
+            return sock
+    return sockets[index]
 
 
 def _new_group(name: str) -> bpy.types.NodeTree:
@@ -58,77 +69,216 @@ def ensure_mark_orig_group() -> bpy.types.NodeTree:
 
 
 def ensure_rough_cutter_group() -> bpy.types.NodeTree:
-    """Create or return FDT_GN_RoughCutter node group for rough/jagged cut edges.
+    """Create or return FDT_GN_RoughCutter (v2) node group for edge-band inward rough cuts.
 
-    Uses Subdivide Mesh + 4D Noise displacement along normals so the cutter stays
-    100% solid, manifold, and fast (avoiding hollow-shell volume artifacts).
+    Extracts sharp outer edges before subdivision, computes normalized vertex proximity to those
+    edges, and carves strictly inward (-Normal) within the configurable Inward Ratio band so the
+    cutter stays 100% solid, watertight, manifold, and never bulges past its drawn boundary.
     """
     existing = bpy.data.node_groups.get(GN_ROUGH_CUTTER)
     if existing is not None:
-        return existing
+        if int(existing.get("fdt_gn_version", 1)) >= ROUGH_CUTTER_VERSION:
+            return existing
+        # Upgrade legacy v1 node group in-place so existing modifier links stay intact
+        ng = existing
+        ng.links.clear()
+        ng.nodes.clear()
+        for item in list(ng.interface.items_tree):
+            ng.interface.remove(item)
+    else:
+        ng = _new_group(GN_ROUGH_CUTTER)
 
-    ng = _new_group(GN_ROUGH_CUTTER)
     ng.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
-    s_scale = ng.interface.new_socket(name="Noise Scale", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_scale.default_value = 3.0
+
+    s_inward = ng.interface.new_socket(name="Inward Ratio", in_out="INPUT", socket_type="NodeSocketFloat")
+    s_inward.default_value = 0.35
+    if hasattr(s_inward, "min_value"):
+        s_inward.min_value = 0.0
+        s_inward.max_value = 1.0
+    if hasattr(s_inward, "subtype"):
+        s_inward.subtype = "FACTOR"
+
     s_strength = ng.interface.new_socket(name="Strength", in_out="INPUT", socket_type="NodeSocketFloat")
     s_strength.default_value = 0.08
-    s_voxel = ng.interface.new_socket(name="Voxel Size", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_voxel.default_value = 0.06
+    if hasattr(s_strength, "min_value"):
+        s_strength.min_value = 0.0
+        s_strength.max_value = 2.0
+
+    s_scale = ng.interface.new_socket(name="Noise Scale", in_out="INPUT", socket_type="NodeSocketFloat")
+    s_scale.default_value = 3.0
+    if hasattr(s_scale, "min_value"):
+        s_scale.min_value = 0.1
+        s_scale.max_value = 50.0
+
+    s_detail = ng.interface.new_socket(name="Noise Detail", in_out="INPUT", socket_type="NodeSocketFloat")
+    s_detail.default_value = 0.5
+    if hasattr(s_detail, "min_value"):
+        s_detail.min_value = 0.0
+        s_detail.max_value = 1.0
+    if hasattr(s_detail, "subtype"):
+        s_detail.subtype = "FACTOR"
+
+    s_subdiv = ng.interface.new_socket(name="Subdiv Level", in_out="INPUT", socket_type="NodeSocketInt")
+    s_subdiv.default_value = 3
+    if hasattr(s_subdiv, "min_value"):
+        s_subdiv.min_value = 1
+        s_subdiv.max_value = 5
+
     s_seed = ng.interface.new_socket(name="Seed", in_out="INPUT", socket_type="NodeSocketFloat")
     s_seed.default_value = 0.0
+
     ng.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
 
     nodes = ng.nodes
     links = ng.links
 
     n_in = nodes.new("NodeGroupInput")
-    n_in.location = (-800, 0)
+    n_in.location = (-1200, 0)
 
+    # 1. Extract sharp outer edges before subdivision (angle > ~20 deg = 0.35 rad)
+    n_edge_angle = nodes.new("GeometryNodeInputMeshEdgeAngle")
+    n_edge_angle.location = (-1000, 320)
+
+    n_is_sharp = nodes.new("FunctionNodeCompare")
+    n_is_sharp.location = (-800, 320)
+    n_is_sharp.data_type = "FLOAT"
+    n_is_sharp.operation = "GREATER_THAN"
+    n_is_sharp.inputs["B"].default_value = 0.35
+
+    n_sep_edges = nodes.new("GeometryNodeSeparateGeometry")
+    n_sep_edges.location = (-600, 320)
+    n_sep_edges.domain = "EDGE"
+
+    links.new(n_edge_angle.outputs["Unsigned Angle"], n_is_sharp.inputs["A"])
+    links.new(n_in.outputs["Geometry"], n_sep_edges.inputs["Geometry"])
+    links.new(n_is_sharp.outputs["Result"], n_sep_edges.inputs["Selection"])
+
+    # 2. Watertight uniform subdivision (keeps cutter 100% manifold for Rust Boolean Engine)
     n_subdiv = nodes.new("GeometryNodeSubdivideMesh")
-    n_subdiv.location = (-420, 100)
-    n_subdiv.inputs["Level"].default_value = 3
+    n_subdiv.location = (-600, 80)
+    links.new(n_in.outputs["Geometry"], n_subdiv.inputs["Mesh"])
+    links.new(n_in.outputs["Subdiv Level"], n_subdiv.inputs["Level"])
+
+    # 3. Normalized edge-distance mask (1.0 at sharp edge -> 0.0 at band_width inward)
+    n_prox = nodes.new("GeometryNodeProximity")
+    n_prox.location = (-360, 300)
+    n_prox.target_element = "EDGES"
+    links.new(
+        n_sep_edges.outputs["Selection"],
+        _get_socket(n_prox.inputs, "Geometry", "Target", index=0),
+    )
+
+    n_stat = nodes.new("GeometryNodeAttributeStatistic")
+    n_stat.location = (-140, 360)
+    n_stat.data_type = "FLOAT"
+    n_stat.domain = "POINT"
+    links.new(n_subdiv.outputs["Mesh"], n_stat.inputs["Geometry"])
+    links.new(n_prox.outputs["Distance"], n_stat.inputs["Attribute"])
+
+    n_max_d = nodes.new("ShaderNodeMath")
+    n_max_d.location = (60, 360)
+    n_max_d.operation = "MAXIMUM"
+    n_max_d.inputs[1].default_value = 1e-4
+    links.new(n_stat.outputs["Max"], n_max_d.inputs[0])
+
+    n_band = nodes.new("ShaderNodeMath")
+    n_band.location = (240, 320)
+    n_band.operation = "MULTIPLY"
+    links.new(n_max_d.outputs["Value"], n_band.inputs[0])
+    links.new(n_in.outputs["Inward Ratio"], n_band.inputs[1])
+
+    n_band_safe = nodes.new("ShaderNodeMath")
+    n_band_safe.location = (420, 320)
+    n_band_safe.operation = "MAXIMUM"
+    n_band_safe.inputs[1].default_value = 1e-5
+    links.new(n_band.outputs["Value"], n_band_safe.inputs[0])
+
+    n_map = nodes.new("ShaderNodeMapRange")
+    n_map.location = (600, 260)
+    n_map.data_type = "FLOAT"
+    n_map.interpolation_type = "SMOOTHSTEP"
+    n_map.clamp = True
+    n_map.inputs["From Min"].default_value = 0.0
+    n_map.inputs["To Min"].default_value = 1.0
+    n_map.inputs["To Max"].default_value = 0.0
+    links.new(n_prox.outputs["Distance"], n_map.inputs["Value"])
+    links.new(n_band_safe.outputs["Value"], n_map.inputs["From Max"])
+
+    # Clean zero guard when Inward Ratio == 0.0
+    n_ratio_on = nodes.new("FunctionNodeCompare")
+    n_ratio_on.location = (600, 40)
+    n_ratio_on.data_type = "FLOAT"
+    n_ratio_on.operation = "GREATER_THAN"
+    n_ratio_on.inputs["B"].default_value = 0.001
+    links.new(n_in.outputs["Inward Ratio"], n_ratio_on.inputs["A"])
+
+    n_mask = nodes.new("ShaderNodeMath")
+    n_mask.location = (800, 180)
+    n_mask.operation = "MULTIPLY"
+    links.new(n_map.outputs["Result"], n_mask.inputs[0])
+    links.new(n_ratio_on.outputs["Result"], n_mask.inputs[1])
+
+    # 4. 4D Noise with customizable Detail & Roughness
+    n_det_map = nodes.new("ShaderNodeMath")
+    n_det_map.location = (-800, -240)
+    n_det_map.operation = "MULTIPLY_ADD"
+    n_det_map.inputs[1].default_value = 8.0
+    n_det_map.inputs[2].default_value = 2.0
+    links.new(n_in.outputs["Noise Detail"], n_det_map.inputs[0])
+
+    n_rgh_map = nodes.new("ShaderNodeMath")
+    n_rgh_map.location = (-800, -400)
+    n_rgh_map.operation = "MULTIPLY_ADD"
+    n_rgh_map.inputs[1].default_value = 0.6
+    n_rgh_map.inputs[2].default_value = 0.3
+    links.new(n_in.outputs["Noise Detail"], n_rgh_map.inputs[0])
 
     n_noise = nodes.new("ShaderNodeTexNoise")
-    n_noise.location = (-550, -200)
+    n_noise.location = (-560, -260)
     n_noise.noise_dimensions = "4D"
-
-    n_sub = nodes.new("ShaderNodeMath")
-    n_sub.location = (-320, -200)
-    n_sub.operation = "SUBTRACT"
-    n_sub.inputs[1].default_value = 0.5
-
-    n_mul = nodes.new("ShaderNodeMath")
-    n_mul.location = (-120, -200)
-    n_mul.operation = "MULTIPLY"
-
-    n_norm = nodes.new("GeometryNodeInputNormal")
-    n_norm.location = (-120, -360)
-
-    n_vec_scale = nodes.new("ShaderNodeVectorMath")
-    n_vec_scale.location = (80, -240)
-    n_vec_scale.operation = "SCALE"
-
-    n_set_pos = nodes.new("GeometryNodeSetPosition")
-    n_set_pos.location = (300, 80)
-
-    n_out = nodes.new("NodeGroupOutput")
-    n_out.location = (550, 80)
-
-    links.new(n_in.outputs["Geometry"], n_subdiv.inputs["Mesh"])
-
     links.new(n_in.outputs["Noise Scale"], n_noise.inputs["Scale"])
     links.new(n_in.outputs["Seed"], n_noise.inputs["W"])
-    links.new(n_noise.outputs["Fac"], n_sub.inputs[0])
-    links.new(n_sub.outputs["Value"], n_mul.inputs[0])
-    links.new(n_in.outputs["Strength"], n_mul.inputs[1])
+    links.new(n_det_map.outputs["Value"], n_noise.inputs["Detail"])
+    links.new(n_rgh_map.outputs["Value"], n_noise.inputs["Roughness"])
 
+    # 5. Strictly inward displacement: Offset = Normal * (-Fac * edge_mask * Strength)
+    n_masked_noise = nodes.new("ShaderNodeMath")
+    n_masked_noise.location = (980, -40)
+    n_masked_noise.operation = "MULTIPLY"
+    links.new(n_noise.outputs["Fac"], n_masked_noise.inputs[0])
+    links.new(n_mask.outputs["Value"], n_masked_noise.inputs[1])
+
+    n_depth = nodes.new("ShaderNodeMath")
+    n_depth.location = (1160, -40)
+    n_depth.operation = "MULTIPLY"
+    links.new(n_masked_noise.outputs["Value"], n_depth.inputs[0])
+    links.new(n_in.outputs["Strength"], n_depth.inputs[1])
+
+    n_neg = nodes.new("ShaderNodeMath")
+    n_neg.location = (1340, -40)
+    n_neg.operation = "MULTIPLY"
+    n_neg.inputs[1].default_value = -1.0
+    links.new(n_depth.outputs["Value"], n_neg.inputs[0])
+
+    n_norm = nodes.new("GeometryNodeInputNormal")
+    n_norm.location = (1340, -220)
+
+    n_vec_scale = nodes.new("ShaderNodeVectorMath")
+    n_vec_scale.location = (1540, -120)
+    n_vec_scale.operation = "SCALE"
     links.new(n_norm.outputs["Normal"], n_vec_scale.inputs[0])
-    links.new(n_mul.outputs["Value"], n_vec_scale.inputs["Scale"])
+    links.new(n_neg.outputs["Value"], n_vec_scale.inputs["Scale"])
 
+    n_set_pos = nodes.new("GeometryNodeSetPosition")
+    n_set_pos.location = (1760, 80)
     links.new(n_subdiv.outputs["Mesh"], n_set_pos.inputs["Geometry"])
     links.new(n_vec_scale.outputs["Vector"], n_set_pos.inputs["Offset"])
+
+    n_out = nodes.new("NodeGroupOutput")
+    n_out.location = (1980, 80)
     links.new(n_set_pos.outputs["Geometry"], n_out.inputs["Geometry"])
+
+    ng["fdt_gn_version"] = ROUGH_CUTTER_VERSION
     return ng
 
 

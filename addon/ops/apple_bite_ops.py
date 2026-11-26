@@ -190,9 +190,12 @@ def _build_zone_grid_cache(context, session, shader) -> list[tuple[object, str, 
     rough_sig = (
         (
             bool(settings.enable_rough),
+            round(float(getattr(settings, "rough_inward_ratio", 0.35)), 4),
             round(float(settings.rough_scale), 4),
             round(float(settings.rough_strength), 4),
-            int(settings.rough_seed),
+            round(float(getattr(settings, "rough_detail", 0.5)), 4),
+            int(getattr(settings, "rough_subdiv", 3)),
+            round(float(settings.rough_seed), 4),
         )
         if settings is not None
         else ()

@@ -57,11 +57,17 @@ class FDT_OT_quick_popup(bpy.types.Operator):
             op.zone_key = settings.active_zone
         layout.prop(settings, "cutter_size", text="Box Size (m)")
         layout.prop(settings, "enable_rough", text="Rough Cut Edge")
-        if settings.enable_rough:
+        from ..core.session import load_session
+        session = load_session(context.scene)
+        any_rough = settings.enable_rough or (session is not None and any(c.rough for c in session.cutters))
+        if any_rough:
             box = layout.box()
-            box.prop(settings, "rough_scale")
-            box.prop(settings, "rough_strength")
-            box.prop(settings, "rough_seed")
+            box.prop(settings, "rough_inward_ratio", text="Inward Ratio", slider=True)
+            box.prop(settings, "rough_strength", text="Strength")
+            box.prop(settings, "rough_scale", text="Noise Scale")
+            box.prop(settings, "rough_detail", text="Noise Detail", slider=True)
+            box.prop(settings, "rough_subdiv", text="Resolution")
+            box.prop(settings, "rough_seed", text="Seed")
         draw_cut_material_row(layout, settings, text="Cut Material")
         row = layout.row(align=True)
         row.prop(settings, "texel_per_meter", text="Texel")

@@ -587,6 +587,101 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.chk_rough.toggled.connect(self._on_rough_toggled)
         s3_layout.addWidget(self.chk_rough)
 
+        self.rough_params_box = QtWidgets.QFrame()
+        self.rough_params_box.setStyleSheet(
+            "QFrame { background-color: #20232a; border: 1px solid #353944; border-radius: 5px; }"
+            "QLabel { border: none; background: transparent; color: #cfd5df; font-size: 11px; }"
+        )
+        rp_layout = QtWidgets.QFormLayout(self.rough_params_box)
+        rp_layout.setContentsMargins(8, 6, 8, 6)
+        rp_layout.setSpacing(5)
+
+        # Inward Ratio (0-100%)
+        inward_row = QtWidgets.QHBoxLayout()
+        inward_row.setContentsMargins(0, 0, 0, 0)
+        inward_row.setSpacing(6)
+        self.sld_rough_inward = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sld_rough_inward.setRange(0, 100)
+        self.sld_rough_inward.setValue(35)
+        self.spn_rough_inward = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_inward.setRange(0.0, 100.0)
+        self.spn_rough_inward.setSingleStep(5.0)
+        self.spn_rough_inward.setDecimals(0)
+        self.spn_rough_inward.setSuffix("%")
+        self.spn_rough_inward.setValue(35.0)
+        self.spn_rough_inward.setFixedWidth(64)
+        self.sld_rough_inward.valueChanged.connect(self._on_rough_inward_slider_changed)
+        self.spn_rough_inward.valueChanged.connect(self._on_rough_inward_spin_changed)
+        inward_row.addWidget(self.sld_rough_inward, 1)
+        inward_row.addWidget(self.spn_rough_inward)
+        rp_layout.addRow("Inward Ratio:", inward_row)
+
+        # Strength (meters)
+        self.spn_rough_strength = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_strength.setRange(0.0, 2.0)
+        self.spn_rough_strength.setSingleStep(0.01)
+        self.spn_rough_strength.setDecimals(3)
+        self.spn_rough_strength.setSuffix(" m")
+        self.spn_rough_strength.setValue(0.08)
+        self.spn_rough_strength.valueChanged.connect(
+            lambda v: self._on_rough_param_changed("rough_strength", float(v))
+        )
+        rp_layout.addRow("Strength:", self.spn_rough_strength)
+
+        # Noise Scale
+        self.spn_rough_scale = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_scale.setRange(0.1, 50.0)
+        self.spn_rough_scale.setSingleStep(0.25)
+        self.spn_rough_scale.setDecimals(2)
+        self.spn_rough_scale.setValue(3.0)
+        self.spn_rough_scale.valueChanged.connect(
+            lambda v: self._on_rough_param_changed("rough_scale", float(v))
+        )
+        rp_layout.addRow("Noise Scale:", self.spn_rough_scale)
+
+        # Noise Detail (0-100%)
+        detail_row = QtWidgets.QHBoxLayout()
+        detail_row.setContentsMargins(0, 0, 0, 0)
+        detail_row.setSpacing(6)
+        self.sld_rough_detail = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sld_rough_detail.setRange(0, 100)
+        self.sld_rough_detail.setValue(50)
+        self.spn_rough_detail = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_detail.setRange(0.0, 100.0)
+        self.spn_rough_detail.setSingleStep(5.0)
+        self.spn_rough_detail.setDecimals(0)
+        self.spn_rough_detail.setSuffix("%")
+        self.spn_rough_detail.setValue(50.0)
+        self.spn_rough_detail.setFixedWidth(64)
+        self.sld_rough_detail.valueChanged.connect(self._on_rough_detail_slider_changed)
+        self.spn_rough_detail.valueChanged.connect(self._on_rough_detail_spin_changed)
+        detail_row.addWidget(self.sld_rough_detail, 1)
+        detail_row.addWidget(self.spn_rough_detail)
+        rp_layout.addRow("Noise Detail:", detail_row)
+
+        # Resolution (Subdiv Level 1-5)
+        self.spn_rough_subdiv = QtWidgets.QSpinBox()
+        self.spn_rough_subdiv.setRange(1, 5)
+        self.spn_rough_subdiv.setValue(3)
+        self.spn_rough_subdiv.valueChanged.connect(
+            lambda v: self._on_rough_param_changed("rough_subdiv", int(v))
+        )
+        rp_layout.addRow("Resolution:", self.spn_rough_subdiv)
+
+        # Seed
+        self.spn_rough_seed = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_seed.setRange(-10000.0, 10000.0)
+        self.spn_rough_seed.setSingleStep(0.5)
+        self.spn_rough_seed.setDecimals(2)
+        self.spn_rough_seed.setValue(0.0)
+        self.spn_rough_seed.valueChanged.connect(
+            lambda v: self._on_rough_param_changed("rough_seed", float(v))
+        )
+        rp_layout.addRow("Seed:", self.spn_rough_seed)
+
+        self.rough_params_box.setVisible(False)
+        s3_layout.addWidget(self.rough_params_box)
+
         self.chk_auto_fill = QtWidgets.QCheckBox("Auto-Fill Cut Gaps")
         self.chk_auto_fill.setChecked(True)
         self.chk_auto_fill.setToolTip("Automatically fill unclosed solid holes strictly on cut planes on Apply")
@@ -678,6 +773,50 @@ class FullDestrucWindow(QtWidgets.QWidget):
             if settings is not None and bool(settings.enable_rough) != bool(checked):
                 settings.enable_rough = bool(checked)
         _tag_all_view3d_redraw()
+        self.refresh_from_blender()
+
+    def _on_rough_param_changed(self, prop_name: str, value) -> None:
+        with blender_view3d_override():
+            scene = bpy.context.scene
+            settings = getattr(scene, "fdt_settings", None)
+            if settings is not None and hasattr(settings, prop_name):
+                cur = getattr(settings, prop_name)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    if int(cur) != value:
+                        setattr(settings, prop_name, value)
+                elif abs(float(cur) - float(value)) > 1e-6:
+                    setattr(settings, prop_name, float(value))
+        _tag_all_view3d_redraw()
+
+    def _on_rough_inward_slider_changed(self, pct: int) -> None:
+        if abs(self.spn_rough_inward.value() - float(pct)) > 1e-6:
+            self.spn_rough_inward.blockSignals(True)
+            self.spn_rough_inward.setValue(float(pct))
+            self.spn_rough_inward.blockSignals(False)
+        self._on_rough_param_changed("rough_inward_ratio", float(pct) / 100.0)
+
+    def _on_rough_inward_spin_changed(self, pct: float) -> None:
+        ipct = int(round(pct))
+        if self.sld_rough_inward.value() != ipct:
+            self.sld_rough_inward.blockSignals(True)
+            self.sld_rough_inward.setValue(ipct)
+            self.sld_rough_inward.blockSignals(False)
+        self._on_rough_param_changed("rough_inward_ratio", float(pct) / 100.0)
+
+    def _on_rough_detail_slider_changed(self, pct: int) -> None:
+        if abs(self.spn_rough_detail.value() - float(pct)) > 1e-6:
+            self.spn_rough_detail.blockSignals(True)
+            self.spn_rough_detail.setValue(float(pct))
+            self.spn_rough_detail.blockSignals(False)
+        self._on_rough_param_changed("rough_detail", float(pct) / 100.0)
+
+    def _on_rough_detail_spin_changed(self, pct: float) -> None:
+        ipct = int(round(pct))
+        if self.sld_rough_detail.value() != ipct:
+            self.sld_rough_detail.blockSignals(True)
+            self.sld_rough_detail.setValue(ipct)
+            self.sld_rough_detail.blockSignals(False)
+        self._on_rough_param_changed("rough_detail", float(pct) / 100.0)
 
     def _on_auto_fill_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
@@ -1013,6 +1152,55 @@ class FullDestrucWindow(QtWidgets.QWidget):
                     self.chk_rough.blockSignals(True)
                     self.chk_rough.setChecked(bool(settings.enable_rough))
                     self.chk_rough.blockSignals(False)
+                any_rough = bool(settings.enable_rough) or any(c.rough for c in session.cutters)
+                if self.rough_params_box.isVisible() != any_rough:
+                    self.rough_params_box.setVisible(any_rough)
+                if any_rough:
+                    inward_pct = float(getattr(settings, "rough_inward_ratio", 0.35)) * 100.0
+                    inward_ipct = int(round(inward_pct))
+                    if not self.sld_rough_inward.isSliderDown() and self.sld_rough_inward.value() != inward_ipct:
+                        self.sld_rough_inward.blockSignals(True)
+                        self.sld_rough_inward.setValue(inward_ipct)
+                        self.sld_rough_inward.blockSignals(False)
+                    if not self.spn_rough_inward.hasFocus() and abs(self.spn_rough_inward.value() - inward_pct) > 0.5:
+                        self.spn_rough_inward.blockSignals(True)
+                        self.spn_rough_inward.setValue(inward_pct)
+                        self.spn_rough_inward.blockSignals(False)
+
+                    r_str = float(getattr(settings, "rough_strength", 0.08))
+                    if not self.spn_rough_strength.hasFocus() and abs(self.spn_rough_strength.value() - r_str) > 1e-5:
+                        self.spn_rough_strength.blockSignals(True)
+                        self.spn_rough_strength.setValue(r_str)
+                        self.spn_rough_strength.blockSignals(False)
+
+                    r_scl = float(getattr(settings, "rough_scale", 3.0))
+                    if not self.spn_rough_scale.hasFocus() and abs(self.spn_rough_scale.value() - r_scl) > 1e-4:
+                        self.spn_rough_scale.blockSignals(True)
+                        self.spn_rough_scale.setValue(r_scl)
+                        self.spn_rough_scale.blockSignals(False)
+
+                    detail_pct = float(getattr(settings, "rough_detail", 0.5)) * 100.0
+                    detail_ipct = int(round(detail_pct))
+                    if not self.sld_rough_detail.isSliderDown() and self.sld_rough_detail.value() != detail_ipct:
+                        self.sld_rough_detail.blockSignals(True)
+                        self.sld_rough_detail.setValue(detail_ipct)
+                        self.sld_rough_detail.blockSignals(False)
+                    if not self.spn_rough_detail.hasFocus() and abs(self.spn_rough_detail.value() - detail_pct) > 0.5:
+                        self.spn_rough_detail.blockSignals(True)
+                        self.spn_rough_detail.setValue(detail_pct)
+                        self.spn_rough_detail.blockSignals(False)
+
+                    r_sub = int(getattr(settings, "rough_subdiv", 3))
+                    if not self.spn_rough_subdiv.hasFocus() and self.spn_rough_subdiv.value() != r_sub:
+                        self.spn_rough_subdiv.blockSignals(True)
+                        self.spn_rough_subdiv.setValue(r_sub)
+                        self.spn_rough_subdiv.blockSignals(False)
+
+                    r_seed = float(getattr(settings, "rough_seed", 0.0))
+                    if not self.spn_rough_seed.hasFocus() and abs(self.spn_rough_seed.value() - r_seed) > 1e-4:
+                        self.spn_rough_seed.blockSignals(True)
+                        self.spn_rough_seed.setValue(r_seed)
+                        self.spn_rough_seed.blockSignals(False)
                 auto_fill = bool(getattr(settings, "apply_auto_fill_caps", True))
                 if self.chk_auto_fill.isChecked() != auto_fill:
                     self.chk_auto_fill.blockSignals(True)

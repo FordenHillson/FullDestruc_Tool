@@ -295,9 +295,12 @@ class FDT_PT_main_panel(bpy.types.Panel):
             any_rough = settings.enable_rough or any(c.rough for c in session.cutters)
             if any_rough:
                 rbox = step3.box()
-                rbox.prop(settings, "rough_scale")
-                rbox.prop(settings, "rough_strength")
-                rbox.prop(settings, "rough_seed")
+                rbox.prop(settings, "rough_inward_ratio", text="Inward Ratio", slider=True)
+                rbox.prop(settings, "rough_strength", text="Strength")
+                rbox.prop(settings, "rough_scale", text="Noise Scale")
+                rbox.prop(settings, "rough_detail", text="Noise Detail", slider=True)
+                rbox.prop(settings, "rough_subdiv", text="Resolution")
+                rbox.prop(settings, "rough_seed", text="Seed")
 
             draw_cut_material_row(step3, settings, text="Cut Material")
             row_uv = step3.row(align=True)

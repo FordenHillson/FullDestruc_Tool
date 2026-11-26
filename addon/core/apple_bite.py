@@ -440,14 +440,12 @@ def _ensure_rough_modifier(
     mod.node_group = ensure_rough_cutter_group()
 
     if settings is not None:
-        base_voxel = float(settings.rough_voxel_size)
-        # During live preview with Rust Engine, use ~1.8x coarser voxels so rough cutters stay 2-3x faster;
-        # on Apply (preview_mode=False), use exact full-resolution voxel size!
-        use_fast_voxel = preview_mode and getattr(settings, "boolean_solver", "") == "RUST"
-        voxel = min(base_voxel * 1.8, 0.25) if use_fast_voxel else base_voxel
-        set_modifier_socket(mod, "Noise Scale", float(settings.rough_scale))
+        subdiv_level = max(1, min(5, int(getattr(settings, "rough_subdiv", 3))))
+        set_modifier_socket(mod, "Inward Ratio", float(getattr(settings, "rough_inward_ratio", 0.35)))
         set_modifier_socket(mod, "Strength", float(settings.rough_strength))
-        set_modifier_socket(mod, "Voxel Size", voxel)
+        set_modifier_socket(mod, "Noise Scale", float(settings.rough_scale))
+        set_modifier_socket(mod, "Noise Detail", float(getattr(settings, "rough_detail", 0.5)))
+        set_modifier_socket(mod, "Subdiv Level", subdiv_level)
         set_modifier_socket(mod, "Seed", float(settings.rough_seed))
 
 

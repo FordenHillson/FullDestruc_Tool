@@ -626,6 +626,85 @@ def test_19_builtin_zone_rename_survives_reload() -> None:
     assert not ok_dup, "Case-insensitive uniqueness must protect renamed built-ins"
 
 
+def test_20_edge_band_inward_rough_cut() -> None:
+    from FullDestruc_Tool.core import geonodes
+
+    _reset_scene()
+    ctx = bpy.context
+    wall = _make_box("EdgeRough_Wall", location=(0, 0, 0), scale=(6, 0.5, 3))
+    ok, msg, _ = apple_bite.enter_session(ctx, target_objects=[wall])
+    assert ok, msg
+
+    # 2x2x2 cube centered at origin -> local bounds [-1, +1] on every axis
+    ok, msg, cutter = apple_bite.add_box_cutter(ctx, location=(0, 0, 0), size=2.0, zone="A")
+    assert ok and cutter is not None, msg
+
+    settings = ctx.scene.fdt_settings
+    settings.rough_inward_ratio = 0.35
+    settings.rough_strength = 0.15
+    settings.rough_scale = 3.0
+    settings.rough_detail = 0.5
+    settings.rough_subdiv = 3
+    settings.rough_seed = 1.0
+
+    ok, is_rough = apple_bite.toggle_cutter_rough(ctx, cutter.name)
+    assert ok and is_rough is True
+
+    mod = cutter.modifiers.get("FDT_RoughCutter")
+    assert mod is not None and mod.node_group is not None
+    assert int(mod.node_group.get("fdt_gn_version", 1)) == geonodes.ROUGH_CUTTER_VERSION
+
+    input_names = {
+        item.name
+        for item in mod.node_group.interface.items_tree
+        if item.item_type == "SOCKET" and item.in_out == "INPUT"
+    }
+    for expected in ("Geometry", "Inward Ratio", "Strength", "Noise Scale", "Noise Detail", "Subdiv Level", "Seed"):
+        assert expected in input_names, f"Missing socket: {expected}"
+
+    def _eval_local_verts():
+        deps = ctx.evaluated_depsgraph_get()
+        eval_obj = cutter.evaluated_get(deps)
+        mesh = eval_obj.to_mesh()
+        try:
+            return [tuple(v.co) for v in mesh.vertices]
+        finally:
+            eval_obj.to_mesh_clear()
+
+    # 1. Inward-only guarantee: no vertex may bulge outside [-1.0, +1.0]
+    verts = _eval_local_verts()
+    assert len(verts) > 200, f"Expected subdivided cutter verts, got {len(verts)}"
+    max_abs = max(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
+    assert max_abs <= 1.0005, f"Rough cutter bulged outward beyond box bounds: max_abs={max_abs:.5f}"
+
+    # 2. Edge band: center of top face (|x|, |y| < 0.2, z > 0.5) must remain flat (z ~ 1.0),
+    # while edge vertices must carve noticeably inward
+    center_top = [z for x, y, z in verts if abs(x) < 0.2 and abs(y) < 0.2 and z > 0.5]
+    assert center_top, "Expected center vertices on top face"
+    assert max(abs(1.0 - z) for z in center_top) < 1e-3, (
+        f"Center of face should stay smooth at Inward Ratio=0.35, got min z={min(center_top):.4f}"
+    )
+
+    edge_inward = max(1.0 - max(abs(x), abs(y), abs(z)) for x, y, z in verts)
+    assert edge_inward > 0.01, f"Expected noticeable inward carving near edges, got {edge_inward:.5f}"
+
+    # 3. Inward Ratio = 0.0 -> zero carving everywhere
+    settings.rough_inward_ratio = 0.0
+    apple_bite.rebuild_session(ctx)
+    verts_zero = _eval_local_verts()
+    max_dev_zero = max(abs(1.0 - max(abs(x), abs(y), abs(z))) for x, y, z in verts_zero)
+    assert max_dev_zero < 1e-4, f"Expected zero carving at Inward Ratio=0.0, got {max_dev_zero:.5f}"
+
+    # 4. Inward Ratio = 1.0 -> carving reaches inner area of the face
+    settings.rough_inward_ratio = 1.0
+    apple_bite.rebuild_session(ctx)
+    verts_full = _eval_local_verts()
+    inner_top = [z for x, y, z in verts_full if abs(x) < 0.35 and abs(y) < 0.35 and z > 0.5]
+    assert inner_top and max(1.0 - z for z in inner_top) > 0.005, (
+        "Expected inward carving to reach inner face region at Inward Ratio=1.0"
+    )
+
+
 ALL_TESTS = [
     test_1_enter_exit_cancel_lifecycle,
     test_2_multi_object_cutting_and_zone_tagging,
@@ -646,4 +725,5 @@ ALL_TESTS = [
     test_17_per_cutter_rough_cut_independence,
     test_18_scene_zone_registry_custom_tokens,
     test_19_builtin_zone_rename_survives_reload,
+    test_20_edge_band_inward_rough_cut,
 ]
