@@ -395,7 +395,7 @@ def test_12_adjacent_box_cutter_overlap_no_sliver() -> None:
     assert ok and c_a is not None, msg
 
     # Add adjacent Cutter B along +X -> auto-overlaps by 0.05m and auto-advances to Zone B!
-    ok, msg, c_b = apple_bite.add_adjacent_box_cutter(ctx, direction="+X", overlap=0.05, auto_next_zone=True)
+    ok, msg, c_b = apple_bite.add_adjacent_box_cutter(ctx, direction="+X", overlap=0.05, auto_next_zone=True, size=2.2)
     assert ok and c_b is not None, msg
     assert c_b.get("fdt_cutter_zone") == "B", f"Expected auto-next Zone B, got {c_b.get('fdt_cutter_zone')}"
     dx = c_b.matrix_world.translation.x - c_a.matrix_world.translation.x
@@ -866,11 +866,15 @@ def test_23_next_box_spawns_cube_and_duplicate_cutter() -> None:
     assert ok and len(added) == 1, msg
     assert len(cyl_obj.data.vertices) > 8
 
-    # Next Box from a custom/drawn cutter MUST spawn a clean 8-vert, 6-face Box!
+    # Next Box from a custom/drawn cutter MUST spawn a standard uniform Cube (8v/6f, settings.cutter_size)!
     ok, msg, next_box = apple_bite.add_adjacent_box_cutter(ctx, direction="+X", overlap=0.05, auto_next_zone=True)
     assert ok and next_box is not None, msg
     assert len(next_box.data.vertices) == 8 and len(next_box.data.polygons) == 6, (
         f"Next Box should be a pure 8v/6f cube, got {len(next_box.data.vertices)}v/{len(next_box.data.polygons)}f"
+    )
+    expected_sz = float(scene.fdt_settings.cutter_size)
+    assert all(abs(d - expected_sz) < 0.01 for d in next_box.dimensions), (
+        f"Next Box should be a uniform {expected_sz}m cube, got {tuple(next_box.dimensions)}"
     )
     assert next_box.get(apple_bite.CUTTER_ZONE_PROP) == "B"
 

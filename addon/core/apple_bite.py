@@ -1593,11 +1593,12 @@ def add_adjacent_box_cutter(
     direction: str = "+X",
     overlap: float = 0.05,
     auto_next_zone: bool = True,
+    size: float | None = None,
 ) -> tuple[bool, str, bpy.types.Object | None]:
-    """Spawn a clean Box cutter flush-adjacent to the active/last cutter along direction.
+    """Spawn a fresh standard Cube cutter flush-adjacent to the active/last cutter along direction.
 
-    Always spawns a pure 6-face Box matching the reference cutter's bounding dimensions
-    and orientation (even when the reference cutter was drawn/sculpted/custom-shaped).
+    Always spawns a uniform standard Cube (``settings.cutter_size``, default 2.0 m) rather than
+    inheriting the previous cutter's stretched dimensions or custom mesh shape.
     Because Pieces subtract all prior cutters (DIFFERENCE cutter_0..i-1), overlapping the
     previous cutter by a few cm eliminates both gaps and coplanar boolean precision slivers.
     """
@@ -1631,7 +1632,7 @@ def add_adjacent_box_cutter(
     context.view_layer.update()
     axis_idx, sign = _DIR_VECTORS.get(direction.upper(), (0, 1.0))
 
-    # Measure reference cutter's clean local bounding box (ignores rough modifier displacement)
+    # Measure reference cutter's clean local bounding box to place the new Cube flush-adjacent
     mw = ref_cutter.matrix_world
     rot_mat = mw.to_quaternion().to_matrix()
     col_scales = [max(mw.col[i].xyz.length, 1e-4) for i in range(3)]
@@ -1649,20 +1650,24 @@ def add_adjacent_box_cutter(
 
     local_center = (local_min + local_max) * 0.5
     ref_world_center = mw @ local_center
-    box_dims = [max((local_max[i] - local_min[i]) * col_scales[i], 0.05) for i in range(3)]
+    ref_extent = max((local_max[axis_idx] - local_min[axis_idx]) * col_scales[axis_idx], 0.05)
 
-    extent = float(box_dims[axis_idx])
-    if extent <= 1e-4:
-        extent = 2.0
-    safe_overlap = min(max(float(overlap), 0.005), extent * 0.25)
-    step_dist = extent - safe_overlap
+    settings = _get_settings(scene)
+    if size is not None and float(size) > 1e-4:
+        cube_size = float(size)
+    elif settings is not None and float(getattr(settings, "cutter_size", 0.0)) > 1e-4:
+        cube_size = float(settings.cutter_size)
+    else:
+        cube_size = 2.0
+
+    safe_overlap = min(max(float(overlap), 0.005), min(ref_extent, cube_size) * 0.25)
+    step_dist = (ref_extent * 0.5) + (cube_size * 0.5) - safe_overlap
 
     local_axis = Vector((0.0, 0.0, 0.0))
     local_axis[axis_idx] = sign
     world_offset = rot_mat @ (local_axis * step_dist)
 
     ref_zone = zone_registry.resolve_zone(ref_cutter.get(CUTTER_ZONE_PROP, "A"), scene).key
-    settings = _get_settings(scene)
     if auto_next_zone:
         zone_id = _next_zone_letter(ref_zone)
         if settings is not None:
@@ -1675,11 +1680,10 @@ def add_adjacent_box_cutter(
     idx = _next_cutter_index(session)
     cutter_name = f"Cutter_{session.session_id}_ID-{_zone_name_token(zone_id, scene)}_{idx:02d}"[:MAX_BLENDER_NAME]
 
-    # Always spawn a fresh pure Box (8 verts, 6 faces) with clean unit scale
+    # Always spawn a fresh standard uniform Cube (8 verts, 6 faces)
     mesh_box = bpy.data.meshes.new(f"{cutter_name}_Mesh")
     bm = bmesh.new()
-    bmesh.ops.create_cube(bm, size=1.0)
-    bmesh.ops.scale(bm, vec=Vector(box_dims), verts=bm.verts)
+    bmesh.ops.create_cube(bm, size=cube_size)
     bm.to_mesh(mesh_box)
     bm.free()
 
@@ -1700,7 +1704,7 @@ def add_adjacent_box_cutter(
     save_session(scene, session)
     rebuild_session(context)
     safe_select_objects(context, [cutter], active=cutter)
-    return True, f"ต่อกล่องชิดขอบ ({direction}) โซน {zone_registry.zone_token(zone_id, scene)} เรียบร้อย (เหลื่อมกัน {safe_overlap*100:.1f} ซม. ไม่เหลือเศษ)", cutter
+    return True, f"วางกล่องใหม่ชิดขอบ ({direction}) โซน {zone_registry.zone_token(zone_id, scene)} เรียบร้อย (เหลื่อมกัน {safe_overlap*100:.1f} ซม.)", cutter
 
 
 def duplicate_selected_cutters(
