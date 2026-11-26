@@ -14,7 +14,7 @@ GN_MARK_ORIG = "FDT_GN_MarkOrig"
 GN_ROUGH_CUTTER = "FDT_GN_RoughCutter"
 GN_CUT_FACE_UV = "FDT_GN_CutFaceUV"
 
-ROUGH_CUTTER_VERSION = 7
+ROUGH_CUTTER_VERSION = 8
 
 ORIG_ATTR_NAME = "fdt_orig"
 UV_ATTR_NAME = "UVMap0"
@@ -86,23 +86,22 @@ def ensure_mark_orig_group() -> bpy.types.NodeTree:
 
 
 def ensure_rough_cutter_group() -> bpy.types.NodeTree:
-    """Create or return FDT_GN_RoughCutter (v7) for blocky, spike-free low-poly concrete fracture.
+    """Create or return FDT_GN_RoughCutter (v8) for bold, blocky, spike-free concrete fracture.
 
-    1. Subdivides cleanly (Level 1-3) and computes a smooth low-frequency 4D Noise field blurred
-       topologically across neighboring vertices (`Blur Attribute` FLOAT, 2 iterations) so no
-       isolated corner or single vertex can protrude as a thin needle/spike.
-    2. Displaces strictly inward (`-Normal`, clamped safely to 26% of min cutter dimension) and
-       applies proportional topological position blunting (`Blur Attribute` FLOAT_VECTOR) to turn
-       any acute protruding tip into a sturdy, believable concrete rubble facet.
-    3. Uniformly scales the blunted jagged shape inward toward its bounding-box center by
-       `Inward Depth` (`scale = 1.0 - Inward Depth * 0.85`), preserving the exact silhouette.
+    1. Subdivides cleanly (Level 1-3) and runs 1-pass topological `Blur Attribute` on raw 4D Noise
+       BEFORE contrast stretching (`Map Range 0.30..0.70 -> 0..1`) so single-vertex needles are
+       eliminated while full bold 0..1 jagged concrete chunks are preserved.
+    2. Displaces strictly inward (`-Normal`, up to 42% of min cutter dimension) and applies light
+       position blunting (max weight 0.20) to trim razor tips without softening the big chunks.
+    3. Uniformly scales the jagged shape inward toward its bounding-box center by `Inward Depth`
+       (`scale = 1.0 - Inward Depth * 0.85`), preserving the exact silhouette.
     4. Finishes with shortest-diagonal Triangulate + Merge by Distance + Flat Shading.
     """
     existing = bpy.data.node_groups.get(GN_ROUGH_CUTTER)
     if existing is not None:
         if int(existing.get("fdt_gn_version", 1)) >= ROUGH_CUTTER_VERSION:
             return existing
-        # Upgrade legacy v1-v6 node group in-place so existing modifier links stay intact
+        # Upgrade legacy v1-v7 node group in-place so existing modifier links stay intact
         ng = existing
         ng.links.clear()
         ng.nodes.clear()
@@ -152,7 +151,7 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     n_in = nodes.new("NodeGroupInput")
     n_in.location = (-1400, 0)
 
-    # 1. Bounding Box -> center (for inward scaling) & safe max jagged amplitude (0.26 * min_dim)
+    # 1. Bounding Box -> center (for inward scaling) & bold max jagged amplitude (0.42 * min_dim)
     n_bbox = nodes.new("GeometryNodeBoundBox")
     n_bbox.location = (-1140, 360)
     links.new(n_in.outputs["Geometry"], n_bbox.inputs["Geometry"])
@@ -194,10 +193,10 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     n_max_amp = nodes.new("ShaderNodeMath")
     n_max_amp.location = (-140, 300)
     n_max_amp.operation = "MULTIPLY"
-    n_max_amp.inputs[1].default_value = 0.26
+    n_max_amp.inputs[1].default_value = 0.42
     links.new(n_min_xyz.outputs["Value"], n_max_amp.inputs[0])
 
-    # jagged_amp = 0.26 * min_dim * Jaggedness
+    # jagged_amp = 0.42 * min_dim * Jaggedness
     n_jagged_amp = nodes.new("ShaderNodeMath")
     n_jagged_amp.location = (60, 260)
     n_jagged_amp.operation = "MULTIPLY"
@@ -210,40 +209,40 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     links.new(n_in.outputs["Geometry"], n_subdiv.inputs["Mesh"])
     links.new(n_in.outputs["Detail"], n_subdiv.inputs["Level"])
 
-    # 3. Broad, blocky 4D Noise (no pointy Voronoi F1 cusps) + topological Blur Attribute
+    # 3. Bold 4D Noise -> 1-pass topological blur (kills single-vertex needles) -> FULL contrast stretch!
     n_noise = nodes.new("ShaderNodeTexNoise")
     n_noise.location = (-720, -220)
     n_noise.noise_dimensions = "4D"
-    n_noise.inputs["Detail"].default_value = 1.2
-    n_noise.inputs["Roughness"].default_value = 0.4
+    n_noise.inputs["Detail"].default_value = 2.0
+    n_noise.inputs["Roughness"].default_value = 0.55
     n_noise.inputs["Distortion"].default_value = 0.0
     links.new(n_in.outputs["Noise Scale"], n_noise.inputs["Scale"])
     links.new(n_in.outputs["Seed"], n_noise.inputs["W"])
 
+    n_blur_val = nodes.new("GeometryNodeBlurAttribute")
+    n_blur_val.location = (-460, -220)
+    n_blur_val.data_type = "FLOAT"
+    n_blur_val.inputs["Iterations"].default_value = 1
+    n_blur_val.inputs["Weight"].default_value = 0.55
+    links.new(n_noise.outputs["Fac"], _get_socket(n_blur_val.inputs, "Value", index=0))
+
+    # Stretch contrast AFTER blur so full 0..1 jagged depth is preserved without single-vertex needles
     n_contrast = nodes.new("ShaderNodeMapRange")
-    n_contrast.location = (-460, -220)
+    n_contrast.location = (-200, -220)
     n_contrast.data_type = "FLOAT"
-    n_contrast.interpolation_type = "SMOOTHSTEP"
+    n_contrast.interpolation_type = "LINEAR"
     n_contrast.clamp = True
-    n_contrast.inputs["From Min"].default_value = 0.25
-    n_contrast.inputs["From Max"].default_value = 0.75
+    n_contrast.inputs["From Min"].default_value = 0.30
+    n_contrast.inputs["From Max"].default_value = 0.70
     n_contrast.inputs["To Min"].default_value = 0.0
     n_contrast.inputs["To Max"].default_value = 1.0
-    links.new(n_noise.outputs["Fac"], n_contrast.inputs["Value"])
-
-    # Blur scalar displacement across neighboring vertices to prevent isolated single-vertex needles
-    n_blur_val = nodes.new("GeometryNodeBlurAttribute")
-    n_blur_val.location = (-200, -220)
-    n_blur_val.data_type = "FLOAT"
-    n_blur_val.inputs["Iterations"].default_value = 2
-    n_blur_val.inputs["Weight"].default_value = 0.85
-    links.new(n_contrast.outputs["Result"], _get_socket(n_blur_val.inputs, "Value", index=0))
+    links.new(_get_socket(n_blur_val.outputs, "Value", index=0), n_contrast.inputs["Value"])
 
     # 4. Inward jagged fracture displacement along -Normal
     n_disp = nodes.new("ShaderNodeMath")
     n_disp.location = (100, -160)
     n_disp.operation = "MULTIPLY"
-    links.new(_get_socket(n_blur_val.outputs, "Value", index=0), n_disp.inputs[0])
+    links.new(n_contrast.outputs["Result"], n_disp.inputs[0])
     links.new(n_jagged_amp.outputs["Value"], n_disp.inputs[1])
 
     n_neg = nodes.new("ShaderNodeMath")
@@ -266,18 +265,17 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     links.new(n_subdiv.outputs["Mesh"], n_set_jagged.inputs["Geometry"])
     links.new(n_vec_scale.outputs["Vector"], n_set_jagged.inputs["Offset"])
 
-    # 5. Anti-Spike Position Blunting: proportionally smooth sharp tips into sturdy concrete chunks
-    # blur_weight = clamp(Jaggedness * 0.75, 0.0, 0.50) (zero blunting when Jaggedness == 0)
+    # 5. Light Anti-Spike Position Blunting: trims razor tips (max weight 0.20) while keeping chunks bold
     n_blunt_mul = nodes.new("ShaderNodeMath")
     n_blunt_mul.location = (460, -40)
     n_blunt_mul.operation = "MULTIPLY"
-    n_blunt_mul.inputs[1].default_value = 0.75
+    n_blunt_mul.inputs[1].default_value = 0.25
     links.new(n_in.outputs["Jaggedness"], n_blunt_mul.inputs[0])
 
     n_blunt_w = nodes.new("ShaderNodeMath")
     n_blunt_w.location = (640, -40)
     n_blunt_w.operation = "MINIMUM"
-    n_blunt_w.inputs[1].default_value = 0.50
+    n_blunt_w.inputs[1].default_value = 0.20
     links.new(n_blunt_mul.outputs["Value"], n_blunt_w.inputs[0])
 
     n_pos_blunt_in = nodes.new("GeometryNodeInputPosition")
