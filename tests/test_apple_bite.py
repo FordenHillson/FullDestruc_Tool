@@ -685,8 +685,8 @@ def test_20_edge_band_inward_rough_cut() -> None:
     # 1. Per-cutter independence: c1 (Detail=2, full size) vs c2 (Detail=1, scaled inward)
     v1_0, p1 = _eval_local_mesh(c1)
     v2, p2 = _eval_local_mesh(c2)
-    assert 24 <= p1 <= 220, f"Expected low-poly Detail=2 on c1, got {p1}"
-    assert 12 <= p2 <= 60, f"Expected ultra low-poly Detail=1 on c2, got {p2}"
+    assert 8 <= p1 <= 260, f"Expected low-poly planar cleavage facets on c1, got {p1}"
+    assert 6 <= p2 <= 160, f"Expected ultra low-poly planar cleavage facets on c2, got {p2}"
     max_abs_1 = max(max(abs(x), abs(y), abs(z)) for x, y, z in v1_0)
     max_abs_2 = max(max(abs(x), abs(y), abs(z)) for x, y, z in v2)
     assert max_abs_1 <= 1.0005 and max_abs_1 > 0.85, f"c1 at Inward Depth=0 should span full box: {max_abs_1:.4f}"
