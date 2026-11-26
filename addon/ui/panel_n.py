@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import bpy
 
-from ..core import apple_bite, rust_bridge, zone_registry
+from ..core import apple_bite, rename_tool, rust_bridge, zone_registry
 from ..core.session import load_session
 from ..ops import apple_bite_ops
 from ..ops.material_picker import draw_cut_material_row
@@ -20,6 +20,165 @@ _TOOL_TABS = (
     ("CLEANUP", "BRUSH_DATA"),
     ("BATCH", "MOD_ARRAY"),
 )
+
+
+def _draw_rename_box(layout: bpy.types.UILayout, context: bpy.types.Context, settings) -> None:
+    """User-driven Object Rename box — always available, never tied to Zone Registry."""
+    targets = rename_tool.get_target_objects(context)
+    count = len(targets)
+
+    box = layout.box()
+    hdr = box.row(align=True)
+    is_open = bool(getattr(settings, "ui_show_rename", True))
+    hdr.prop(
+        settings,
+        "ui_show_rename",
+        text=f"Rename Objects ({count})" if count else "Rename Objects",
+        icon="TRIA_DOWN" if is_open else "TRIA_RIGHT",
+        emboss=False,
+    )
+    if not is_open:
+        return
+
+    mode = str(getattr(settings, "rename_mode", "FULL") or "FULL")
+    row_mode = box.row(align=True)
+    row_mode.prop(settings, "rename_mode", expand=True)
+
+    row_input = box.row(align=True)
+    row_input.prop(settings, "rename_text", text="ID" if mode == "TAG" else "Name")
+    row_input.operator("fdt.rename_pick_active", text="", icon="EYEDROPPER")
+
+    row_opts = box.row(align=True)
+    if mode == "FULL":
+        row_opts.prop(settings, "rename_auto_number", text="Auto #")
+        if bool(getattr(settings, "rename_auto_number", True)):
+            row_opts.prop(settings, "rename_start_index", text="Start")
+    row_opts.prop(settings, "rename_sync_mesh", text="Sync Mesh")
+
+    raw_text = str(getattr(settings, "rename_text", "") or "").strip()
+    preview_plan = (
+        rename_tool.build_target_names(
+            targets,
+            mode=mode,
+            text=raw_text,
+            auto_number=bool(getattr(settings, "rename_auto_number", True)),
+            start_index=int(getattr(settings, "rename_start_index", 1)),
+        )
+        if targets and raw_text
+        else []
+    )
+    if not targets:
+        box.label(text="Select object(s) in Viewport or Outliner", icon="INFO")
+    elif preview_plan:
+        first_obj, first_new = preview_plan[0]
+        extra = f" (+{len(preview_plan) - 1})" if len(preview_plan) > 1 else ""
+        box.label(text=f"-> {first_new}{extra}", icon="GREASEPENCIL")
+    else:
+        hint = "Type new ID (e.g. A, B, A#B)" if mode == "TAG" else "Type new object name"
+        box.label(text=hint, icon="INFO")
+
+    row_btn = box.row()
+    row_btn.scale_y = 1.2
+    row_btn.enabled = bool(preview_plan)
+    btn_label = f"Rename ({count})" if count > 1 else "Rename"
+    row_btn.operator("fdt.rename_objects", text=btn_label, icon="CHECKMARK")
+
+
+
+_CUTTER_LIST_SYNC_PENDING = False
+
+
+def _deferred_sync_cutter_list() -> float | None:
+    global _CUTTER_LIST_SYNC_PENDING
+    _CUTTER_LIST_SYNC_PENDING = False
+    scene = getattr(getattr(bpy, "context", None), "scene", None)
+    if scene is not None:
+        from ..props import sync_cutter_layer_items
+
+        sync_cutter_layer_items(scene)
+    wm = getattr(getattr(bpy, "context", None), "window_manager", None)
+    if wm is not None:
+        for win in wm.windows:
+            screen = getattr(win, "screen", None)
+            if screen is None:
+                continue
+            for area in screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    return None
+
+
+def _schedule_cutter_list_sync() -> None:
+    """Defer syncing CollectionProperty outside Panel.draw() (e.g. legacy .blend files)."""
+    global _CUTTER_LIST_SYNC_PENDING
+    if _CUTTER_LIST_SYNC_PENDING:
+        return
+    _CUTTER_LIST_SYNC_PENDING = True
+    try:
+        bpy.app.timers.register(_deferred_sync_cutter_list, first_interval=0.0)
+    except Exception:
+        _CUTTER_LIST_SYNC_PENDING = False
+
+
+@bpy.app.handlers.persistent
+def _on_cutter_list_handler(_dummy=None) -> None:
+    scene = getattr(getattr(bpy, "context", None), "scene", None)
+    if scene is not None:
+        from ..props import sync_cutter_layer_items
+
+        sync_cutter_layer_items(scene)
+
+
+class FDT_UL_cutter_layers(bpy.types.UIList):
+    """Compact scrollable Cutter Layers list with inline Zone, Rough & Mute controls."""
+
+    bl_idname = "FDT_UL_cutter_layers"
+
+    def draw_item(
+        self,
+        context,
+        layout,
+        data,
+        item,
+        icon,
+        active_data,
+        active_propname,
+        index=0,
+    ):
+        if self.layout_type in {"DEFAULT", "COMPACT"}:
+            row = layout.row(align=True)
+
+            z_col = row.row(align=True)
+            z_col.ui_units_x = 2.6
+            z_label = zone_registry.zone_token(item.zone, context.scene)
+            op_z = z_col.operator("fdt.applebite_cycle_zone", text=f"[{z_label[:10]}]")
+            op_z.cutter_name = item.name
+
+            lbl_col = row.row(align=True)
+            lbl_col.active = not bool(item.muted)
+            lbl_col.label(text=item.name)
+
+            act = row.row(align=True)
+            op_rough = act.operator(
+                "fdt.applebite_toggle_rough",
+                text="",
+                icon="MOD_DISPLACE",
+                depress=bool(item.rough),
+                emboss=bool(item.rough),
+            )
+            op_rough.cutter_name = item.name
+
+            op_mute = act.operator(
+                "fdt.applebite_toggle_mute",
+                text="",
+                icon="HIDE_ON" if item.muted else "HIDE_OFF",
+                depress=bool(item.muted),
+                emboss=bool(item.muted),
+            )
+            op_mute.cutter_name = item.name
+        elif self.layout_type == "GRID":
+            layout.alignment = "CENTER"
+            layout.label(text=item.name)
 
 
 class FDT_OT_set_active_tool(bpy.types.Operator):
@@ -111,6 +270,8 @@ class FDT_PT_main_panel(bpy.types.Panel):
             box_batch = detail.box()
             box_batch.label(text="Reserved slot for future Batch Pipeline", icon="TIME")
 
+        _draw_rename_box(detail, context, settings)
+
     def _draw_step1_idle(self, layout: bpy.types.UILayout, context: bpy.types.Context) -> None:
         info = apple_bite.detect_step1_action(context)
 
@@ -201,7 +362,7 @@ class FDT_PT_main_panel(bpy.types.Panel):
         zone_manage = step2.row(align=True)
         for action, label, icon in (
             ("NEW", "New Zone", "ADD"),
-            ("RENAME", "Rename", "GREASEPENCIL"),
+            ("RENAME", "Edit Zone", "GREASEPENCIL"),
             ("DELETE", "Delete", "TRASH"),
         ):
             op = zone_manage.operator("fdt.zone_manage", text=label, icon=icon)
@@ -235,56 +396,68 @@ class FDT_PT_main_panel(bpy.types.Panel):
                 row_grid.prop(settings, "zone_grid_size", text="Size")
             step2.label(text="Tip: Click Gear icon on box for Radial Wheel & 3D Axis", icon="PREFERENCES")
 
-            # Live Cutter Layer List (Up/Down | Zone | Select | Rough | Mute | Delete)
+            # Compact collapsible & scrollable Cutter Layers (UIList + Up/Down/Delete sidebar)
             list_box = step2.box()
-            list_box.label(text=f"Cutter Layers ({len(session.cutters)}) — Top = Priority:", icon="OUTLINER_OB_MESH")
-            active_obj = context.active_object
             total_c = len(session.cutters)
-            for idx, entry in enumerate(session.cutters):
-                row = list_box.row(align=True)
-                is_sel = active_obj is not None and active_obj.name == entry.name
+            show_layers = bool(getattr(settings, "ui_show_cutter_layers", True))
+            hdr = list_box.row(align=True)
+            hdr.prop(
+                settings,
+                "ui_show_cutter_layers",
+                text=f"Cutter Layers ({total_c}) — Top = Priority",
+                icon="TRIA_DOWN" if show_layers else "TRIA_RIGHT",
+                emboss=False,
+            )
+            if show_layers:
+                items = getattr(settings, "cutter_layer_items", None)
+                if items is not None:
+                    cur_sig = [(it.name, it.zone, bool(it.muted), bool(it.rough)) for it in items]
+                    want_sig = [(c.name, c.zone, bool(c.muted), bool(c.rough)) for c in session.cutters]
+                    if cur_sig != want_sig:
+                        _schedule_cutter_list_sync()
 
-                col_up = row.row(align=True)
-                col_up.enabled = idx > 0
+                list_row = list_box.row(align=True)
+                if hasattr(list_row, "template_list"):
+                    list_row.template_list(
+                        "FDT_UL_cutter_layers",
+                        "",
+                        settings,
+                        "cutter_layer_items",
+                        settings,
+                        "cutter_layer_index",
+                        rows=min(5, max(2, total_c)),
+                        maxrows=8,
+                    )
+
+                active_idx = int(getattr(settings, "cutter_layer_index", 0))
+                if active_idx < 0 or active_idx >= total_c:
+                    active_obj = context.active_object
+                    active_idx = next(
+                        (i for i, c in enumerate(session.cutters) if active_obj is not None and c.name == active_obj.name),
+                        0,
+                    )
+                sel_entry = session.cutters[active_idx] if 0 <= active_idx < total_c else None
+
+                side = list_row.column(align=True)
+                col_up = side.row(align=True)
+                col_up.enabled = sel_entry is not None and active_idx > 0
                 op_up = col_up.operator("fdt.applebite_move_cutter", text="", icon="TRIA_UP")
-                op_up.cutter_name = entry.name
+                if sel_entry is not None:
+                    op_up.cutter_name = sel_entry.name
                 op_up.direction = "UP"
 
-                col_dn = row.row(align=True)
-                col_dn.enabled = idx < (total_c - 1)
+                col_dn = side.row(align=True)
+                col_dn.enabled = sel_entry is not None and active_idx < (total_c - 1)
                 op_dn = col_dn.operator("fdt.applebite_move_cutter", text="", icon="TRIA_DOWN")
-                op_dn.cutter_name = entry.name
+                if sel_entry is not None:
+                    op_dn.cutter_name = sel_entry.name
                 op_dn.direction = "DOWN"
 
-                z_label = zone_registry.zone_token(entry.zone, context.scene)
-                op_z = row.operator("fdt.applebite_cycle_zone", text=f"[{z_label[:12]}]")
-                op_z.cutter_name = entry.name
-
-                op_sel = row.operator(
-                    "fdt.applebite_select_cutter",
-                    text=entry.name,
-                    depress=is_sel,
-                )
-                op_sel.cutter_name = entry.name
-
-                op_rough = row.operator(
-                    "fdt.applebite_toggle_rough",
-                    text="",
-                    icon="MOD_DISPLACE",
-                    depress=entry.rough,
-                )
-                op_rough.cutter_name = entry.name
-
-                op_mute = row.operator(
-                    "fdt.applebite_toggle_mute",
-                    text="",
-                    icon="HIDE_ON" if entry.muted else "HIDE_OFF",
-                    depress=entry.muted,
-                )
-                op_mute.cutter_name = entry.name
-
-                op_del = row.operator("fdt.applebite_delete_cutter", text="", icon="X")
-                op_del.cutter_name = entry.name
+                col_del = side.row(align=True)
+                col_del.enabled = sel_entry is not None
+                op_del = col_del.operator("fdt.applebite_delete_cutter", text="", icon="X")
+                if sel_entry is not None:
+                    op_del.cutter_name = sel_entry.name
 
         # --- Step 3: Tune Cut & Apply ---
         if session.cutters:
@@ -346,14 +519,28 @@ class FDT_PT_main_panel(bpy.types.Panel):
         row_end.operator("fdt.applebite_cancel", text="Cancel & Restore", icon="LOOP_BACK")
 
 
-CLASSES = (FDT_OT_set_active_tool, FDT_PT_main_panel)
+CLASSES = (FDT_OT_set_active_tool, FDT_UL_cutter_layers, FDT_PT_main_panel)
+
+_HANDLER_ATTRS = ("load_post", "undo_post", "redo_post")
 
 
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    handlers = getattr(getattr(bpy, "app", None), "handlers", None)
+    if handlers is not None:
+        for attr in _HANDLER_ATTRS:
+            hlist = getattr(handlers, attr, None)
+            if hlist is not None and _on_cutter_list_handler not in hlist:
+                hlist.append(_on_cutter_list_handler)
 
 
 def unregister():
+    handlers = getattr(getattr(bpy, "app", None), "handlers", None)
+    if handlers is not None:
+        for attr in _HANDLER_ATTRS:
+            hlist = getattr(handlers, attr, None)
+            if hlist is not None and _on_cutter_list_handler in hlist:
+                hlist.remove(_on_cutter_list_handler)
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

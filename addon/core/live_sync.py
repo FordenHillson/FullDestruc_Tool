@@ -316,6 +316,36 @@ def _trailing_sync_timer() -> float | None:
     return None
 
 
+_ADOPT_REBUILD_PENDING = False
+
+
+def _deferred_adopted_rebuild() -> float | None:
+    global _ADOPT_REBUILD_PENDING
+    _ADOPT_REBUILD_PENDING = False
+    ctx = getattr(bpy, "context", None)
+    scene = getattr(ctx, "scene", None) if ctx is not None else None
+    if ctx is None or scene is None or load_session(scene) is None:
+        return None
+    try:
+        from . import apple_bite
+
+        apple_bite.rebuild_session(ctx)
+    except Exception as exc:
+        print(f"[FullDestruc_Tool] Adopted cutter rebuild error: {exc}")
+    return None
+
+
+def _schedule_adopted_rebuild() -> None:
+    global _ADOPT_REBUILD_PENDING
+    if _ADOPT_REBUILD_PENDING:
+        return
+    _ADOPT_REBUILD_PENDING = True
+    try:
+        bpy.app.timers.register(_deferred_adopted_rebuild, first_interval=0.0)
+    except Exception:
+        _ADOPT_REBUILD_PENDING = False
+
+
 @persistent
 def _on_depsgraph_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
     global _IS_SYNCING, _LAST_SYNC_TIME, _TRAILING_TIMER_SCHEDULED
@@ -329,6 +359,20 @@ def _on_depsgraph_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph)
     # Auto-enable show_in_front ONLY while editing a cutter in Edit Mode, and hide noisy rough
     # black wireframes (BOUNDS) whenever a rough cutter is idle (neither Edit Mode nor tuning).
     from . import apple_bite as _ab
+
+    # Auto-adopt cutters duplicated via Shift+D / Alt+D / Ctrl+C+V / Outliner before Apply
+    adopted = []
+    _IS_SYNCING = True
+    try:
+        adopted = _ab.adopt_duplicated_cutters(scene)
+    except Exception as exc:
+        print(f"[FullDestruc_Tool] Duplicate cutter adopt error: {exc}")
+    finally:
+        _IS_SYNCING = False
+    if adopted:
+        session = load_session(scene)
+        if session is None:
+            return
 
     for entry in session.cutters:
         c_obj = bpy.data.objects.get(entry.name)
@@ -361,9 +405,13 @@ def _on_depsgraph_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph)
                             pass
 
     if settings is None or getattr(settings, "boolean_solver", "") != "RUST":
+        if adopted:
+            _schedule_adopted_rebuild()
         return
 
     if not rust_bridge.is_available():
+        if adopted:
+            _schedule_adopted_rebuild()
         return
 
     active_cutters = session.get_valid_cutters(include_muted=False)

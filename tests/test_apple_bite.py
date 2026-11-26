@@ -329,6 +329,13 @@ class _MockUILayout:
         assert hasattr(data, prop_name), f"Missing property '{prop_name}' on {data}"
         return None
 
+    def template_list(self, listtype_name, list_id, dataptr, propname, active_dataptr, active_propname, **kwargs):
+        assert hasattr(dataptr, propname), f"Missing list property '{propname}' on {dataptr}"
+        assert hasattr(active_dataptr, active_propname), f"Missing index property '{active_propname}' on {active_dataptr}"
+        self.lists = getattr(self, "lists", [])
+        self.lists.append((listtype_name, kwargs.get("rows"), kwargs.get("maxrows")))
+        return None
+
     def operator(self, op_id, text="", **kwargs):
         self.operators.append(op_id)
 
@@ -355,16 +362,21 @@ def test_10_panel_draw_renders_apply_button_without_errors() -> None:
     FDT_PT_main_panel.draw(panel, ctx)
     assert "fdt.applebite_smart_start" in mock_idle.operators
 
-    # 2. Active session with cutter -> MUST render Apply, Exit, Cancel without NameError!
+    # 2. Active session with cutter -> MUST render scrollable UIList, Apply, Exit, Cancel without NameError!
     wall = _make_box("Panel_Wall", location=(0, 0, 0), scale=(4, 0.5, 3))
     ok, msg, _ = apple_bite.enter_session(ctx, target_objects=[wall])
     assert ok, msg
-    ok, msg, _ = apple_bite.add_box_cutter(ctx, size=1.5, zone="A")
-    assert ok, msg
+    ok, msg, c1 = apple_bite.add_box_cutter(ctx, size=1.5, zone="A")
+    assert ok and c1 is not None, msg
+    assert len(ctx.scene.fdt_settings.cutter_layer_items) == 1
+    assert ctx.scene.fdt_settings.cutter_layer_items[0].name == c1.name
 
     mock_active = _MockUILayout()
     panel.layout = mock_active
     FDT_PT_main_panel.draw(panel, ctx)
+    assert any(lt == "FDT_UL_cutter_layers" for lt, _, _ in getattr(mock_active, "lists", [])), (
+        "Scrollable FDT_UL_cutter_layers UIList was NOT drawn in N-Panel!"
+    )
     assert "fdt.applebite_apply" in mock_active.operators, "Apply button was NOT drawn in N-Panel!"
     assert "fdt.applebite_exit" in mock_active.operators, "Exit button was NOT drawn in N-Panel!"
     assert "fdt.applebite_cancel" in mock_active.operators, "Cancel button was NOT drawn in N-Panel!"
@@ -600,6 +612,7 @@ def test_18_scene_zone_registry_custom_tokens() -> None:
     assert baked.endswith("_FDST_ID-ID-A#B"), baked
 
     assert apple_bite.set_cutters_zone(ctx, [cutter], "Z") == 1
+    assert "_ID-Z_" in cutter.name, f"Expected cutter renamed to Zone Z, got {cutter.name}"
     cycled = apple_bite.cycle_cutter_zone(ctx, cutter.name)
     assert cycled is not None and cycled[0] == key and "ID-B#7" in cycled[1]
 
@@ -709,6 +722,190 @@ def test_20_edge_band_inward_rough_cut() -> None:
     assert c1.display_type == "BOUNDS", f"Expected BOUNDS when rough cutter is idle, got {c1.display_type}"
 
 
+def test_21_set_zone_renames_cutter_and_active_zone_dropdown() -> None:
+    from FullDestruc_Tool.core import zone_registry
+    from FullDestruc_Tool.props import set_active_zone_silent
+
+    _reset_scene()
+    ctx = bpy.context
+    scene = ctx.scene
+
+    # Target already carries _FDST_ID-C_LOD0 so we verify _FDST_ID- is never mangled
+    wall = _make_box("PubVillage_E_2L01_V2_dst_FDST_ID-C_LOD0", location=(0, 0, 0), scale=(4, 0.5, 3))
+    ok, msg, _sess = apple_bite.enter_session(ctx, target_objects=[wall])
+    assert ok, msg
+
+    ok, msg, cutter = apple_bite.add_box_cutter(ctx, location=(0, 0, 0), size=1.5, zone="B")
+    assert ok and cutter is not None, msg
+    assert "_ID-B_" in cutter.name, f"Expected initial _ID-B_ name, got {cutter.name}"
+
+    # 1. set_cutters_zone (used by N-panel buttons, wheel, zone picker, Qt) renames cutter & working pieces
+    assert apple_bite.set_cutters_zone(ctx, [cutter], "A") == 1
+    assert cutter.get(apple_bite.CUTTER_ZONE_PROP) == "A"
+    assert "_ID-A_" in cutter.name and "_ID-B_" not in cutter.name, f"Cutter was not renamed: {cutter.name}"
+    assert "_ID-A_" in cutter.data.name, f"Cutter mesh data was not renamed: {cutter.data.name}"
+    sess_now = session.load_session(scene)
+    assert sess_now is not None and sess_now.cutters[0].name == cutter.name and sess_now.cutters[0].zone == "A"
+
+    pieces_col = sess_now.get_collections()["pieces"]
+    if pieces_col is not None:
+        for p in pieces_col.objects:
+            assert p.get(apple_bite.PIECE_ZONE_PROP) == "A"
+            assert "_FDST_ID-C_LOD0_ID-A_" in p.name, f"Piece name out of sync: {p.name}"
+
+    # 2. Out-of-sync name healing: cutter already tagged A but still named _ID-B_01
+    cutter.name = cutter.name.replace("_ID-A_", "_ID-B_")
+    sess_now.cutters[0].name = cutter.name
+    session.save_session(scene, sess_now)
+    assert apple_bite.set_cutters_zone(ctx, [cutter], "A") == 1
+    assert "_ID-A_" in cutter.name and "_ID-B_" not in cutter.name, f"Failed to heal stale name: {cutter.name}"
+
+    # 3. active_zone dropdown updates selected cutter; set_active_zone_silent does NOT
+    apple_bite.safe_select_objects(ctx, [cutter], active=cutter)
+    scene.fdt_settings.active_zone = "D"
+    assert cutter.get(apple_bite.CUTTER_ZONE_PROP) == "D"
+    assert "_ID-D_" in cutter.name, f"active_zone dropdown did not rename selected cutter: {cutter.name}"
+
+    set_active_zone_silent(scene.fdt_settings, "E")
+    assert scene.fdt_settings.active_zone == "E"
+    assert cutter.get(apple_bite.CUTTER_ZONE_PROP) == "D" and "_ID-D_" in cutter.name
+
+    # 4. Renaming a zone token updates existing session cutters using that zone key
+    ok_z, msg_z, custom_key = zone_registry.create_zone("ID-A#B", "A", "ID", scene=scene)
+    assert ok_z, msg_z
+    assert apple_bite.set_cutters_zone(ctx, [cutter], custom_key) == 1
+    assert "_ID-ID-A#B_" in cutter.name, cutter.name
+
+    ok_u, msg_u = zone_registry.update_zone(custom_key, token="ID-A_VIS-A#B", scene=scene)
+    assert ok_u, msg_u
+    assert apple_bite.sync_zone_visuals_and_names(ctx, custom_key) == 1
+    assert "_ID-ID-A_VIS-A#B_" in cutter.name, f"Zone rename did not update cutter name: {cutter.name}"
+
+    # 5. Custom mesh cutters without _ID- keep their user-given name
+    custom_mesh = _make_box("MyCustomCutter", location=(1.2, 0, 0), scale=(1.0, 1.0, 1.0))
+    ok_c, msg_c, added = apple_bite.add_custom_mesh_cutters(ctx, [custom_mesh], zone="B")
+    assert ok_c and len(added) == 1, msg_c
+    assert apple_bite.set_cutters_zone(ctx, [custom_mesh], "A") == 1
+    assert custom_mesh.name == "MyCustomCutter" and custom_mesh.get(apple_bite.CUTTER_ZONE_PROP) == "A"
+
+
+def test_22_user_driven_rename_tool() -> None:
+    from FullDestruc_Tool.core import rename_tool
+    from FullDestruc_Tool.ui.panel_n import FDT_PT_main_panel
+
+    _reset_scene()
+    ctx = bpy.context
+    scene = ctx.scene
+
+    # 1. FULL mode: single object direct rename + mesh sync
+    m1 = _make_box("TempCube", location=(0, 0, 0))
+    ok, msg, pairs = rename_tool.rename_objects(ctx, [m1], mode="FULL", text="CustomWall_Main", sync_mesh_data=True)
+    assert ok and m1.name == "CustomWall_Main" and m1.data.name == "CustomWall_Main_Mesh", (msg, pairs)
+
+    # 2. FULL mode: multiple objects auto-numbered _01, _02
+    m2 = _make_box("AlphaBox", location=(2, 0, 0))
+    m3 = _make_box("BetaBox", location=(4, 0, 0))
+    ok, msg, _ = rename_tool.rename_objects(ctx, [m3, m2], mode="FULL", text="PillarPart", auto_number=True, start_index=1)
+    assert ok and m2.name == "PillarPart_01" and m3.name == "PillarPart_02", (msg, m2.name, m3.name)
+
+    # 3. TAG mode: replaces ID freely without touching Zone Registry
+    baked_like = _make_box("PubVillage_E_2L01_V2_dst_FDST_ID-C_LOD0", location=(6, 0, 0))
+    ok, msg, _ = rename_tool.rename_objects(ctx, [baked_like], mode="TAG", text="A#Custom99")
+    assert ok and baked_like.name == "PubVillage_E_2L01_V2_dst_FDST_ID-A#Custom99_LOD0", (msg, baked_like.name)
+
+    # 4. Cutter inside active Apple Bite session: rename keeps session & pieces synced without changing zone
+    wall = _make_box("RenameSessionWall", location=(0, 5, 0), scale=(4, 0.5, 3))
+    ok, msg, _sess = apple_bite.enter_session(ctx, target_objects=[wall])
+    assert ok, msg
+    ok, msg, cutter = apple_bite.add_box_cutter(ctx, location=(0, 5, 0), size=1.5, zone="B")
+    assert ok and cutter is not None, msg
+
+    ok, msg, _ = rename_tool.rename_objects(ctx, [cutter], mode="TAG", text="FreeID")
+    assert ok and "_ID-FreeID_" in cutter.name, (msg, cutter.name)
+    assert cutter.get(apple_bite.CUTTER_ZONE_PROP) == "B", "Manual rename must NOT change fdt_cutter_zone"
+    sess_after = session.load_session(scene)
+    assert sess_after is not None and sess_after.cutters[0].name == cutter.name and sess_after.cutters[0].zone == "B"
+
+    # Also test full free-form rename on cutter
+    ok, msg, _ = rename_tool.rename_objects(ctx, [cutter], mode="FULL", text="MyManualCutter")
+    assert ok and cutter.name == "MyManualCutter", (msg, cutter.name)
+    sess_after2 = session.load_session(scene)
+    assert sess_after2 is not None and sess_after2.cutters[0].name == "MyManualCutter"
+
+    # 5. Panel draw renders fdt.rename_objects cleanly
+    class _DummyPanel:
+        _draw_step1_idle = FDT_PT_main_panel._draw_step1_idle
+        _draw_step2_and_step3_active = FDT_PT_main_panel._draw_step2_and_step3_active
+
+    panel = _DummyPanel()
+    mock_layout = _MockUILayout()
+    panel.layout = mock_layout
+    FDT_PT_main_panel.draw(panel, ctx)
+    assert "fdt.rename_objects" in mock_layout.operators, "Rename Objects button was not drawn in N-Panel!"
+
+
+def test_23_next_box_spawns_cube_and_duplicate_cutter() -> None:
+    _reset_scene()
+    ctx = bpy.context
+    scene = ctx.scene
+
+    wall = _make_box("DupNext_Wall", location=(0, 0, 0), scale=(8, 0.5, 3))
+    ok, msg, sess = apple_bite.enter_session(ctx, target_objects=[wall])
+    assert ok and sess is not None, msg
+
+    # 1. Create a non-box custom cutter (16-segment cylinder -> 32 verts, 18 faces)
+    cyl_mesh = bpy.data.meshes.new("CylCutter_Mesh")
+    bm = bmesh.new()
+    bmesh.ops.create_cone(bm, cap_ends=True, cap_tris=False, segments=16, radius1=0.8, radius2=0.8, depth=2.0)
+    bm.to_mesh(cyl_mesh)
+    bm.free()
+    cyl_obj = bpy.data.objects.new("CylCutter", cyl_mesh)
+    cyl_obj.location = Vector((-1.5, 0.0, 0.0))
+    scene.collection.objects.link(cyl_obj)
+    ok, msg, added = apple_bite.add_custom_mesh_cutters(ctx, [cyl_obj], zone="A")
+    assert ok and len(added) == 1, msg
+    assert len(cyl_obj.data.vertices) > 8
+
+    # Next Box from a custom/drawn cutter MUST spawn a clean 8-vert, 6-face Box!
+    ok, msg, next_box = apple_bite.add_adjacent_box_cutter(ctx, direction="+X", overlap=0.05, auto_next_zone=True)
+    assert ok and next_box is not None, msg
+    assert len(next_box.data.vertices) == 8 and len(next_box.data.polygons) == 6, (
+        f"Next Box should be a pure 8v/6f cube, got {len(next_box.data.vertices)}v/{len(next_box.data.polygons)}f"
+    )
+    assert next_box.get(apple_bite.CUTTER_ZONE_PROP) == "B"
+
+    # 2. Ctrl+D operator core (duplicate_selected_cutters): independent mesh, sequential name, registered in session
+    apple_bite.safe_select_objects(ctx, [next_box], active=next_box)
+    ok, msg, dups = apple_bite.duplicate_selected_cutters(ctx)
+    assert ok and len(dups) == 1, msg
+    dup = dups[0]
+    assert dup.data is not next_box.data, "Duplicated cutter must have its own independent mesh data!"
+    assert dup.get(apple_bite.CUTTER_ZONE_PROP) == "B"
+    dup.location.x += 1.8
+
+    sess_now = session.load_session(scene)
+    assert sess_now is not None and len(sess_now.cutters) == 3
+    assert any(c.name == dup.name for c in sess_now.cutters)
+
+    # 3. Shift+D / Alt+D simulation: duplicate object directly inside FDT_Cutters_* and call adopt_duplicated_cutters
+    cutters_col = sess_now.get_collections()["cutters"]
+    raw_copy = bpy.data.objects.new(f"{next_box.name}.001", next_box.data)  # linked mesh like Alt+D
+    raw_copy.matrix_world = next_box.matrix_world.copy()
+    raw_copy.location.x -= 3.5
+    raw_copy[apple_bite.CUTTER_PROP] = True
+    raw_copy[apple_bite.CUTTER_ZONE_PROP] = "C"
+    raw_copy[apple_bite.OBJ_SESSION_ID_PROP] = sess_now.session_id
+    cutters_col.objects.link(raw_copy)
+
+    adopted = apple_bite.adopt_duplicated_cutters(scene)
+    assert len(adopted) == 1 and adopted[0] == raw_copy, f"Expected raw_copy adopted, got {adopted}"
+    assert raw_copy.data is not next_box.data, "Linked duplicate should be made single-user on adopt!"
+    assert not raw_copy.name.endswith(".001"), f"Expected clean sequential name, got {raw_copy.name}"
+    sess_after = session.load_session(scene)
+    assert sess_after is not None and len(sess_after.cutters) == 4
+    assert len(scene.fdt_settings.cutter_layer_items) == 4
+
+
 ALL_TESTS = [
     test_1_enter_exit_cancel_lifecycle,
     test_2_multi_object_cutting_and_zone_tagging,
@@ -730,4 +927,7 @@ ALL_TESTS = [
     test_18_scene_zone_registry_custom_tokens,
     test_19_builtin_zone_rename_survives_reload,
     test_20_edge_band_inward_rough_cut,
+    test_21_set_zone_renames_cutter_and_active_zone_dropdown,
+    test_22_user_driven_rename_tool,
+    test_23_next_box_spawns_cube_and_duplicate_cutter,
 ]

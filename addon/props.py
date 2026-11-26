@@ -5,6 +5,7 @@ from __future__ import annotations
 import bpy
 from bpy.props import (
     BoolProperty,
+    CollectionProperty,
     EnumProperty,
     FloatProperty,
     FloatVectorProperty,
@@ -43,6 +44,19 @@ _DENSITY_ITEMS = [
     ("CUSTOM", "Custom", "กำหนดระยะเองในส่วนขั้นสูง"),
 ]
 _LOADING_DENSITY = False
+_SYNCING_ACTIVE_ZONE = False
+
+
+def set_active_zone_silent(settings, zone_key: str) -> None:
+    """Update ``settings.active_zone`` without triggering selected-cutter reassignment."""
+    global _SYNCING_ACTIVE_ZONE
+    if settings is None:
+        return
+    _SYNCING_ACTIVE_ZONE = True
+    try:
+        settings.active_zone = zone_key
+    finally:
+        _SYNCING_ACTIVE_ZONE = False
 
 
 def _zone_items(self, context):
@@ -51,6 +65,21 @@ def _zone_items(self, context):
 
     scene = getattr(context, "scene", None) if context is not None else None
     return zone_registry.iter_zone_items(scene)
+
+
+def _on_active_zone_changed(self, context):
+    """Apply active_zone dropdown changes to any currently selected Apple Bite cutters."""
+    if _SYNCING_ACTIVE_ZONE:
+        return
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    selected = list(getattr(context, "selected_objects", ()) or ())
+    edit_obj = getattr(context, "edit_object", None)
+    if edit_obj is not None and edit_obj not in selected:
+        selected.append(edit_obj)
+    if not selected:
+        return
+    apple_bite.set_cutters_zone(context, selected, self.active_zone)
 
 
 def _on_live_setting_changed(self, context):
@@ -177,13 +206,104 @@ def _on_preview_display_changed(self, context):
                         area.tag_redraw()
 
 
+_SYNCING_CUTTER_LIST = False
+
+
+def _on_cutter_layer_index_changed(self, context):
+    """Select the corresponding cutter in the 3D Viewport when clicking a UIList row."""
+    if _SYNCING_CUTTER_LIST:
+        return
+    if context is None or getattr(context, "scene", None) is None:
+        return
+    idx = int(getattr(self, "cutter_layer_index", -1))
+    items = getattr(self, "cutter_layer_items", None)
+    if items is None or idx < 0 or idx >= len(items):
+        return
+    cname = str(items[idx].name or "")
+    if not cname:
+        return
+    active = getattr(context, "active_object", None)
+    if active is not None and active.name == cname:
+        return
+    apple_bite.select_cutter(context, cname)
+
+
+def sync_cutter_layer_items(scene, session=None, active_name: str | None = None) -> None:
+    """Keep ``scene.fdt_settings.cutter_layer_items`` mirrored to ``session.cutters``."""
+    global _SYNCING_CUTTER_LIST
+    if scene is None:
+        return
+    settings = getattr(scene, "fdt_settings", None)
+    items = getattr(settings, "cutter_layer_items", None) if settings is not None else None
+    if settings is None or items is None:
+        return
+
+    if session is None:
+        from .core.session import load_session
+
+        session = load_session(scene)
+
+    _SYNCING_CUTTER_LIST = True
+    try:
+        if session is None or not session.cutters:
+            if len(items):
+                items.clear()
+            settings.cutter_layer_index = 0
+            return
+
+        desired = [
+            (str(c.name), str(c.zone), bool(c.muted), bool(c.rough))
+            for c in session.cutters
+        ]
+        current = [
+            (str(it.name), str(it.zone), bool(it.muted), bool(it.rough))
+            for it in items
+        ]
+        if current != desired:
+            items.clear()
+            for cname, czone, cmuted, crough in desired:
+                it = items.add()
+                it.name = cname
+                it.zone = czone
+                it.muted = cmuted
+                it.rough = crough
+
+        target_name = active_name
+        if target_name is None:
+            ctx_active = getattr(getattr(bpy, "context", None), "active_object", None)
+            if ctx_active is not None:
+                target_name = ctx_active.name
+        if target_name:
+            match_idx = next((i for i, row in enumerate(desired) if row[0] == target_name), -1)
+            if match_idx >= 0:
+                settings.cutter_layer_index = match_idx
+                return
+        cur_idx = int(getattr(settings, "cutter_layer_index", 0))
+        if cur_idx < 0 or cur_idx >= len(desired):
+            settings.cutter_layer_index = max(0, min(cur_idx, len(desired) - 1))
+    except AttributeError:
+        pass
+    finally:
+        _SYNCING_CUTTER_LIST = False
+
+
+class FDT_CutterLayerItem(bpy.types.PropertyGroup):
+    """Mirrored cutter layer row for the scrollable N-Panel UIList."""
+
+    name: StringProperty(name="Cutter Name", default="")
+    zone: StringProperty(name="Zone Key", default="A")
+    muted: BoolProperty(name="Muted", default=False)
+    rough: BoolProperty(name="Rough", default=False)
+
+
 class FDT_SceneSettings(bpy.types.PropertyGroup):
     # Zone selection for new/selected cutters
     active_zone: EnumProperty(
         name="Active Zone",
-        description="Zone tagged onto new cutters — from the Scene zone registry (type to search)",
+        description="Zone tagged onto new/selected cutters — from the Scene zone registry (type to search)",
         items=_zone_items,
         default=0,  # Blender requires an index default for dynamic EnumProperty items
+        update=_on_active_zone_changed,
     )
 
     # Cutter sizing
@@ -384,6 +504,59 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         ],
         default="ALL",
         update=_on_preview_display_changed,
+    )
+
+    # User-driven Object Rename tool (independent of Zone Registry)
+    ui_show_rename: BoolProperty(
+        name="Rename Objects",
+        description="เปิดหรือยุบแผงเปลี่ยนชื่อ Object",
+        default=True,
+    )
+    rename_mode: EnumProperty(
+        name="Rename Mode",
+        description="เลือกรูปแบบการเปลี่ยนชื่อ: พิมพ์ชื่อใหม่ทั้งหมด หรือเปลี่ยนเฉพาะส่วน ID ในชื่อเดิม (ไม่ยึดกับ Zone)",
+        items=[
+            ("FULL", "Full Name", "พิมพ์ชื่อใหม่ตรง ๆ (เลือกหลายชิ้นจะรันเลข _01, _02 ให้อัตโนมัติ)"),
+            ("TAG", "Replace ID", "เปลี่ยนเฉพาะส่วน _ID-... หรือ _FDST_ID-... ในชื่อเดิม (เช่น _ID-B_18 -> _ID-A_18)"),
+        ],
+        default="FULL",
+    )
+    rename_text: StringProperty(
+        name="New Name",
+        description="พิมพ์ชื่อใหม่ หรือรหัส ID ที่ต้องการ (ไม่ยึดติดกับ Zone)",
+        default="",
+        maxlen=63,
+    )
+    rename_auto_number: BoolProperty(
+        name="Auto #",
+        description="เติมเลขลำดับ _01, _02 ต่อท้ายอัตโนมัติเมื่อเลือกหลายชิ้น",
+        default=True,
+    )
+    rename_start_index: IntProperty(
+        name="Start",
+        description="เลขเริ่มต้นสำหรับรันเลขลำดับเมื่อเลือกหลายชิ้น",
+        default=1,
+        min=0,
+        max=9999,
+    )
+    rename_sync_mesh: BoolProperty(
+        name="Sync Mesh",
+        description="เปลี่ยนชื่อ Mesh Data ให้ตรงกับชื่อ Object ด้วย (เฉพาะ Mesh ที่ไม่ได้แชร์กัน)",
+        default=True,
+    )
+
+    # Scrollable Cutter Layers UIList state
+    ui_show_cutter_layers: BoolProperty(
+        name="Cutter Layers",
+        description="เปิดหรือยุบรายการ Cutter Layers",
+        default=True,
+    )
+    cutter_layer_items: CollectionProperty(type=FDT_CutterLayerItem)
+    cutter_layer_index: IntProperty(
+        name="Active Cutter Layer",
+        description="รายการ Cutter Layer ที่เลือกอยู่",
+        default=0,
+        update=_on_cutter_layer_index_changed,
     )
 
     # Reserved status message
@@ -807,7 +980,7 @@ class FDT_CutterRoughSettings(bpy.types.PropertyGroup):
     )
 
 
-CLASSES = (FDT_CutterRoughSettings, FDT_SceneSettings, FDT_RebarSettings)
+CLASSES = (FDT_CutterLayerItem, FDT_CutterRoughSettings, FDT_SceneSettings, FDT_RebarSettings)
 
 
 def register():

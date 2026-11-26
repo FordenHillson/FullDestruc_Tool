@@ -656,7 +656,7 @@ class FDT_OT_applebite_add_box(bpy.types.Operator):
 class FDT_OT_applebite_add_adjacent_box(bpy.types.Operator):
     bl_idname = "fdt.applebite_add_adjacent_box"
     bl_label = "ต่อกล่องชิดขอบ"
-    bl_description = "Clone the active/last cutter flush-adjacent with a small overlap so no thin slivers are left"
+    bl_description = "Spawn a clean Box cutter flush-adjacent with a small overlap so no thin slivers are left"
     bl_options = {"REGISTER", "UNDO"}
 
     direction: StringProperty(name="Direction", default="+X", options={"SKIP_SAVE"})
@@ -673,6 +673,46 @@ class FDT_OT_applebite_add_adjacent_box(bpy.types.Operator):
         _set_status(context, msg)
         self.report({"INFO"} if ok else {"WARNING"}, msg)
         return {"FINISHED"} if ok else {"CANCELLED"}
+
+
+class FDT_OT_applebite_duplicate_cutter(bpy.types.Operator):
+    bl_idname = "fdt.applebite_duplicate_cutter"
+    bl_label = "Duplicate Cutter"
+    bl_description = "Duplicate selected Apple Bite cutter(s) before Apply and immediately move them (Ctrl+D)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    start_move: BoolProperty(name="Move Immediately", default=True, options={"SKIP_SAVE"})
+
+    @classmethod
+    def poll(cls, context):
+        if context is None or getattr(context, "scene", None) is None:
+            return False
+        if getattr(context, "mode", "OBJECT") != "OBJECT":
+            return False
+        if not has_active_session(context.scene):
+            return False
+        for obj in getattr(context, "selected_objects", ()) or ():
+            if obj is not None and bool(obj.get(apple_bite.CUTTER_PROP, False)):
+                return True
+        active = getattr(context, "active_object", None)
+        return active is not None and bool(active.get(apple_bite.CUTTER_PROP, False))
+
+    def execute(self, context):
+        ok, msg, _created = apple_bite.duplicate_selected_cutters(context)
+        if ok:
+            _ensure_wire_overlay()
+        _set_status(context, msg)
+        self.report({"INFO"} if ok else {"WARNING"}, msg)
+        return {"FINISHED"} if ok else {"CANCELLED"}
+
+    def invoke(self, context, event):
+        res = self.execute(context)
+        if res == {"FINISHED"} and self.start_move and not bpy.app.background:
+            try:
+                bpy.ops.transform.translate("INVOKE_DEFAULT")
+            except Exception:
+                pass
+        return res
 
 
 class FDT_OT_applebite_add_mesh(bpy.types.Operator):
@@ -799,11 +839,17 @@ class FDT_OT_applebite_set_zone(bpy.types.Operator):
     zone: StringProperty(name="Zone", default="A")
 
     def execute(self, context):
+        from ..props import set_active_zone_silent
+
         zone = zone_registry.resolve_zone(self.zone, context.scene).key
         settings = getattr(context.scene, "fdt_settings", None)
         if settings is not None:
-            settings.active_zone = zone
-        updated = apple_bite.set_cutters_zone(context, list(context.selected_objects), zone)
+            set_active_zone_silent(settings, zone)
+        selected = list(context.selected_objects)
+        edit_obj = getattr(context, "edit_object", None)
+        if edit_obj is not None and edit_obj not in selected:
+            selected.append(edit_obj)
+        updated = apple_bite.set_cutters_zone(context, selected, zone)
         msg = f"โซนที่เลือก: {zone_registry.zone_token(zone, context.scene)}" + (f" (อัปเดตตัวตัด {updated} อัน)" if updated else "")
         _set_status(context, msg)
         return {"FINISHED"}
@@ -1093,6 +1139,8 @@ class FDT_OT_applebite_set_view_mode(bpy.types.Operator):
         return {"FINISHED"}
 
 
+_addon_keymaps: list[tuple[bpy.types.KeyMap, bpy.types.KeyMapItem]] = []
+
 CLASSES = (
     FDT_OT_applebite_smart_start,
     FDT_OT_applebite_reedit,
@@ -1102,6 +1150,7 @@ CLASSES = (
     FDT_OT_applebite_reset_original,
     FDT_OT_applebite_add_box,
     FDT_OT_applebite_add_adjacent_box,
+    FDT_OT_applebite_duplicate_cutter,
     FDT_OT_applebite_add_mesh,
     FDT_OT_applebite_draw_cutter,
     FDT_OT_applebite_draw_sculpt_cutter,
@@ -1128,10 +1177,27 @@ def register():
     _ensure_wire_overlay()
     if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    wm = getattr(bpy.context, "window_manager", None)
+    kc = wm.keyconfigs.addon if wm else None
+    if kc is not None:
+        km = kc.keymaps.new(name="3D View", space_type="VIEW_3D")
+        kmi = km.keymap_items.new(
+            FDT_OT_applebite_duplicate_cutter.bl_idname,
+            type="D",
+            value="PRESS",
+            ctrl=True,
+        )
+        _addon_keymaps.append((km, kmi))
 
 
 def unregister():
     global _zone_grid_shader, _zone_grid_shader_failed, _zone_grid_cache_sig, _zone_grid_cache_entries, _zone_grid_deps_rev
+    for km, kmi in _addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    _addon_keymaps.clear()
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
     _remove_hud_handler()

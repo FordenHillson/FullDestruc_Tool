@@ -14,11 +14,17 @@ def _zone_items(self, context):
     return zone_registry.iter_zone_items(getattr(context, "scene", None))
 
 
+_LOADING_PICKER_ZONE = False
+
+
 def _on_picker_zone_changed(self, context) -> None:
+    if _LOADING_PICKER_ZONE:
+        return
     cutter = bpy.data.objects.get(self.cutter_name)
     if cutter is None or context is None:
         return
     apple_bite.set_cutters_zone(context, [cutter], self.zone_key)
+    self.cutter_name = cutter.name
 
 
 class FDT_OT_zone_picker(bpy.types.Operator):
@@ -31,6 +37,7 @@ class FDT_OT_zone_picker(bpy.types.Operator):
     zone_key: EnumProperty(name="Zone", items=_zone_items, update=_on_picker_zone_changed)
 
     def invoke(self, context, event):
+        global _LOADING_PICKER_ZONE
         scene = getattr(context, "scene", None)
         cutter = bpy.data.objects.get(self.cutter_name)
         if cutter is None:
@@ -39,7 +46,11 @@ class FDT_OT_zone_picker(bpy.types.Operator):
             self.report({"WARNING"}, "Select a cutter object first.")
             return {"CANCELLED"}
         self.cutter_name = cutter.name
-        self.zone_key = zone_registry.resolve_zone(cutter.get(apple_bite.CUTTER_ZONE_PROP, "A"), scene).key
+        _LOADING_PICKER_ZONE = True
+        try:
+            self.zone_key = zone_registry.resolve_zone(cutter.get(apple_bite.CUTTER_ZONE_PROP, "A"), scene).key
+        finally:
+            _LOADING_PICKER_ZONE = False
         return context.window_manager.invoke_popup(self, width=360)
 
     def draw(self, context):
@@ -51,7 +62,7 @@ class FDT_OT_zone_picker(bpy.types.Operator):
         row = layout.row(align=True)
         for action, label, icon in (
             ("NEW", "New", "ADD"),
-            ("RENAME", "Rename", "GREASEPENCIL"),
+            ("RENAME", "Edit Zone", "GREASEPENCIL"),
             ("DELETE", "Delete", "TRASH"),
         ):
             op = row.operator("fdt.zone_manage", text=label, icon=icon)
@@ -64,6 +75,7 @@ class FDT_OT_zone_picker(bpy.types.Operator):
         if cutter is None:
             return {"CANCELLED"}
         apple_bite.set_cutters_zone(context, [cutter], self.zone_key)
+        self.cutter_name = cutter.name
         return {"FINISHED"}
 
 
@@ -133,17 +145,21 @@ class FDT_OT_zone_manage(bpy.types.Operator):
         layout.label(text="Examples: ID-A#B, VIS-A#B, ID-A_VIS-A#B")
 
     def execute(self, context):
+        from ..props import set_active_zone_silent
+
         scene = getattr(context, "scene", None)
         if self.action == "NEW":
             ok, msg, key = zone_registry.create_zone(self.token, self.base_zone, self.kind, self.color, scene)
             if ok:
                 settings = getattr(scene, "fdt_settings", None)
                 if settings is not None:
-                    settings.active_zone = key
+                    set_active_zone_silent(settings, key)
         elif self.action == "RENAME":
             ok, msg = zone_registry.update_zone(
                 self.zone_key, token=self.token, base=self.base_zone, kind=self.kind, color=self.color, scene=scene
             )
+            if ok and context is not None:
+                apple_bite.sync_zone_visuals_and_names(context, self.zone_key)
         else:
             ok, msg = zone_registry.delete_zone(self.zone_key, scene)
         self.report({"INFO"} if ok else {"WARNING"}, msg)

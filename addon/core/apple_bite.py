@@ -169,9 +169,47 @@ def _safe_zone_token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_#-]+", "_", str(value or "A").strip())[:MAX_BLENDER_NAME] or "A"
 
 
+_ID_TAG_WITH_IDX_RE = re.compile(r"(?<!_FDST)_ID-(.+?)(_\d+(?:\.\d+)?)$")
+_ID_TAG_TRUNC_RE = re.compile(r"(?<!_FDST)_ID-(.+)$")
+
+
 def _zone_name_token(zone: str, scene: bpy.types.Scene | None = None) -> str:
     """Resolve a stored zone key to its editable token for object naming."""
     return _safe_zone_token(zone_registry.resolve_zone(zone, scene).token)
+
+
+def _replace_id_token_in_name(old_name: str, new_token: str) -> str:
+    """Replace the embedded ``_ID-<token>`` segment in a cutter or working-piece name.
+
+    Preserves trailing numeric indices (e.g. ``_10``) and ignores ``_FDST_ID-``
+    segments inherited from original target object names.  Custom names without
+    an ``_ID-`` tag are returned unchanged.
+    """
+    token = _safe_zone_token(new_token)
+    m = _ID_TAG_WITH_IDX_RE.search(old_name)
+    if m is not None:
+        if m.group(1) == token:
+            return old_name
+        prefix = old_name[: m.start()]
+        suffix = re.sub(r"\.\d+$", "", m.group(2))
+        tag = f"_ID-{token}"
+        max_prefix = max(0, MAX_BLENDER_NAME - len(tag) - len(suffix))
+        if len(prefix) > max_prefix:
+            prefix = prefix[:max_prefix]
+        return f"{prefix}{tag}{suffix}"[:MAX_BLENDER_NAME]
+
+    m_trunc = _ID_TAG_TRUNC_RE.search(old_name)
+    if m_trunc is not None:
+        if m_trunc.group(1) == token:
+            return old_name
+        prefix = old_name[: m_trunc.start()]
+        tag = f"_ID-{token}"
+        max_prefix = max(0, MAX_BLENDER_NAME - len(tag))
+        if len(prefix) > max_prefix:
+            prefix = prefix[:max_prefix]
+        return f"{prefix}{tag}"[:MAX_BLENDER_NAME]
+
+    return old_name
 
 
 def _format_zone_name(base_name: str, zone: str) -> str:
@@ -826,10 +864,15 @@ def _sync_rust_session(
             key = (orig.name, cutter_obj.name)
             valid_piece_keys.add(key)
             p_obj = piece_map.get(key)
+            zone_token = _zone_name_token(zone, scene)
             if p_obj is None:
-                piece_name = f"FDT_Piece_{orig.name}_ID-{_zone_name_token(zone, scene)}_{idx + 1:02d}"[:MAX_BLENDER_NAME]
+                piece_name = f"FDT_Piece_{orig.name}_ID-{zone_token}_{idx + 1:02d}"[:MAX_BLENDER_NAME]
                 p_obj = _create_working_copy(orig, piece_name, pieces_col, session.session_id)
                 piece_map[key] = p_obj
+            else:
+                desired_piece_name = _replace_id_token_in_name(p_obj.name, zone_token)
+                if desired_piece_name != p_obj.name:
+                    p_obj.name = desired_piece_name
             _clear_fdt_modifiers(p_obj)
             p_obj.matrix_world = orig.matrix_world.copy()
             p_obj[PIECE_ZONE_PROP] = zone
@@ -938,10 +981,15 @@ def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
         for idx, (cutter_obj, zone) in enumerate(active_cutters):
             key = (orig.name, cutter_obj.name)
             p_obj = piece_map.get(key)
+            zone_token = _zone_name_token(zone, scene)
             if p_obj is None:
-                piece_name = f"FDT_Piece_{orig.name}_ID-{_zone_name_token(zone, scene)}_{idx + 1:02d}"[:MAX_BLENDER_NAME]
+                piece_name = f"FDT_Piece_{orig.name}_ID-{zone_token}_{idx + 1:02d}"[:MAX_BLENDER_NAME]
                 p_obj = _create_working_copy(orig, piece_name, pieces_col, session.session_id)
                 piece_map[key] = p_obj
+            else:
+                desired_piece_name = _replace_id_token_in_name(p_obj.name, zone_token)
+                if desired_piece_name != p_obj.name:
+                    p_obj.name = desired_piece_name
             _clear_fdt_modifiers(p_obj)
             p_obj.matrix_world = orig.matrix_world.copy()
             p_obj[PIECE_ZONE_PROP] = zone
@@ -1509,14 +1557,47 @@ def _next_zone_letter(zone: str) -> str:
     return zone_registry.next_zone_key(zone, getattr(bpy.context, "scene", None))
 
 
+_CUTTER_TRAILING_IDX_RE = re.compile(r"_(\d+)(?:\.\d+)?$")
+
+
+def _next_cutter_index(session: AppleBiteSession) -> int:
+    """Return the next sequential 1-based cutter index higher than existing cutters."""
+    max_idx = len(session.cutters)
+    for entry in session.cutters:
+        m = _CUTTER_TRAILING_IDX_RE.search(entry.name)
+        if m is not None:
+            try:
+                max_idx = max(max_idx, int(m.group(1)))
+            except ValueError:
+                pass
+    return max_idx + 1
+
+
+def _make_duplicate_cutter_name(
+    session: AppleBiteSession,
+    src_name: str,
+    zone_id: str,
+    scene: bpy.types.Scene | None,
+) -> str:
+    """Generate a clean sequential name for a duplicated cutter, preserving custom names."""
+    base_src = re.sub(r"\.\d+$", "", str(src_name or ""))
+    if _ID_TAG_WITH_IDX_RE.search(base_src) or _ID_TAG_TRUNC_RE.search(base_src):
+        prefix = "DrawCutter" if base_src.startswith("DrawCutter_") else "Cutter"
+        idx = _next_cutter_index(session)
+        return f"{prefix}_{session.session_id}_ID-{_zone_name_token(zone_id, scene)}_{idx:02d}"[:MAX_BLENDER_NAME]
+    return base_src[:MAX_BLENDER_NAME] or f"Cutter_{session.session_id}_ID-{_zone_name_token(zone_id, scene)}_{_next_cutter_index(session):02d}"[:MAX_BLENDER_NAME]
+
+
 def add_adjacent_box_cutter(
     context: bpy.types.Context,
     direction: str = "+X",
     overlap: float = 0.05,
     auto_next_zone: bool = True,
 ) -> tuple[bool, str, bpy.types.Object | None]:
-    """Clone the active/last cutter flush-adjacent along direction with slight overlap to prevent slivers.
+    """Spawn a clean Box cutter flush-adjacent to the active/last cutter along direction.
 
+    Always spawns a pure 6-face Box matching the reference cutter's bounding dimensions
+    and orientation (even when the reference cutter was drawn/sculpted/custom-shaped).
     Because Pieces subtract all prior cutters (DIFFERENCE cutter_0..i-1), overlapping the
     previous cutter by a few cm eliminates both gaps and coplanar boolean precision slivers.
     """
@@ -1550,8 +1631,27 @@ def add_adjacent_box_cutter(
     context.view_layer.update()
     axis_idx, sign = _DIR_VECTORS.get(direction.upper(), (0, 1.0))
 
-    # Measure reference cutter extent along its local axis
-    extent = float(ref_cutter.dimensions[axis_idx])
+    # Measure reference cutter's clean local bounding box (ignores rough modifier displacement)
+    mw = ref_cutter.matrix_world
+    rot_mat = mw.to_quaternion().to_matrix()
+    col_scales = [max(mw.col[i].xyz.length, 1e-4) for i in range(3)]
+    ref_verts = getattr(getattr(ref_cutter, "data", None), "vertices", None)
+    if ref_verts and len(ref_verts) > 0:
+        xs = [v.co.x for v in ref_verts]
+        ys = [v.co.y for v in ref_verts]
+        zs = [v.co.z for v in ref_verts]
+        local_min = Vector((min(xs), min(ys), min(zs)))
+        local_max = Vector((max(xs), max(ys), max(zs)))
+    else:
+        bb = [Vector(c) for c in ref_cutter.bound_box]
+        local_min = Vector((min(v.x for v in bb), min(v.y for v in bb), min(v.z for v in bb)))
+        local_max = Vector((max(v.x for v in bb), max(v.y for v in bb), max(v.z for v in bb)))
+
+    local_center = (local_min + local_max) * 0.5
+    ref_world_center = mw @ local_center
+    box_dims = [max((local_max[i] - local_min[i]) * col_scales[i], 0.05) for i in range(3)]
+
+    extent = float(box_dims[axis_idx])
     if extent <= 1e-4:
         extent = 2.0
     safe_overlap = min(max(float(overlap), 0.005), extent * 0.25)
@@ -1559,7 +1659,6 @@ def add_adjacent_box_cutter(
 
     local_axis = Vector((0.0, 0.0, 0.0))
     local_axis[axis_idx] = sign
-    rot_mat = ref_cutter.matrix_world.to_3x3().normalized()
     world_offset = rot_mat @ (local_axis * step_dist)
 
     ref_zone = zone_registry.resolve_zone(ref_cutter.get(CUTTER_ZONE_PROP, "A"), scene).key
@@ -1567,20 +1666,27 @@ def add_adjacent_box_cutter(
     if auto_next_zone:
         zone_id = _next_zone_letter(ref_zone)
         if settings is not None:
-            settings.active_zone = zone_id
+            from ..props import set_active_zone_silent
+
+            set_active_zone_silent(settings, zone_id)
     else:
         zone_id = _resolve_zone_id(scene, settings.active_zone if settings else ref_zone)
 
-    idx = len(session.cutters) + 1
+    idx = _next_cutter_index(session)
     cutter_name = f"Cutter_{session.session_id}_ID-{_zone_name_token(zone_id, scene)}_{idx:02d}"[:MAX_BLENDER_NAME]
 
-    mesh_copy = ref_cutter.data.copy()
-    mesh_copy.name = f"{cutter_name}_Mesh"
-    cutter = bpy.data.objects.new(cutter_name, mesh_copy)
+    # Always spawn a fresh pure Box (8 verts, 6 faces) with clean unit scale
+    mesh_box = bpy.data.meshes.new(f"{cutter_name}_Mesh")
+    bm = bmesh.new()
+    bmesh.ops.create_cube(bm, size=1.0)
+    bmesh.ops.scale(bm, vec=Vector(box_dims), verts=bm.verts)
+    bm.to_mesh(mesh_box)
+    bm.free()
+
+    cutter = bpy.data.objects.new(cutter_name, mesh_box)
     cutters_col.objects.link(cutter)
 
-    cutter.matrix_world = ref_cutter.matrix_world.copy()
-    cutter.matrix_world.translation = ref_cutter.matrix_world.translation + world_offset
+    cutter.matrix_world = Matrix.Translation(ref_world_center + world_offset) @ rot_mat.to_4x4()
 
     default_rough = bool(settings.enable_rough) if settings else False
     cutter[CUTTER_PROP] = True
@@ -1595,6 +1701,152 @@ def add_adjacent_box_cutter(
     rebuild_session(context)
     safe_select_objects(context, [cutter], active=cutter)
     return True, f"ต่อกล่องชิดขอบ ({direction}) โซน {zone_registry.zone_token(zone_id, scene)} เรียบร้อย (เหลื่อมกัน {safe_overlap*100:.1f} ซม. ไม่เหลือเศษ)", cutter
+
+
+def duplicate_selected_cutters(
+    context: bpy.types.Context,
+    cutters: Sequence[bpy.types.Object] | None = None,
+) -> tuple[bool, str, list[bpy.types.Object]]:
+    """Duplicate selected Apple Bite cutter(s) cleanly before Apply (Ctrl+D)."""
+    scene = context.scene
+    session = load_session(scene)
+    if session is None:
+        return False, "ยังไม่ได้เริ่มโหมด Apple Bite", []
+
+    cols = session.get_collections()
+    cutters_col = cols["cutters"]
+    if cutters_col is None:
+        return False, "ไม่พบโฟลเดอร์ตัวตัด", []
+
+    if cutters is None:
+        sources = [o for o in context.selected_objects if o is not None and bool(o.get(CUTTER_PROP, False))]
+        if not sources:
+            active = context.active_object
+            if active is not None and bool(active.get(CUTTER_PROP, False)):
+                sources = [active]
+    else:
+        sources = [o for o in cutters if o is not None and bool(o.get(CUTTER_PROP, False))]
+
+    if not sources:
+        return False, "กรุณาเลือกกล่องตัดที่ต้องการ Duplicate ก่อน", []
+
+    entry_by_name = {c.name: c for c in session.cutters}
+    created: list[bpy.types.Object] = []
+    for src in sources:
+        if src.type != "MESH" or src.data is None:
+            continue
+        src_entry = entry_by_name.get(src.name)
+        zone_id = zone_registry.resolve_zone(
+            src.get(CUTTER_ZONE_PROP, src_entry.zone if src_entry else "A"), scene
+        ).key
+        is_rough = bool(src.get(CUTTER_ROUGH_PROP, src_entry.rough if src_entry else False))
+
+        dup_name = _make_duplicate_cutter_name(session, src.name, zone_id, scene)
+        mesh_copy = src.data.copy()
+        mesh_copy.name = f"{dup_name}_Mesh"[:MAX_BLENDER_NAME]
+
+        dup = bpy.data.objects.new(dup_name, mesh_copy)
+        cutters_col.objects.link(dup)
+        dup.matrix_world = src.matrix_world.copy()
+        dup[CUTTER_PROP] = True
+        dup[CUTTER_ZONE_PROP] = zone_id
+        dup[CUTTER_ROUGH_PROP] = is_rough
+        init_cutter_rough_settings(dup, scene, ref_cutter=src)
+        dup[OBJ_SESSION_ID_PROP] = session.session_id
+        apply_cutter_visuals(dup, zone_id, muted=False, is_rough=is_rough)
+
+        session.cutters.insert(0, CutterEntry(name=dup.name, zone=zone_id, muted=False, rough=is_rough))
+        created.append(dup)
+
+    if not created:
+        return False, "ไม่พบกล่องตัดที่สามารถ Duplicate ได้", []
+
+    save_session(scene, session)
+    with profiler.action_scope("DUPLICATE_CUTTER", f"n={len(created)}"):
+        rebuild_session(context)
+    safe_select_objects(context, created, active=created[-1])
+    if len(created) == 1:
+        msg = f"Duplicate กล่องตัด '{created[0].name}' แล้ว — ขยับตำแหน่งได้เลย"
+    else:
+        msg = f"Duplicate กล่องตัด {len(created)} อันแล้ว — ขยับตำแหน่งได้เลย"
+    return True, msg, created
+
+
+def adopt_duplicated_cutters(scene: bpy.types.Scene | None) -> list[bpy.types.Object]:
+    """Detect and adopt cutters duplicated via Blender's Shift+D / Alt+D / Ctrl+C+V / Outliner.
+
+    Safe to call from depsgraph_update_post: does not alter selection or interrupt modal transforms.
+    """
+    if scene is None:
+        return []
+    session = load_session(scene)
+    if session is None:
+        return []
+    cols = session.get_collections()
+    cutters_col = cols.get("cutters")
+    if cutters_col is None:
+        return []
+
+    known_names = {c.name for c in session.cutters}
+    candidates: list[bpy.types.Object] = []
+    seen: set[bpy.types.Object] = set()
+
+    # 1. Any unregistered mesh inside the active session's FDT_Cutters_* collection (Shift+D / Alt+D / Outliner)
+    for obj in list(cutters_col.objects):
+        if obj is not None and obj.type == "MESH" and obj.name not in known_names and obj not in seen:
+            if not is_protected_object(obj) and RESULT_SOURCE_PROP not in obj:
+                seen.add(obj)
+                candidates.append(obj)
+
+    # 2. Any pasted cutter tagged for this exact active session_id (Ctrl+C / Ctrl+V into Scene Collection)
+    for obj in list(scene.objects):
+        if obj is None or obj.type != "MESH" or obj.name in known_names or obj in seen:
+            continue
+        if bool(obj.get(CUTTER_PROP, False)) and str(obj.get(OBJ_SESSION_ID_PROP, "")) == session.session_id:
+            if not is_protected_object(obj) and RESULT_SOURCE_PROP not in obj:
+                seen.add(obj)
+                candidates.append(obj)
+
+    if not candidates:
+        return []
+
+    adopted: list[bpy.types.Object] = []
+    for obj in candidates:
+        if obj.name not in cutters_col.objects:
+            move_object_to_collection(obj, cutters_col)
+
+        zone_id = zone_registry.resolve_zone(obj.get(CUTTER_ZONE_PROP, "A"), scene).key
+        is_rough = bool(obj.get(CUTTER_ROUGH_PROP, False))
+
+        # Ensure linked duplicates (Alt+D) get an independent mesh datablock
+        if obj.data is not None and getattr(obj.data, "users", 1) > 1:
+            obj.data = obj.data.copy()
+
+        # Give Blender .001 duplicates of standard cutter names a clean sequential name
+        if re.search(r"\.\d{3}$", obj.name):
+            clean_name = _make_duplicate_cutter_name(session, obj.name, zone_id, scene)
+            if clean_name != obj.name:
+                obj.name = clean_name
+
+        if obj.data is not None and getattr(obj.data, "users", 0) == 1:
+            new_mname = f"{obj.name}_Mesh"[:MAX_BLENDER_NAME]
+            if obj.data.name != new_mname:
+                obj.data.name = new_mname
+
+        obj[CUTTER_PROP] = True
+        obj[CUTTER_ZONE_PROP] = zone_id
+        obj[CUTTER_ROUGH_PROP] = is_rough
+        obj[OBJ_SESSION_ID_PROP] = session.session_id
+        apply_cutter_visuals(obj, zone_id, muted=False, is_rough=is_rough)
+        _ensure_rough_modifier(obj, scene, is_rough=is_rough, preview_mode=True)
+
+        session.cutters.insert(0, CutterEntry(name=obj.name, zone=zone_id, muted=False, rough=is_rough))
+        known_names.add(obj.name)
+        adopted.append(obj)
+
+    if adopted:
+        save_session(scene, session)
+    return adopted
 
 
 def add_custom_mesh_cutters(
@@ -1646,12 +1898,59 @@ def add_custom_mesh_cutters(
     return True, f"เพิ่มโมเดลตัดเอง {len(added)} ชิ้น (โซน {zone_registry.zone_token(zone_id, scene)}) แล้ว", added
 
 
+def _rename_cutter_for_zone(
+    obj: bpy.types.Object,
+    entry: CutterEntry | None,
+    zone_id: str,
+    scene: bpy.types.Scene | None,
+) -> bool:
+    """Rename a cutter object (and its linked session/piece refs) to carry ``zone_id``'s token."""
+    old_name = obj.name
+    new_token = _zone_name_token(zone_id, scene)
+    desired_name = _replace_id_token_in_name(old_name, new_token)
+    renamed = False
+    if desired_name != old_name:
+        obj.name = desired_name
+        renamed = obj.name != old_name
+    new_name = obj.name
+
+    if entry is not None:
+        entry.name = new_name
+        entry.zone = zone_id
+
+    if renamed:
+        data = getattr(obj, "data", None)
+        if data is not None and getattr(data, "users", 0) == 1:
+            new_mesh_name = f"{new_name}_Mesh"[:MAX_BLENDER_NAME]
+            if data.name != new_mesh_name:
+                data.name = new_mesh_name
+
+        if old_name in _ROUGH_WIRE_PREVIEW_UNTIL:
+            _ROUGH_WIRE_PREVIEW_UNTIL[new_name] = _ROUGH_WIRE_PREVIEW_UNTIL.pop(old_name)
+
+    for piece in bpy.data.objects:
+        if str(piece.get("fdt_piece_cutter", "") or "") == old_name:
+            if renamed:
+                piece["fdt_piece_cutter"] = new_name
+            piece[PIECE_ZONE_PROP] = zone_id
+            desired_piece_name = _replace_id_token_in_name(piece.name, new_token)
+            if desired_piece_name != piece.name:
+                piece.name = desired_piece_name
+                p_data = getattr(piece, "data", None)
+                if p_data is not None and getattr(p_data, "users", 0) == 1:
+                    new_pm = f"{piece.name}_Mesh"[:MAX_BLENDER_NAME]
+                    if p_data.name != new_pm:
+                        p_data.name = new_pm
+
+    return renamed
+
+
 def set_cutters_zone(
     context: bpy.types.Context,
     cutters: list[bpy.types.Object],
     zone: str,
 ) -> int:
-    """Update the Zone ID and wireframe color on one or more cutters."""
+    """Update the Zone ID, object name, and wireframe color on one or more cutters."""
     scene = context.scene
     session = load_session(scene)
     if session is None:
@@ -1660,15 +1959,48 @@ def set_cutters_zone(
     zone_id = zone_registry.resolve_zone(zone, scene).key
     updated = 0
     cutter_map = {c.name: c for c in session.cutters}
+    seen: set[bpy.types.Object] = set()
     for obj in cutters:
+        if obj is None or obj in seen or not bool(obj.get(CUTTER_PROP, False)):
+            continue
+        seen.add(obj)
+        old_name = obj.name
+        entry = cutter_map.pop(old_name, None)
+        obj[CUTTER_ZONE_PROP] = zone_id
+        muted = entry.muted if entry is not None else False
+        _rename_cutter_for_zone(obj, entry, zone_id, scene)
+        if entry is not None:
+            cutter_map[obj.name] = entry
+        apply_cutter_visuals(obj, zone_id, muted=muted)
+        updated += 1
+
+    if updated:
+        save_session(scene, session)
+        rebuild_session(context)
+    return updated
+
+
+def sync_zone_visuals_and_names(
+    context: bpy.types.Context,
+    zone_key: str,
+) -> int:
+    """Refresh colors and object names for active session cutters/pieces using ``zone_key``."""
+    scene = getattr(context, "scene", None)
+    session = load_session(scene)
+    if session is None:
+        return 0
+
+    target_key = zone_registry.resolve_zone(zone_key, scene).key
+    updated = 0
+    for entry in session.cutters:
+        obj = bpy.data.objects.get(entry.name)
         if obj is None or not bool(obj.get(CUTTER_PROP, False)):
             continue
-        obj[CUTTER_ZONE_PROP] = zone_id
-        muted = False
-        if obj.name in cutter_map:
-            cutter_map[obj.name].zone = zone_id
-            muted = cutter_map[obj.name].muted
-        apply_cutter_visuals(obj, zone_id, muted=muted)
+        cur_key = zone_registry.resolve_zone(obj.get(CUTTER_ZONE_PROP, entry.zone), scene).key
+        if cur_key != target_key:
+            continue
+        _rename_cutter_for_zone(obj, entry, target_key, scene)
+        apply_cutter_visuals(obj, target_key, muted=entry.muted)
         updated += 1
 
     if updated:
@@ -1693,33 +2025,6 @@ def cycle_cutter_zone(
     next_z = zone_registry.next_zone_key(cur, scene)
     if not set_cutters_zone(context, [obj], next_z):
         return None
-
-    # Load the session while the object still has its old name; otherwise
-    # load_session() would prune the entry before we can rename it.
-    old_name = obj.name
-    session = load_session(scene)
-    if session is None:
-        return None
-    entry = next((c for c in session.cutters if c.name == old_name), None)
-    if entry is None:
-        return None
-    entry.zone = next_z
-
-    # Keep the readable zone token in the object name while the stable key stays in props.
-    old_token = _zone_name_token(cur, scene)
-    new_token = _zone_name_token(next_z, scene)
-    tag_re = re.compile(r"_ID-" + re.escape(old_token) + r"(?=_)")
-    new_name = tag_re.sub(f"_ID-{new_token}", old_name, count=1)[:MAX_BLENDER_NAME]
-    renamed = new_name != old_name
-    if renamed:
-        obj.name = new_name
-    entry.name = obj.name
-    for piece in bpy.data.objects:
-        if str(piece.get("fdt_piece_cutter", "") or "") == old_name:
-            piece["fdt_piece_cutter"] = obj.name
-    save_session(scene, session)
-    if renamed:
-        rebuild_session(context)
     return next_z, obj.name
 
 
@@ -1811,6 +2116,12 @@ def select_cutter(context: bpy.types.Context, cutter_name: str) -> bool:
     if obj is None:
         return False
     safe_select_objects(context, [obj], active=obj)
+    try:
+        from ..props import sync_cutter_layer_items
+
+        sync_cutter_layer_items(context.scene, active_name=cutter_name)
+    except Exception:
+        pass
     return True
 
 
@@ -1836,6 +2147,12 @@ def move_cutter_layer(
 
     session.cutters[idx], session.cutters[new_idx] = session.cutters[new_idx], session.cutters[idx]
     save_session(scene, session)
+    try:
+        from ..props import sync_cutter_layer_items
+
+        sync_cutter_layer_items(scene, session=session, active_name=cutter_name)
+    except Exception:
+        pass
     rebuild_session(context)
     return True, f"ย้าย '{cutter_name}' ไป Layer #{new_idx + 1} แล้ว"
 

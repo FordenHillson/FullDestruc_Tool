@@ -482,7 +482,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
         s2_layout.addWidget(self.cmb_zone)
 
         zone_manage_row = QtWidgets.QHBoxLayout()
-        for action, label in (("NEW", "+ New Zone"), ("RENAME", "Rename"), ("DELETE", "Delete")):
+        for action, label in (("NEW", "+ New Zone"), ("RENAME", "Edit Zone"), ("DELETE", "Delete")):
             btn = QtWidgets.QPushButton(label)
             btn.clicked.connect(
                 lambda _checked=False, a=action: self._run_op(

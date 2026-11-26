@@ -49,7 +49,7 @@ class FDT_OT_quick_popup(bpy.types.Operator):
         row_zones = layout.row(align=True)
         for action, label, icon in (
             ("NEW", "New", "ADD"),
-            ("RENAME", "Rename", "GREASEPENCIL"),
+            ("RENAME", "Edit Zone", "GREASEPENCIL"),
             ("DELETE", "Delete", "TRASH"),
         ):
             op = row_zones.operator("fdt.zone_manage", text=label, icon=icon)

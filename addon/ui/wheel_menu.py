@@ -716,14 +716,18 @@ class FDT_OT_cutter_wheel_menu(bpy.types.Operator):
             _draw_centered_text(font_id, f"Layer #{cur_layer_num}", cx, cy - 9.0, 10, (0.70, 0.78, 0.92, 0.92))
 
     def _assign_zone(self, context: bpy.types.Context, zone_letter: str) -> None:
+        from ..props import set_active_zone_silent
+
         obj = bpy.data.objects.get(self._cutter_name)
         settings = getattr(context.scene, "fdt_settings", None)
         if settings is not None:
-            settings.active_zone = zone_letter
+            set_active_zone_silent(settings, zone_letter)
         if obj is not None:
             apple_bite.set_cutters_zone(context, [obj], zone_letter)
+            self._cutter_name = obj.name
             if settings is not None:
-                settings.last_status = f"Set '{obj.name}' to Zone {zone_letter}"
+                token = zone_registry.zone_token(zone_letter, context.scene)
+                settings.last_status = f"Set '{obj.name}' to Zone {token}"
 
     def _execute_item(self, context: bpy.types.Context, item_id: str) -> None:
         cname = self._cutter_name

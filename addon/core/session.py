@@ -116,13 +116,19 @@ def save_session(scene: bpy.types.Scene, session: AppleBiteSession | None, persi
     if session is None:
         if SESSION_SCENE_PROP in scene:
             del scene[SESSION_SCENE_PROP]
-        return
-    payload = json.dumps(session.to_dict())
-    scene[SESSION_SCENE_PROP] = payload
-    if persist_meta:
-        root_col = bpy.data.collections.get(session.root_col_name)
-        if root_col is not None:
-            root_col[SESSION_COL_META_PROP] = payload
+    else:
+        payload = json.dumps(session.to_dict())
+        scene[SESSION_SCENE_PROP] = payload
+        if persist_meta:
+            root_col = bpy.data.collections.get(session.root_col_name)
+            if root_col is not None:
+                root_col[SESSION_COL_META_PROP] = payload
+    try:
+        from ..props import sync_cutter_layer_items
+
+        sync_cutter_layer_items(scene, session=session)
+    except Exception:
+        pass
 
 
 def load_session(scene: bpy.types.Scene | None) -> AppleBiteSession | None:
