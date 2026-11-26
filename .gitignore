@@ -221,3 +221,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# FullDestruc Tool
+addon/logs/
+*.dll.old_*
+*.blend1
+.obsidian/
