@@ -444,7 +444,7 @@ def init_cutter_rough_settings(
         if settings is not None:
             cr.inward_depth = float(getattr(settings, "rough_inward_ratio", 0.0))
             cr.jaggedness = float(getattr(settings, "rough_jaggedness", 0.45))
-            cr.noise_scale = float(getattr(settings, "rough_scale", 1.5))
+            cr.noise_scale = float(getattr(settings, "rough_scale", 2.5))
             cr.detail = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
             cr.seed = float(getattr(settings, "rough_seed", 0.0))
     finally:

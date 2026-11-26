@@ -14,7 +14,7 @@ GN_MARK_ORIG = "FDT_GN_MarkOrig"
 GN_ROUGH_CUTTER = "FDT_GN_RoughCutter"
 GN_CUT_FACE_UV = "FDT_GN_CutFaceUV"
 
-ROUGH_CUTTER_VERSION = 8
+ROUGH_CUTTER_VERSION = 9
 
 ORIG_ATTR_NAME = "fdt_orig"
 UV_ATTR_NAME = "UVMap0"
@@ -86,22 +86,23 @@ def ensure_mark_orig_group() -> bpy.types.NodeTree:
 
 
 def ensure_rough_cutter_group() -> bpy.types.NodeTree:
-    """Create or return FDT_GN_RoughCutter (v8) for bold, blocky, spike-free concrete fracture.
+    """Create or return FDT_GN_RoughCutter (v9) for bold, chunky, spike-free low-poly concrete cuts.
 
-    1. Subdivides cleanly (Level 1-3) and runs 1-pass topological `Blur Attribute` on raw 4D Noise
-       BEFORE contrast stretching (`Map Range 0.30..0.70 -> 0..1`) so single-vertex needles are
-       eliminated while full bold 0..1 jagged concrete chunks are preserved.
-    2. Displaces strictly inward (`-Normal`, up to 42% of min cutter dimension) and applies light
-       position blunting (max weight 0.20) to trim razor tips without softening the big chunks.
-    3. Uniformly scales the jagged shape inward toward its bounding-box center by `Inward Depth`
-       (`scale = 1.0 - Inward Depth * 0.85`), preserving the exact silhouette.
-    4. Finishes with shortest-diagonal Triangulate + Merge by Distance + Flat Shading.
+    1. Normalizes cutter local coordinates by max bounding-box extent so `Noise Scale` directly
+       controls the number of fracture chunks across the cutter regardless of box size.
+    2. Samples smooth 4D Perlin Noise (no Voronoi F1 needles) and auto-normalizes the evaluated
+       field across the subdivided mesh via `Attribute Statistic (Min..Max -> 0..1)` so the full
+       jagged dynamic range is ALWAYS preserved along every edge (never flattens out at high scales).
+    3. Displaces strictly inward (`-Normal`, up to 45% of min cutter dimension) with a subtle
+       anti-spike position blunt (max weight 0.12) to trim sharp corner ears without softening chunks.
+    4. Uniformly scales the jagged silhouette inward toward bbox center by `Inward Depth`
+       (`scale = 1.0 - Inward Depth * 0.85`), then Triangulate + Merge + Flat Shade.
     """
     existing = bpy.data.node_groups.get(GN_ROUGH_CUTTER)
     if existing is not None:
         if int(existing.get("fdt_gn_version", 1)) >= ROUGH_CUTTER_VERSION:
             return existing
-        # Upgrade legacy v1-v7 node group in-place so existing modifier links stay intact
+        # Upgrade legacy v1-v8 node group in-place so existing modifier links stay intact
         ng = existing
         ng.links.clear()
         ng.nodes.clear()
@@ -129,10 +130,10 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
         s_jagged.subtype = "FACTOR"
 
     s_scale = ng.interface.new_socket(name="Noise Scale", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_scale.default_value = 1.5
+    s_scale.default_value = 2.5
     if hasattr(s_scale, "min_value"):
-        s_scale.min_value = 0.2
-        s_scale.max_value = 15.0
+        s_scale.min_value = 0.5
+        s_scale.max_value = 10.0
 
     s_detail = ng.interface.new_socket(name="Detail", in_out="INPUT", socket_type="NodeSocketInt")
     s_detail.default_value = 2
@@ -149,203 +150,257 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     links = ng.links
 
     n_in = nodes.new("NodeGroupInput")
-    n_in.location = (-1400, 0)
+    n_in.location = (-1600, 0)
 
-    # 1. Bounding Box -> center (for inward scaling) & bold max jagged amplitude (0.42 * min_dim)
+    # 1. Bounding Box -> center, min_dim (safe depth), max_dim (size-independent noise coordinates)
     n_bbox = nodes.new("GeometryNodeBoundBox")
-    n_bbox.location = (-1140, 360)
+    n_bbox.location = (-1320, 360)
     links.new(n_in.outputs["Geometry"], n_bbox.inputs["Geometry"])
 
     n_center_sum = nodes.new("ShaderNodeVectorMath")
-    n_center_sum.location = (-920, 480)
+    n_center_sum.location = (-1100, 520)
     n_center_sum.operation = "ADD"
     links.new(n_bbox.outputs["Min"], n_center_sum.inputs[0])
     links.new(n_bbox.outputs["Max"], n_center_sum.inputs[1])
 
     n_center = nodes.new("ShaderNodeVectorMath")
-    n_center.location = (-720, 480)
+    n_center.location = (-900, 520)
     n_center.operation = "SCALE"
     n_center.inputs["Scale"].default_value = 0.5
     links.new(n_center_sum.outputs["Vector"], n_center.inputs[0])
 
     n_size = nodes.new("ShaderNodeVectorMath")
-    n_size.location = (-920, 300)
+    n_size.location = (-1100, 300)
     n_size.operation = "SUBTRACT"
     links.new(n_bbox.outputs["Max"], n_size.inputs[0])
     links.new(n_bbox.outputs["Min"], n_size.inputs[1])
 
     n_sep_sz = nodes.new("ShaderNodeSeparateXYZ")
-    n_sep_sz.location = (-720, 300)
+    n_sep_sz.location = (-900, 300)
     links.new(n_size.outputs["Vector"], n_sep_sz.inputs["Vector"])
 
+    # min_dim for safe max jagged amplitude
     n_min_xy = nodes.new("ShaderNodeMath")
-    n_min_xy.location = (-520, 340)
+    n_min_xy.location = (-700, 360)
     n_min_xy.operation = "MINIMUM"
     links.new(n_sep_sz.outputs["X"], n_min_xy.inputs[0])
     links.new(n_sep_sz.outputs["Y"], n_min_xy.inputs[1])
 
     n_min_xyz = nodes.new("ShaderNodeMath")
-    n_min_xyz.location = (-340, 300)
+    n_min_xyz.location = (-520, 320)
     n_min_xyz.operation = "MINIMUM"
     links.new(n_min_xy.outputs["Value"], n_min_xyz.inputs[0])
     links.new(n_sep_sz.outputs["Z"], n_min_xyz.inputs[1])
 
+    # max_dim for aspect-preserving normalized noise space [-0.5 .. +0.5]
+    n_max_xy = nodes.new("ShaderNodeMath")
+    n_max_xy.location = (-700, 180)
+    n_max_xy.operation = "MAXIMUM"
+    links.new(n_sep_sz.outputs["X"], n_max_xy.inputs[0])
+    links.new(n_sep_sz.outputs["Y"], n_max_xy.inputs[1])
+
+    n_max_xyz = nodes.new("ShaderNodeMath")
+    n_max_xyz.location = (-520, 180)
+    n_max_xyz.operation = "MAXIMUM"
+    links.new(n_max_xy.outputs["Value"], n_max_xyz.inputs[0])
+    links.new(n_sep_sz.outputs["Z"], n_max_xyz.inputs[1])
+
+    n_max_safe = nodes.new("ShaderNodeMath")
+    n_max_safe.location = (-340, 180)
+    n_max_safe.operation = "MAXIMUM"
+    n_max_safe.inputs[1].default_value = 1e-4
+    links.new(n_max_xyz.outputs["Value"], n_max_safe.inputs[0])
+
+    n_inv_max = nodes.new("ShaderNodeMath")
+    n_inv_max.location = (-160, 180)
+    n_inv_max.operation = "DIVIDE"
+    n_inv_max.inputs[0].default_value = 1.0
+    links.new(n_max_safe.outputs["Value"], n_inv_max.inputs[1])
+
     n_max_amp = nodes.new("ShaderNodeMath")
-    n_max_amp.location = (-140, 300)
+    n_max_amp.location = (-340, 320)
     n_max_amp.operation = "MULTIPLY"
-    n_max_amp.inputs[1].default_value = 0.42
+    n_max_amp.inputs[1].default_value = 0.45
     links.new(n_min_xyz.outputs["Value"], n_max_amp.inputs[0])
 
-    # jagged_amp = 0.42 * min_dim * Jaggedness
+    # jagged_amp = 0.45 * min_dim * Jaggedness
     n_jagged_amp = nodes.new("ShaderNodeMath")
-    n_jagged_amp.location = (60, 260)
+    n_jagged_amp.location = (-140, 320)
     n_jagged_amp.operation = "MULTIPLY"
     links.new(n_max_amp.outputs["Value"], n_jagged_amp.inputs[0])
     links.new(n_in.outputs["Jaggedness"], n_jagged_amp.inputs[1])
 
     # 2. Low-poly clean subdivision (Level 1 = 48 tris, Level 2 = 192 tris, Level 3 = 768 tris on a box)
     n_subdiv = nodes.new("GeometryNodeSubdivideMesh")
-    n_subdiv.location = (-520, 80)
+    n_subdiv.location = (-520, 20)
     links.new(n_in.outputs["Geometry"], n_subdiv.inputs["Mesh"])
     links.new(n_in.outputs["Detail"], n_subdiv.inputs["Level"])
 
-    # 3. Bold 4D Noise -> 1-pass topological blur (kills single-vertex needles) -> FULL contrast stretch!
+    # 3. Size-normalized 4D Perlin Noise + Attribute Statistic auto-normalization (always full 0..1!)
+    n_pos_noise = nodes.new("GeometryNodeInputPosition")
+    n_pos_noise.location = (-1100, -240)
+
+    n_pos_rel = nodes.new("ShaderNodeVectorMath")
+    n_pos_rel.location = (-900, -240)
+    n_pos_rel.operation = "SUBTRACT"
+    links.new(n_pos_noise.outputs["Position"], n_pos_rel.inputs[0])
+    links.new(n_center.outputs["Vector"], n_pos_rel.inputs[1])
+
+    n_pos_norm = nodes.new("ShaderNodeVectorMath")
+    n_pos_norm.location = (-700, -240)
+    n_pos_norm.operation = "SCALE"
+    links.new(n_pos_rel.outputs["Vector"], n_pos_norm.inputs[0])
+    links.new(n_inv_max.outputs["Value"], n_pos_norm.inputs["Scale"])
+
     n_noise = nodes.new("ShaderNodeTexNoise")
-    n_noise.location = (-720, -220)
+    n_noise.location = (-480, -240)
     n_noise.noise_dimensions = "4D"
-    n_noise.inputs["Detail"].default_value = 2.0
-    n_noise.inputs["Roughness"].default_value = 0.55
+    n_noise.inputs["Detail"].default_value = 1.5
+    n_noise.inputs["Roughness"].default_value = 0.45
     n_noise.inputs["Distortion"].default_value = 0.0
+    links.new(n_pos_norm.outputs["Vector"], n_noise.inputs["Vector"])
     links.new(n_in.outputs["Noise Scale"], n_noise.inputs["Scale"])
     links.new(n_in.outputs["Seed"], n_noise.inputs["W"])
 
-    n_blur_val = nodes.new("GeometryNodeBlurAttribute")
-    n_blur_val.location = (-460, -220)
-    n_blur_val.data_type = "FLOAT"
-    n_blur_val.inputs["Iterations"].default_value = 1
-    n_blur_val.inputs["Weight"].default_value = 0.55
-    links.new(n_noise.outputs["Fac"], _get_socket(n_blur_val.inputs, "Value", index=0))
+    # Auto-normalize [stat.Min .. stat.Max] -> [0.0 .. 1.0] across the cutter vertices
+    n_stat = nodes.new("GeometryNodeAttributeStatistic")
+    n_stat.location = (-260, -400)
+    n_stat.data_type = "FLOAT"
+    n_stat.domain = "POINT"
+    links.new(n_subdiv.outputs["Mesh"], n_stat.inputs["Geometry"])
+    links.new(n_noise.outputs["Fac"], n_stat.inputs["Attribute"])
 
-    # Stretch contrast AFTER blur so full 0..1 jagged depth is preserved without single-vertex needles
+    n_min_eps = nodes.new("ShaderNodeMath")
+    n_min_eps.location = (-60, -480)
+    n_min_eps.operation = "ADD"
+    n_min_eps.inputs[1].default_value = 1e-4
+    links.new(n_stat.outputs["Min"], n_min_eps.inputs[0])
+
+    n_stat_max_safe = nodes.new("ShaderNodeMath")
+    n_stat_max_safe.location = (120, -440)
+    n_stat_max_safe.operation = "MAXIMUM"
+    links.new(n_stat.outputs["Max"], n_stat_max_safe.inputs[0])
+    links.new(n_min_eps.outputs["Value"], n_stat_max_safe.inputs[1])
+
     n_contrast = nodes.new("ShaderNodeMapRange")
-    n_contrast.location = (-200, -220)
+    n_contrast.location = (120, -220)
     n_contrast.data_type = "FLOAT"
     n_contrast.interpolation_type = "LINEAR"
     n_contrast.clamp = True
-    n_contrast.inputs["From Min"].default_value = 0.30
-    n_contrast.inputs["From Max"].default_value = 0.70
     n_contrast.inputs["To Min"].default_value = 0.0
     n_contrast.inputs["To Max"].default_value = 1.0
-    links.new(_get_socket(n_blur_val.outputs, "Value", index=0), n_contrast.inputs["Value"])
+    links.new(n_noise.outputs["Fac"], n_contrast.inputs["Value"])
+    links.new(n_stat.outputs["Min"], n_contrast.inputs["From Min"])
+    links.new(n_stat_max_safe.outputs["Value"], n_contrast.inputs["From Max"])
 
-    # 4. Inward jagged fracture displacement along -Normal
+    # 4. Inward jagged fracture displacement along -Normal (full 0..jagged_amp relief!)
     n_disp = nodes.new("ShaderNodeMath")
-    n_disp.location = (100, -160)
+    n_disp.location = (340, -160)
     n_disp.operation = "MULTIPLY"
     links.new(n_contrast.outputs["Result"], n_disp.inputs[0])
     links.new(n_jagged_amp.outputs["Value"], n_disp.inputs[1])
 
     n_neg = nodes.new("ShaderNodeMath")
-    n_neg.location = (280, -160)
+    n_neg.location = (520, -160)
     n_neg.operation = "MULTIPLY"
     n_neg.inputs[1].default_value = -1.0
     links.new(n_disp.outputs["Value"], n_neg.inputs[0])
 
     n_norm = nodes.new("GeometryNodeInputNormal")
-    n_norm.location = (280, -340)
+    n_norm.location = (520, -340)
 
     n_vec_scale = nodes.new("ShaderNodeVectorMath")
-    n_vec_scale.location = (460, -220)
+    n_vec_scale.location = (700, -220)
     n_vec_scale.operation = "SCALE"
     links.new(n_norm.outputs["Normal"], n_vec_scale.inputs[0])
     links.new(n_neg.outputs["Value"], n_vec_scale.inputs["Scale"])
 
     n_set_jagged = nodes.new("GeometryNodeSetPosition")
-    n_set_jagged.location = (660, 80)
+    n_set_jagged.location = (900, 80)
     links.new(n_subdiv.outputs["Mesh"], n_set_jagged.inputs["Geometry"])
     links.new(n_vec_scale.outputs["Vector"], n_set_jagged.inputs["Offset"])
 
-    # 5. Light Anti-Spike Position Blunting: trims razor tips (max weight 0.20) while keeping chunks bold
+    # 5. Subtle Anti-Spike Position Blunting: trims sharp corner ears (max weight 0.12) while keeping chunks bold
     n_blunt_mul = nodes.new("ShaderNodeMath")
-    n_blunt_mul.location = (460, -40)
+    n_blunt_mul.location = (700, -40)
     n_blunt_mul.operation = "MULTIPLY"
-    n_blunt_mul.inputs[1].default_value = 0.25
+    n_blunt_mul.inputs[1].default_value = 0.16
     links.new(n_in.outputs["Jaggedness"], n_blunt_mul.inputs[0])
 
     n_blunt_w = nodes.new("ShaderNodeMath")
-    n_blunt_w.location = (640, -40)
+    n_blunt_w.location = (880, -40)
     n_blunt_w.operation = "MINIMUM"
-    n_blunt_w.inputs[1].default_value = 0.20
+    n_blunt_w.inputs[1].default_value = 0.12
     links.new(n_blunt_mul.outputs["Value"], n_blunt_w.inputs[0])
 
     n_pos_blunt_in = nodes.new("GeometryNodeInputPosition")
-    n_pos_blunt_in.location = (640, -220)
+    n_pos_blunt_in.location = (880, -220)
 
     n_blur_pos = nodes.new("GeometryNodeBlurAttribute")
-    n_blur_pos.location = (840, -160)
+    n_blur_pos.location = (1080, -160)
     n_blur_pos.data_type = "FLOAT_VECTOR"
     n_blur_pos.inputs["Iterations"].default_value = 1
     links.new(n_pos_blunt_in.outputs["Position"], _get_socket(n_blur_pos.inputs, "Value", index=0))
     links.new(n_blunt_w.outputs["Value"], n_blur_pos.inputs["Weight"])
 
     n_set_blunt = nodes.new("GeometryNodeSetPosition")
-    n_set_blunt.location = (1040, 80)
+    n_set_blunt.location = (1280, 80)
     links.new(n_set_jagged.outputs["Geometry"], n_set_blunt.inputs["Geometry"])
     links.new(_get_socket(n_blur_pos.outputs, "Value", index=0), n_set_blunt.inputs["Position"])
 
-    # 6. Inward Depth: uniform scale around bbox center (preserves exact blunted jagged silhouette!)
+    # 6. Inward Depth: uniform scale around bbox center (preserves exact jagged silhouette!)
     # scale_factor = 1.0 - Inward Depth * 0.85
     n_inward_scale = nodes.new("ShaderNodeMath")
-    n_inward_scale.location = (840, 360)
+    n_inward_scale.location = (1080, 360)
     n_inward_scale.operation = "MULTIPLY_ADD"
     n_inward_scale.inputs[1].default_value = -0.85
     n_inward_scale.inputs[2].default_value = 1.0
     links.new(n_in.outputs["Inward Depth"], n_inward_scale.inputs[0])
 
     n_pos2 = nodes.new("GeometryNodeInputPosition")
-    n_pos2.location = (840, 520)
+    n_pos2.location = (1080, 520)
 
     n_rel = nodes.new("ShaderNodeVectorMath")
-    n_rel.location = (1040, 480)
+    n_rel.location = (1280, 480)
     n_rel.operation = "SUBTRACT"
     links.new(n_pos2.outputs["Position"], n_rel.inputs[0])
     links.new(n_center.outputs["Vector"], n_rel.inputs[1])
 
     n_rel_scaled = nodes.new("ShaderNodeVectorMath")
-    n_rel_scaled.location = (1220, 440)
+    n_rel_scaled.location = (1460, 440)
     n_rel_scaled.operation = "SCALE"
     links.new(n_rel.outputs["Vector"], n_rel_scaled.inputs[0])
     links.new(n_inward_scale.outputs["Value"], n_rel_scaled.inputs["Scale"])
 
     n_pos_final = nodes.new("ShaderNodeVectorMath")
-    n_pos_final.location = (1400, 440)
+    n_pos_final.location = (1640, 440)
     n_pos_final.operation = "ADD"
     links.new(n_rel_scaled.outputs["Vector"], n_pos_final.inputs[0])
     links.new(n_center.outputs["Vector"], n_pos_final.inputs[1])
 
     n_set_scale = nodes.new("GeometryNodeSetPosition")
-    n_set_scale.location = (1400, 80)
+    n_set_scale.location = (1640, 80)
     links.new(n_set_blunt.outputs["Geometry"], n_set_scale.inputs["Geometry"])
     links.new(n_pos_final.outputs["Vector"], n_set_scale.inputs["Position"])
 
     # 7. Clean planar low-poly triangulation + weld degenerate slivers + crisp flat normals
     n_tri = nodes.new("GeometryNodeTriangulate")
-    n_tri.location = (1620, 80)
+    n_tri.location = (1860, 80)
     _set_node_enum(n_tri, "quad_method", "Quad Method", "SHORTEST_DIAGONAL")
     links.new(n_set_scale.outputs["Geometry"], n_tri.inputs["Mesh"])
 
     n_merge = nodes.new("GeometryNodeMergeByDistance")
-    n_merge.location = (1840, 80)
+    n_merge.location = (2080, 80)
     n_merge.inputs["Distance"].default_value = 0.015
     links.new(n_tri.outputs["Mesh"], n_merge.inputs["Geometry"])
 
     n_flat = nodes.new("GeometryNodeSetShadeSmooth")
-    n_flat.location = (2060, 80)
+    n_flat.location = (2300, 80)
     n_flat.inputs["Shade Smooth"].default_value = False
     links.new(n_merge.outputs["Geometry"], n_flat.inputs["Geometry"])
 
     n_out = nodes.new("NodeGroupOutput")
-    n_out.location = (2280, 80)
+    n_out.location = (2520, 80)
     links.new(n_flat.outputs["Geometry"], n_out.inputs["Geometry"])
 
     ng["fdt_gn_version"] = ROUGH_CUTTER_VERSION

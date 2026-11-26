@@ -239,10 +239,10 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_scale: FloatProperty(
         name="Noise Scale",
-        description="Default chunk frequency of fracture noise for new rough cutters",
-        default=1.5,
-        min=0.2,
-        max=15.0,
+        description="Number of fracture chunks across the cutter (lower = huge chunks, higher = finer)",
+        default=2.5,
+        min=0.5,
+        max=10.0,
         update=_on_live_setting_changed,
     )
     rough_detail: FloatProperty(
@@ -782,10 +782,10 @@ class FDT_CutterRoughSettings(bpy.types.PropertyGroup):
     )
     noise_scale: FloatProperty(
         name="Noise Scale",
-        description="Chunk size of fracture noise on this cutter (lower = bigger low-poly chunks)",
-        default=1.5,
-        min=0.2,
-        max=15.0,
+        description="Number of fracture chunks across this cutter (lower = huge chunks, higher = finer)",
+        default=2.5,
+        min=0.5,
+        max=10.0,
         update=_on_cutter_rough_changed,
     )
     detail: IntProperty(

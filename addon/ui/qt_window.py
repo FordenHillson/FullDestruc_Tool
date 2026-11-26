@@ -640,12 +640,12 @@ class FullDestrucWindow(QtWidgets.QWidget):
         jagged_row.addWidget(self.spn_rough_jagged)
         rp_layout.addRow("Jaggedness:", jagged_row)
 
-        # Noise Scale (lower = bigger low-poly chunks)
+        # Noise Scale (chunks across cutter)
         self.spn_rough_scale = QtWidgets.QDoubleSpinBox()
-        self.spn_rough_scale.setRange(0.2, 15.0)
-        self.spn_rough_scale.setSingleStep(0.2)
+        self.spn_rough_scale.setRange(0.5, 10.0)
+        self.spn_rough_scale.setSingleStep(0.25)
         self.spn_rough_scale.setDecimals(2)
-        self.spn_rough_scale.setValue(1.5)
+        self.spn_rough_scale.setValue(2.5)
         self.spn_rough_scale.valueChanged.connect(
             lambda v: self._on_rough_param_changed("noise_scale", float(v))
         )
@@ -1183,7 +1183,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         lbl_txt = "Default Rough (New Cutters)"
                         inward_val = float(getattr(settings, "rough_inward_ratio", 0.0))
                         jagged_val = float(getattr(settings, "rough_jaggedness", 0.45))
-                        r_scl = float(getattr(settings, "rough_scale", 1.5))
+                        r_scl = float(getattr(settings, "rough_scale", 2.5))
                         r_sub = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
                         r_seed = float(getattr(settings, "rough_seed", 0.0))
 
