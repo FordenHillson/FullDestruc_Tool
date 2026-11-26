@@ -440,12 +440,10 @@ def _ensure_rough_modifier(
     mod.node_group = ensure_rough_cutter_group()
 
     if settings is not None:
-        res_level = max(1, min(5, int(getattr(settings, "rough_subdiv", 3))))
+        detail_level = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
         set_modifier_socket(mod, "Inward Ratio", float(getattr(settings, "rough_inward_ratio", 0.35)))
-        set_modifier_socket(mod, "Carve Amount", float(getattr(settings, "rough_carve_amount", 0.50)))
         set_modifier_socket(mod, "Noise Scale", float(settings.rough_scale))
-        set_modifier_socket(mod, "Noise Detail", float(getattr(settings, "rough_detail", 0.5)))
-        set_modifier_socket(mod, "Resolution", res_level)
+        set_modifier_socket(mod, "Detail", detail_level)
         set_modifier_socket(mod, "Seed", float(settings.rough_seed))
 
 

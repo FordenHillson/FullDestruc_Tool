@@ -62,11 +62,9 @@ class FDT_OT_quick_popup(bpy.types.Operator):
         any_rough = settings.enable_rough or (session is not None and any(c.rough for c in session.cutters))
         if any_rough:
             box = layout.box()
-            box.prop(settings, "rough_inward_ratio", text="Inward Ratio", slider=True)
-            box.prop(settings, "rough_carve_amount", text="Carve Amount", slider=True)
+            box.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
             box.prop(settings, "rough_scale", text="Noise Scale")
-            box.prop(settings, "rough_detail", text="Noise Detail", slider=True)
-            box.prop(settings, "rough_subdiv", text="Resolution")
+            box.prop(settings, "rough_subdiv", text="Detail (1-3)")
             box.prop(settings, "rough_seed", text="Seed")
         draw_cut_material_row(layout, settings, text="Cut Material")
         row = layout.row(align=True)

@@ -203,8 +203,8 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         update=_on_global_rough_changed,
     )
     rough_inward_ratio: FloatProperty(
-        name="Inward Ratio",
-        description="Proportion of outer shell band eating inward from the outer surface (0% = off, 100% = full depth)",
+        name="Inward Depth",
+        description="Proportion of jagged concrete fracture eating inward from the outer surface (0% = off, 100% = deepest)",
         subtype="FACTOR",
         default=0.35,
         min=0.0,
@@ -213,7 +213,7 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_carve_amount: FloatProperty(
         name="Carve Amount",
-        description="White-noise carve threshold (0% = none, 50% = balanced white chunks carved out, 100% = heavy erosion)",
+        description="Deprecated legacy carve threshold kept for backward compatibility",
         subtype="FACTOR",
         default=0.50,
         min=0.0,
@@ -230,15 +230,15 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_scale: FloatProperty(
         name="Noise Scale",
-        description="Frequency / chunk size of 4D carve-out noise",
-        default=3.0,
-        min=0.1,
-        max=50.0,
+        description="Chunk frequency of fracture noise (lower = bigger low-poly chunks, higher = finer)",
+        default=1.5,
+        min=0.2,
+        max=15.0,
         update=_on_live_setting_changed,
     )
     rough_detail: FloatProperty(
         name="Noise Detail",
-        description="Jaggedness and fine detail of rough cut noise (controls Noise Detail & Roughness)",
+        description="Deprecated legacy noise detail kept for backward compatibility",
         subtype="FACTOR",
         default=0.5,
         min=0.0,
@@ -246,11 +246,11 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         update=_on_live_setting_changed,
     )
     rough_subdiv: IntProperty(
-        name="Resolution",
-        description="Volume grid resolution level for white-noise carve chunks (WYSIWYG in live preview & apply, 1-5)",
-        default=3,
+        name="Detail",
+        description="Low-poly mesh detail level (1 = ultra low-poly ~48 tris, 2 = game-ready ~192 tris, 3 = detailed ~768 tris)",
+        default=2,
         min=1,
-        max=5,
+        max=3,
         update=_on_live_setting_changed,
     )
     rough_voxel_size: FloatProperty(

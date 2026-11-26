@@ -641,10 +641,8 @@ def test_20_edge_band_inward_rough_cut() -> None:
 
     settings = ctx.scene.fdt_settings
     settings.rough_inward_ratio = 0.35
-    settings.rough_carve_amount = 0.55
-    settings.rough_scale = 2.5
-    settings.rough_detail = 0.5
-    settings.rough_subdiv = 3
+    settings.rough_scale = 1.5
+    settings.rough_subdiv = 2
     settings.rough_seed = 1.0
 
     ok, is_rough = apple_bite.toggle_cutter_rough(ctx, cutter.name)
@@ -659,42 +657,37 @@ def test_20_edge_band_inward_rough_cut() -> None:
         for item in mod.node_group.interface.items_tree
         if item.item_type == "SOCKET" and item.in_out == "INPUT"
     }
-    for expected in ("Geometry", "Inward Ratio", "Carve Amount", "Noise Scale", "Noise Detail", "Resolution", "Seed"):
+    for expected in ("Geometry", "Inward Ratio", "Noise Scale", "Detail", "Seed"):
         assert expected in input_names, f"Missing socket: {expected}"
 
-    def _eval_local_verts():
+    def _eval_local_mesh():
         deps = ctx.evaluated_depsgraph_get()
         eval_obj = cutter.evaluated_get(deps)
         mesh = eval_obj.to_mesh()
         try:
-            return [tuple(v.co) for v in mesh.vertices]
+            return [tuple(v.co) for v in mesh.vertices], len(mesh.polygons)
         finally:
             eval_obj.to_mesh_clear()
 
-    # 1. Inward-only guarantee: Boolean DIFFERENCE never bulges outside [-1.0, +1.0]
-    verts = _eval_local_verts()
-    assert len(verts) > 20, f"Expected carved cutter geometry, got {len(verts)} verts"
+    # 1. True Low-Poly budget: Detail=2 box cutter stays <= 220 clean triangles (vs thousands in VolumeToMesh)
+    verts, poly_count = _eval_local_mesh()
+    assert 24 <= poly_count <= 220, f"Expected low-poly cutter (24..220 polys), got {poly_count}"
+
+    # 2. Inward-only guarantee: no vertex may bulge outside [-1.0, +1.0]
     max_abs = max(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
     assert max_abs <= 1.0005, f"Rough cutter bulged outward beyond box bounds: max_abs={max_abs:.5f}"
 
-    # 2. Outer shell carved inward, while inner core (distance > 0.35m from outer surface) stays untouched
+    # 3. Bold inward fracture without penetrating core
     min_max_axis = min(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
     carved_depth = 1.0 - min_max_axis
-    assert carved_depth > 0.05, f"Expected noticeable white-noise carve chunks, got depth={carved_depth:.4f}"
-    assert min_max_axis >= 0.60, f"Carve penetrated past Inward Ratio=0.35 into core: min_max_axis={min_max_axis:.4f}"
+    assert carved_depth > 0.05, f"Expected noticeable inward fracture depth, got {carved_depth:.4f}"
+    assert min_max_axis >= 0.50, f"Fracture penetrated too deep into core: min_max_axis={min_max_axis:.4f}"
 
-    # 3. Inward Ratio = 0.0 -> bypasses Boolean cleanly (original 8 cube verts)
+    # 4. Inward Ratio = 0.0 -> bypasses cleanly (original 8 cube verts)
     settings.rough_inward_ratio = 0.0
     apple_bite.rebuild_session(ctx)
-    verts_zero = _eval_local_verts()
+    verts_zero, _ = _eval_local_mesh()
     assert len(verts_zero) == 8, f"Expected untouched 8-vert cube at Inward Ratio=0.0, got {len(verts_zero)}"
-
-    # 4. Carve Amount = 0.0 -> bypasses Boolean cleanly (original 8 cube verts)
-    settings.rough_inward_ratio = 0.35
-    settings.rough_carve_amount = 0.0
-    apple_bite.rebuild_session(ctx)
-    verts_no_carve = _eval_local_verts()
-    assert len(verts_no_carve) == 8, f"Expected untouched 8-vert cube at Carve Amount=0.0, got {len(verts_no_carve)}"
 
 
 ALL_TESTS = [

@@ -596,7 +596,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
         rp_layout.setContentsMargins(8, 6, 8, 6)
         rp_layout.setSpacing(5)
 
-        # Inward Ratio (0-100%)
+        # Inward Depth (0-100%)
         inward_row = QtWidgets.QHBoxLayout()
         inward_row.setContentsMargins(0, 0, 0, 0)
         inward_row.setSpacing(6)
@@ -614,67 +614,27 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.spn_rough_inward.valueChanged.connect(self._on_rough_inward_spin_changed)
         inward_row.addWidget(self.sld_rough_inward, 1)
         inward_row.addWidget(self.spn_rough_inward)
-        rp_layout.addRow("Inward Ratio:", inward_row)
+        rp_layout.addRow("Inward Depth:", inward_row)
 
-        # Carve Amount (0-100% white-noise threshold)
-        carve_row = QtWidgets.QHBoxLayout()
-        carve_row.setContentsMargins(0, 0, 0, 0)
-        carve_row.setSpacing(6)
-        self.sld_rough_carve = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sld_rough_carve.setRange(0, 100)
-        self.sld_rough_carve.setValue(50)
-        self.spn_rough_carve = QtWidgets.QDoubleSpinBox()
-        self.spn_rough_carve.setRange(0.0, 100.0)
-        self.spn_rough_carve.setSingleStep(5.0)
-        self.spn_rough_carve.setDecimals(0)
-        self.spn_rough_carve.setSuffix("%")
-        self.spn_rough_carve.setValue(50.0)
-        self.spn_rough_carve.setFixedWidth(64)
-        self.sld_rough_carve.valueChanged.connect(self._on_rough_carve_slider_changed)
-        self.spn_rough_carve.valueChanged.connect(self._on_rough_carve_spin_changed)
-        carve_row.addWidget(self.sld_rough_carve, 1)
-        carve_row.addWidget(self.spn_rough_carve)
-        rp_layout.addRow("Carve Amount:", carve_row)
-
-        # Noise Scale
+        # Noise Scale (lower = bigger low-poly chunks)
         self.spn_rough_scale = QtWidgets.QDoubleSpinBox()
-        self.spn_rough_scale.setRange(0.1, 50.0)
-        self.spn_rough_scale.setSingleStep(0.25)
+        self.spn_rough_scale.setRange(0.2, 15.0)
+        self.spn_rough_scale.setSingleStep(0.2)
         self.spn_rough_scale.setDecimals(2)
-        self.spn_rough_scale.setValue(3.0)
+        self.spn_rough_scale.setValue(1.5)
         self.spn_rough_scale.valueChanged.connect(
             lambda v: self._on_rough_param_changed("rough_scale", float(v))
         )
         rp_layout.addRow("Noise Scale:", self.spn_rough_scale)
 
-        # Noise Detail (0-100%)
-        detail_row = QtWidgets.QHBoxLayout()
-        detail_row.setContentsMargins(0, 0, 0, 0)
-        detail_row.setSpacing(6)
-        self.sld_rough_detail = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.sld_rough_detail.setRange(0, 100)
-        self.sld_rough_detail.setValue(50)
-        self.spn_rough_detail = QtWidgets.QDoubleSpinBox()
-        self.spn_rough_detail.setRange(0.0, 100.0)
-        self.spn_rough_detail.setSingleStep(5.0)
-        self.spn_rough_detail.setDecimals(0)
-        self.spn_rough_detail.setSuffix("%")
-        self.spn_rough_detail.setValue(50.0)
-        self.spn_rough_detail.setFixedWidth(64)
-        self.sld_rough_detail.valueChanged.connect(self._on_rough_detail_slider_changed)
-        self.spn_rough_detail.valueChanged.connect(self._on_rough_detail_spin_changed)
-        detail_row.addWidget(self.sld_rough_detail, 1)
-        detail_row.addWidget(self.spn_rough_detail)
-        rp_layout.addRow("Noise Detail:", detail_row)
-
-        # Resolution (Subdiv Level 1-5)
+        # Low-Poly Detail (1-3)
         self.spn_rough_subdiv = QtWidgets.QSpinBox()
-        self.spn_rough_subdiv.setRange(1, 5)
-        self.spn_rough_subdiv.setValue(3)
+        self.spn_rough_subdiv.setRange(1, 3)
+        self.spn_rough_subdiv.setValue(2)
         self.spn_rough_subdiv.valueChanged.connect(
             lambda v: self._on_rough_param_changed("rough_subdiv", int(v))
         )
-        rp_layout.addRow("Resolution:", self.spn_rough_subdiv)
+        rp_layout.addRow("Detail (1-3):", self.spn_rough_subdiv)
 
         # Seed
         self.spn_rough_seed = QtWidgets.QDoubleSpinBox()
@@ -810,36 +770,6 @@ class FullDestrucWindow(QtWidgets.QWidget):
             self.sld_rough_inward.setValue(ipct)
             self.sld_rough_inward.blockSignals(False)
         self._on_rough_param_changed("rough_inward_ratio", float(pct) / 100.0)
-
-    def _on_rough_carve_slider_changed(self, pct: int) -> None:
-        if abs(self.spn_rough_carve.value() - float(pct)) > 1e-6:
-            self.spn_rough_carve.blockSignals(True)
-            self.spn_rough_carve.setValue(float(pct))
-            self.spn_rough_carve.blockSignals(False)
-        self._on_rough_param_changed("rough_carve_amount", float(pct) / 100.0)
-
-    def _on_rough_carve_spin_changed(self, pct: float) -> None:
-        ipct = int(round(pct))
-        if self.sld_rough_carve.value() != ipct:
-            self.sld_rough_carve.blockSignals(True)
-            self.sld_rough_carve.setValue(ipct)
-            self.sld_rough_carve.blockSignals(False)
-        self._on_rough_param_changed("rough_carve_amount", float(pct) / 100.0)
-
-    def _on_rough_detail_slider_changed(self, pct: int) -> None:
-        if abs(self.spn_rough_detail.value() - float(pct)) > 1e-6:
-            self.spn_rough_detail.blockSignals(True)
-            self.spn_rough_detail.setValue(float(pct))
-            self.spn_rough_detail.blockSignals(False)
-        self._on_rough_param_changed("rough_detail", float(pct) / 100.0)
-
-    def _on_rough_detail_spin_changed(self, pct: float) -> None:
-        ipct = int(round(pct))
-        if self.sld_rough_detail.value() != ipct:
-            self.sld_rough_detail.blockSignals(True)
-            self.sld_rough_detail.setValue(ipct)
-            self.sld_rough_detail.blockSignals(False)
-        self._on_rough_param_changed("rough_detail", float(pct) / 100.0)
 
     def _on_auto_fill_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
@@ -1190,35 +1120,13 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         self.spn_rough_inward.setValue(inward_pct)
                         self.spn_rough_inward.blockSignals(False)
 
-                    carve_pct = float(getattr(settings, "rough_carve_amount", 0.50)) * 100.0
-                    carve_ipct = int(round(carve_pct))
-                    if not self.sld_rough_carve.isSliderDown() and self.sld_rough_carve.value() != carve_ipct:
-                        self.sld_rough_carve.blockSignals(True)
-                        self.sld_rough_carve.setValue(carve_ipct)
-                        self.sld_rough_carve.blockSignals(False)
-                    if not self.spn_rough_carve.hasFocus() and abs(self.spn_rough_carve.value() - carve_pct) > 0.5:
-                        self.spn_rough_carve.blockSignals(True)
-                        self.spn_rough_carve.setValue(carve_pct)
-                        self.spn_rough_carve.blockSignals(False)
-
-                    r_scl = float(getattr(settings, "rough_scale", 3.0))
+                    r_scl = float(getattr(settings, "rough_scale", 1.5))
                     if not self.spn_rough_scale.hasFocus() and abs(self.spn_rough_scale.value() - r_scl) > 1e-4:
                         self.spn_rough_scale.blockSignals(True)
                         self.spn_rough_scale.setValue(r_scl)
                         self.spn_rough_scale.blockSignals(False)
 
-                    detail_pct = float(getattr(settings, "rough_detail", 0.5)) * 100.0
-                    detail_ipct = int(round(detail_pct))
-                    if not self.sld_rough_detail.isSliderDown() and self.sld_rough_detail.value() != detail_ipct:
-                        self.sld_rough_detail.blockSignals(True)
-                        self.sld_rough_detail.setValue(detail_ipct)
-                        self.sld_rough_detail.blockSignals(False)
-                    if not self.spn_rough_detail.hasFocus() and abs(self.spn_rough_detail.value() - detail_pct) > 0.5:
-                        self.spn_rough_detail.blockSignals(True)
-                        self.spn_rough_detail.setValue(detail_pct)
-                        self.spn_rough_detail.blockSignals(False)
-
-                    r_sub = int(getattr(settings, "rough_subdiv", 3))
+                    r_sub = max(1, min(3, int(getattr(settings, "rough_subdiv", 2))))
                     if not self.spn_rough_subdiv.hasFocus() and self.spn_rough_subdiv.value() != r_sub:
                         self.spn_rough_subdiv.blockSignals(True)
                         self.spn_rough_subdiv.setValue(r_sub)

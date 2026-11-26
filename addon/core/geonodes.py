@@ -14,7 +14,7 @@ GN_MARK_ORIG = "FDT_GN_MarkOrig"
 GN_ROUGH_CUTTER = "FDT_GN_RoughCutter"
 GN_CUT_FACE_UV = "FDT_GN_CutFaceUV"
 
-ROUGH_CUTTER_VERSION = 4
+ROUGH_CUTTER_VERSION = 5
 
 ORIG_ATTR_NAME = "fdt_orig"
 UV_ATTR_NAME = "UVMap0"
@@ -82,19 +82,18 @@ def ensure_mark_orig_group() -> bpy.types.NodeTree:
 
 
 def ensure_rough_cutter_group() -> bpy.types.NodeTree:
-    """Create or return FDT_GN_RoughCutter (v4) node group for natural concrete fracture cuts.
+    """Create or return FDT_GN_RoughCutter (v5) for clean low-poly faceted fracture cuts.
 
-    Computes the cutter's Signed Distance Field (SDF) inside its padded bounding box and erodes
-    the outer boundary strictly inward using a blended 4D Fractal Noise + 4D Voronoi (F1) rock
-    fracture field: `density = signed_dist - carve_factor * carve_depth`.
-    Converts directly via Volume-to-Mesh (Threshold = 0.0) with zero internal Boolean overhead,
-    eliminating straight box edges and Swiss-cheese holes while staying 100% watertight & manifold.
+    Uses low-poly Subdivide Mesh (Level 1-3) + bold inward-only 4D Noise/Voronoi displacement
+    clamped safely to 42% of cutter thickness (zero self-intersection) + Triangulate (shortest
+    diagonal) + Merge by Distance + Flat Shading. Produces crisp, game-ready low-poly concrete
+    fracture edges with zero Marching-Cubes slivers or cracked cut faces.
     """
     existing = bpy.data.node_groups.get(GN_ROUGH_CUTTER)
     if existing is not None:
         if int(existing.get("fdt_gn_version", 1)) >= ROUGH_CUTTER_VERSION:
             return existing
-        # Upgrade legacy v1/v2/v3 node group in-place so existing modifier links stay intact
+        # Upgrade legacy v1-v4 node group in-place so existing modifier links stay intact
         ng = existing
         ng.links.clear()
         ng.nodes.clear()
@@ -113,33 +112,17 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     if hasattr(s_inward, "subtype"):
         s_inward.subtype = "FACTOR"
 
-    s_carve = ng.interface.new_socket(name="Carve Amount", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_carve.default_value = 0.50
-    if hasattr(s_carve, "min_value"):
-        s_carve.min_value = 0.0
-        s_carve.max_value = 1.0
-    if hasattr(s_carve, "subtype"):
-        s_carve.subtype = "FACTOR"
-
     s_scale = ng.interface.new_socket(name="Noise Scale", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_scale.default_value = 3.0
+    s_scale.default_value = 1.5
     if hasattr(s_scale, "min_value"):
-        s_scale.min_value = 0.1
-        s_scale.max_value = 50.0
+        s_scale.min_value = 0.2
+        s_scale.max_value = 15.0
 
-    s_detail = ng.interface.new_socket(name="Noise Detail", in_out="INPUT", socket_type="NodeSocketFloat")
-    s_detail.default_value = 0.5
+    s_detail = ng.interface.new_socket(name="Detail", in_out="INPUT", socket_type="NodeSocketInt")
+    s_detail.default_value = 2
     if hasattr(s_detail, "min_value"):
-        s_detail.min_value = 0.0
-        s_detail.max_value = 1.0
-    if hasattr(s_detail, "subtype"):
-        s_detail.subtype = "FACTOR"
-
-    s_res = ng.interface.new_socket(name="Resolution", in_out="INPUT", socket_type="NodeSocketInt")
-    s_res.default_value = 3
-    if hasattr(s_res, "min_value"):
-        s_res.min_value = 1
-        s_res.max_value = 5
+        s_detail.min_value = 1
+        s_detail.max_value = 3
 
     s_seed = ng.interface.new_socket(name="Seed", in_out="INPUT", socket_type="NodeSocketFloat")
     s_seed.default_value = 0.0
@@ -150,259 +133,162 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     links = ng.links
 
     n_in = nodes.new("NodeGroupInput")
-    n_in.location = (-1680, 0)
+    n_in.location = (-1400, 0)
 
-    # 1. Bounding Box -> padded Volume Cube bounds & max inward depth
+    # 1. Compute safe max inward depth = 0.42 * min(bbox_size) so opposite faces never cross
     n_bbox = nodes.new("GeometryNodeBoundBox")
-    n_bbox.location = (-1380, 360)
+    n_bbox.location = (-1140, 320)
     links.new(n_in.outputs["Geometry"], n_bbox.inputs["Geometry"])
 
-    n_pad_min = nodes.new("ShaderNodeVectorMath")
-    n_pad_min.location = (-1140, 480)
-    n_pad_min.operation = "SUBTRACT"
-    n_pad_min.inputs[1].default_value = (0.05, 0.05, 0.05)
-    links.new(n_bbox.outputs["Min"], n_pad_min.inputs[0])
-
-    n_pad_max = nodes.new("ShaderNodeVectorMath")
-    n_pad_max.location = (-1140, 320)
-    n_pad_max.operation = "ADD"
-    n_pad_max.inputs[1].default_value = (0.05, 0.05, 0.05)
-    links.new(n_bbox.outputs["Max"], n_pad_max.inputs[0])
-
     n_size = nodes.new("ShaderNodeVectorMath")
-    n_size.location = (-1140, 140)
+    n_size.location = (-920, 320)
     n_size.operation = "SUBTRACT"
     links.new(n_bbox.outputs["Max"], n_size.inputs[0])
     links.new(n_bbox.outputs["Min"], n_size.inputs[1])
 
     n_sep_sz = nodes.new("ShaderNodeSeparateXYZ")
-    n_sep_sz.location = (-940, 140)
+    n_sep_sz.location = (-720, 320)
     links.new(n_size.outputs["Vector"], n_sep_sz.inputs["Vector"])
 
     n_min_xy = nodes.new("ShaderNodeMath")
-    n_min_xy.location = (-740, 180)
+    n_min_xy.location = (-520, 360)
     n_min_xy.operation = "MINIMUM"
     links.new(n_sep_sz.outputs["X"], n_min_xy.inputs[0])
     links.new(n_sep_sz.outputs["Y"], n_min_xy.inputs[1])
 
     n_min_xyz = nodes.new("ShaderNodeMath")
-    n_min_xyz.location = (-560, 140)
+    n_min_xyz.location = (-340, 320)
     n_min_xyz.operation = "MINIMUM"
     links.new(n_min_xy.outputs["Value"], n_min_xyz.inputs[0])
     links.new(n_sep_sz.outputs["Z"], n_min_xyz.inputs[1])
 
-    n_half_dim = nodes.new("ShaderNodeMath")
-    n_half_dim.location = (-380, 140)
-    n_half_dim.operation = "MULTIPLY"
-    n_half_dim.inputs[1].default_value = 0.5
-    links.new(n_min_xyz.outputs["Value"], n_half_dim.inputs[0])
-
     n_max_depth = nodes.new("ShaderNodeMath")
-    n_max_depth.location = (-200, 140)
-    n_max_depth.operation = "MAXIMUM"
-    n_max_depth.inputs[1].default_value = 0.05
-    links.new(n_half_dim.outputs["Value"], n_max_depth.inputs[0])
+    n_max_depth.location = (-140, 320)
+    n_max_depth.operation = "MULTIPLY"
+    n_max_depth.inputs[1].default_value = 0.42
+    links.new(n_min_xyz.outputs["Value"], n_max_depth.inputs[0])
 
-    # carve_depth = max_depth * Inward Ratio
-    n_carve_depth = nodes.new("ShaderNodeMath")
-    n_carve_depth.location = (0, 140)
-    n_carve_depth.operation = "MULTIPLY"
-    links.new(n_max_depth.outputs["Value"], n_carve_depth.inputs[0])
-    links.new(n_in.outputs["Inward Ratio"], n_carve_depth.inputs[1])
+    # depth = max_depth * Inward Ratio (single main control for both depth & jaggedness!)
+    n_depth = nodes.new("ShaderNodeMath")
+    n_depth.location = (60, 260)
+    n_depth.operation = "MULTIPLY"
+    links.new(n_max_depth.outputs["Value"], n_depth.inputs[0])
+    links.new(n_in.outputs["Inward Ratio"], n_depth.inputs[1])
 
-    # 2. Exact Signed Distance Field (SDF): +Distance inside cutter, -Distance outside cutter
-    n_pos = nodes.new("GeometryNodeInputPosition")
-    n_pos.location = (-940, -100)
+    # 2. Low-poly clean subdivision (Level 1 = 48 tris, Level 2 = 192 tris, Level 3 = 768 tris on a box)
+    n_subdiv = nodes.new("GeometryNodeSubdivideMesh")
+    n_subdiv.location = (-520, 80)
+    links.new(n_in.outputs["Geometry"], n_subdiv.inputs["Mesh"])
+    links.new(n_in.outputs["Detail"], n_subdiv.inputs["Level"])
 
-    n_prox = nodes.new("GeometryNodeProximity")
-    n_prox.location = (-740, -40)
-    _set_node_enum(n_prox, "target_element", "Target Element", "FACES")
-    links.new(
-        n_in.outputs["Geometry"],
-        _get_socket(n_prox.inputs, "Geometry", "Target", index=0),
-    )
-
-    n_norm = nodes.new("GeometryNodeInputNormal")
-    n_norm.location = (-940, -240)
-
-    n_sample_n = nodes.new("GeometryNodeSampleNearestSurface")
-    n_sample_n.location = (-740, -220)
-    n_sample_n.data_type = "FLOAT_VECTOR"
-    links.new(n_in.outputs["Geometry"], n_sample_n.inputs["Mesh"])
-    links.new(n_norm.outputs["Normal"], n_sample_n.inputs["Value"])
-
-    # to_surface = closest_pos - P; dot(to_surface, N_closest) > 0 => INSIDE
-    n_to_surf = nodes.new("ShaderNodeVectorMath")
-    n_to_surf.location = (-500, -80)
-    n_to_surf.operation = "SUBTRACT"
-    links.new(n_prox.outputs["Position"], n_to_surf.inputs[0])
-    links.new(n_pos.outputs["Position"], n_to_surf.inputs[1])
-
-    n_dot = nodes.new("ShaderNodeVectorMath")
-    n_dot.location = (-300, -120)
-    n_dot.operation = "DOT_PRODUCT"
-    links.new(n_to_surf.outputs["Vector"], n_dot.inputs[0])
-    links.new(n_sample_n.outputs["Value"], n_dot.inputs[1])
-
-    n_is_inside = nodes.new("FunctionNodeCompare")
-    n_is_inside.location = (-100, -120)
-    n_is_inside.data_type = "FLOAT"
-    n_is_inside.operation = "GREATER_THAN"
-    n_is_inside.inputs["B"].default_value = 0.0
-    links.new(n_dot.outputs["Value"], n_is_inside.inputs["A"])
-
-    n_neg_dist = nodes.new("ShaderNodeMath")
-    n_neg_dist.location = (-100, 10)
-    n_neg_dist.operation = "MULTIPLY"
-    n_neg_dist.inputs[1].default_value = -1.0
-    links.new(n_prox.outputs["Distance"], n_neg_dist.inputs[0])
-
-    n_sdf = nodes.new("GeometryNodeSwitch")
-    n_sdf.location = (120, -40)
-    n_sdf.input_type = "FLOAT"
-    links.new(n_is_inside.outputs["Result"], n_sdf.inputs["Switch"])
-    links.new(n_neg_dist.outputs["Value"], n_sdf.inputs["False"])
-    links.new(n_prox.outputs["Distance"], n_sdf.inputs["True"])
-
-    # 3. Natural Concrete Fracture Field: 65% 4D Fractal Noise + 35% 4D Voronoi (F1) angular facets
-    n_det_map = nodes.new("ShaderNodeMath")
-    n_det_map.location = (-940, -440)
-    n_det_map.operation = "MULTIPLY_ADD"
-    n_det_map.inputs[1].default_value = 8.0
-    n_det_map.inputs[2].default_value = 2.0
-    links.new(n_in.outputs["Noise Detail"], n_det_map.inputs[0])
-
-    n_rgh_map = nodes.new("ShaderNodeMath")
-    n_rgh_map.location = (-940, -600)
-    n_rgh_map.operation = "MULTIPLY_ADD"
-    n_rgh_map.inputs[1].default_value = 0.5
-    n_rgh_map.inputs[2].default_value = 0.4
-    links.new(n_in.outputs["Noise Detail"], n_rgh_map.inputs[0])
-
+    # 3. Bold, angular concrete fracture pattern: 60% low-detail 4D Noise + 40% 4D Voronoi (F1)
     n_noise = nodes.new("ShaderNodeTexNoise")
-    n_noise.location = (-660, -460)
+    n_noise.location = (-720, -180)
     n_noise.noise_dimensions = "4D"
-    n_noise.inputs["Distortion"].default_value = 0.15
+    n_noise.inputs["Detail"].default_value = 1.5
+    n_noise.inputs["Roughness"].default_value = 0.5
     links.new(n_in.outputs["Noise Scale"], n_noise.inputs["Scale"])
     links.new(n_in.outputs["Seed"], n_noise.inputs["W"])
-    links.new(n_det_map.outputs["Value"], n_noise.inputs["Detail"])
-    links.new(n_rgh_map.outputs["Value"], n_noise.inputs["Roughness"])
 
     n_vor_scale = nodes.new("ShaderNodeMath")
-    n_vor_scale.location = (-940, -760)
+    n_vor_scale.location = (-920, -400)
     n_vor_scale.operation = "MULTIPLY"
-    n_vor_scale.inputs[1].default_value = 1.4
+    n_vor_scale.inputs[1].default_value = 1.3
     links.new(n_in.outputs["Noise Scale"], n_vor_scale.inputs[0])
 
     n_vor = nodes.new("ShaderNodeTexVoronoi")
-    n_vor.location = (-660, -740)
+    n_vor.location = (-720, -400)
     n_vor.voronoi_dimensions = "4D"
     _set_node_enum(n_vor, "feature", "Feature", "F1")
     links.new(n_vor_scale.outputs["Value"], n_vor.inputs["Scale"])
     links.new(n_in.outputs["Seed"], n_vor.inputs["W"])
 
-    # blend = 0.65 * noise + 0.35 * voronoi
+    # blend = 0.60 * noise + 0.40 * voronoi
     n_n_w = nodes.new("ShaderNodeMath")
-    n_n_w.location = (-400, -480)
+    n_n_w.location = (-460, -200)
     n_n_w.operation = "MULTIPLY"
-    n_n_w.inputs[1].default_value = 0.65
+    n_n_w.inputs[1].default_value = 0.60
     links.new(n_noise.outputs["Fac"], n_n_w.inputs[0])
 
     n_blend = nodes.new("ShaderNodeMath")
-    n_blend.location = (-200, -560)
+    n_blend.location = (-260, -280)
     n_blend.operation = "MULTIPLY_ADD"
-    n_blend.inputs[1].default_value = 0.35
+    n_blend.inputs[1].default_value = 0.40
     links.new(n_vor.outputs["Distance"], n_blend.inputs[0])
     links.new(n_n_w.outputs["Value"], n_blend.inputs[2])
 
-    # White-noise carve shaping via Carve Amount:
-    # low = (1.0 - Carve Amount) * 0.55; carve_factor = MapRange(blend, low..0.85 -> 0..1)
-    n_low = nodes.new("ShaderNodeMath")
-    n_low.location = (-200, -740)
-    n_low.operation = "MULTIPLY_ADD"
-    n_low.inputs[1].default_value = -0.55
-    n_low.inputs[2].default_value = 0.55
-    links.new(n_in.outputs["Carve Amount"], n_low.inputs[0])
+    # Stretch contrast so black stays at outer boundary (0.0) and white carves full depth (1.0)
+    n_contrast = nodes.new("ShaderNodeMapRange")
+    n_contrast.location = (-40, -280)
+    n_contrast.data_type = "FLOAT"
+    n_contrast.interpolation_type = "LINEAR"
+    n_contrast.clamp = True
+    n_contrast.inputs["From Min"].default_value = 0.22
+    n_contrast.inputs["From Max"].default_value = 0.78
+    n_contrast.inputs["To Min"].default_value = 0.0
+    n_contrast.inputs["To Max"].default_value = 1.0
+    links.new(n_blend.outputs["Value"], n_contrast.inputs["Value"])
 
-    n_carve_fac = nodes.new("ShaderNodeMapRange")
-    n_carve_fac.location = (40, -560)
-    n_carve_fac.data_type = "FLOAT"
-    n_carve_fac.interpolation_type = "LINEAR"
-    n_carve_fac.clamp = True
-    n_carve_fac.inputs["From Max"].default_value = 0.85
-    n_carve_fac.inputs["To Min"].default_value = 0.0
-    n_carve_fac.inputs["To Max"].default_value = 1.0
-    links.new(n_blend.outputs["Value"], n_carve_fac.inputs["Value"])
-    links.new(n_low.outputs["Value"], n_carve_fac.inputs["From Min"])
+    # 4. Strictly inward displacement along -Normal (never bulges outside cutter bounds)
+    n_disp = nodes.new("ShaderNodeMath")
+    n_disp.location = (240, -140)
+    n_disp.operation = "MULTIPLY"
+    links.new(n_contrast.outputs["Result"], n_disp.inputs[0])
+    links.new(n_depth.outputs["Value"], n_disp.inputs[1])
 
-    # 4. Erode SDF strictly inward: density = signed_dist - carve_factor * carve_depth
-    n_erode_amt = nodes.new("ShaderNodeMath")
-    n_erode_amt.location = (300, -300)
-    n_erode_amt.operation = "MULTIPLY"
-    links.new(n_carve_fac.outputs["Result"], n_erode_amt.inputs[0])
-    links.new(n_carve_depth.outputs["Value"], n_erode_amt.inputs[1])
+    n_neg = nodes.new("ShaderNodeMath")
+    n_neg.location = (420, -140)
+    n_neg.operation = "MULTIPLY"
+    n_neg.inputs[1].default_value = -1.0
+    links.new(n_disp.outputs["Value"], n_neg.inputs[0])
 
-    n_density = nodes.new("ShaderNodeMath")
-    n_density.location = (520, -100)
-    n_density.operation = "SUBTRACT"
-    links.new(n_sdf.outputs["Output"], n_density.inputs[0])
-    links.new(n_erode_amt.outputs["Value"], n_density.inputs[1])
+    n_norm = nodes.new("GeometryNodeInputNormal")
+    n_norm.location = (420, -320)
 
-    # 5. Volume Cube (grid 22..62 from Resolution 1..5) -> Volume to Mesh (Threshold = 0.0)
-    n_grid_res = nodes.new("ShaderNodeMath")
-    n_grid_res.location = (300, 320)
-    n_grid_res.operation = "MULTIPLY_ADD"
-    n_grid_res.inputs[1].default_value = 10.0
-    n_grid_res.inputs[2].default_value = 12.0
-    links.new(n_in.outputs["Resolution"], n_grid_res.inputs[0])
+    n_vec_scale = nodes.new("ShaderNodeVectorMath")
+    n_vec_scale.location = (620, -200)
+    n_vec_scale.operation = "SCALE"
+    links.new(n_norm.outputs["Normal"], n_vec_scale.inputs[0])
+    links.new(n_neg.outputs["Value"], n_vec_scale.inputs["Scale"])
 
-    n_vol = nodes.new("GeometryNodeVolumeCube")
-    n_vol.location = (760, 140)
-    n_vol.inputs["Background"].default_value = -1.0
-    links.new(n_density.outputs["Value"], n_vol.inputs["Density"])
-    links.new(n_pad_min.outputs["Vector"], n_vol.inputs["Min"])
-    links.new(n_pad_max.outputs["Vector"], n_vol.inputs["Max"])
-    links.new(n_grid_res.outputs["Value"], n_vol.inputs["Resolution X"])
-    links.new(n_grid_res.outputs["Value"], n_vol.inputs["Resolution Y"])
-    links.new(n_grid_res.outputs["Value"], n_vol.inputs["Resolution Z"])
+    n_set_pos = nodes.new("GeometryNodeSetPosition")
+    n_set_pos.location = (840, 80)
+    links.new(n_subdiv.outputs["Mesh"], n_set_pos.inputs["Geometry"])
+    links.new(n_vec_scale.outputs["Vector"], n_set_pos.inputs["Offset"])
 
-    n_v2m = nodes.new("GeometryNodeVolumeToMesh")
-    n_v2m.location = (1020, 140)
-    _set_node_enum(n_v2m, "resolution_mode", "Resolution Mode", "GRID")
-    n_v2m.inputs["Threshold"].default_value = 0.0
-    n_v2m.inputs["Adaptivity"].default_value = 0.08
-    links.new(n_vol.outputs["Volume"], n_v2m.inputs["Volume"])
+    # 5. Clean planar low-poly triangulation + weld degenerate slivers + crisp flat normals
+    n_tri = nodes.new("GeometryNodeTriangulate")
+    n_tri.location = (1060, 80)
+    _set_node_enum(n_tri, "quad_method", "Quad Method", "SHORTEST_DIAGONAL")
+    links.new(n_set_pos.outputs["Geometry"], n_tri.inputs["Mesh"])
 
-    # 6. Clean bypass when Inward Ratio == 0 or Carve Amount == 0
+    n_merge = nodes.new("GeometryNodeMergeByDistance")
+    n_merge.location = (1280, 80)
+    n_merge.inputs["Distance"].default_value = 0.015
+    links.new(n_tri.outputs["Mesh"], n_merge.inputs["Geometry"])
+
+    n_flat = nodes.new("GeometryNodeSetShadeSmooth")
+    n_flat.location = (1500, 80)
+    n_flat.inputs["Shade Smooth"].default_value = False
+    links.new(n_merge.outputs["Geometry"], n_flat.inputs["Geometry"])
+
+    # 6. Clean bypass when Inward Ratio == 0.0
     n_ratio_on = nodes.new("FunctionNodeCompare")
-    n_ratio_on.location = (760, -240)
+    n_ratio_on.location = (1500, -140)
     n_ratio_on.data_type = "FLOAT"
     n_ratio_on.operation = "GREATER_THAN"
     n_ratio_on.inputs["B"].default_value = 0.001
     links.new(n_in.outputs["Inward Ratio"], n_ratio_on.inputs["A"])
 
-    n_carve_on = nodes.new("FunctionNodeCompare")
-    n_carve_on.location = (760, -400)
-    n_carve_on.data_type = "FLOAT"
-    n_carve_on.operation = "GREATER_THAN"
-    n_carve_on.inputs["B"].default_value = 0.001
-    links.new(n_in.outputs["Carve Amount"], n_carve_on.inputs["A"])
-
-    n_active = nodes.new("FunctionNodeBooleanMath")
-    n_active.location = (1020, -300)
-    n_active.operation = "AND"
-    links.new(n_ratio_on.outputs["Result"], n_active.inputs[0])
-    links.new(n_carve_on.outputs["Result"], n_active.inputs[1])
-
     n_sw = nodes.new("GeometryNodeSwitch")
-    n_sw.location = (1280, 140)
+    n_sw.location = (1740, 80)
     n_sw.input_type = "GEOMETRY"
-    links.new(n_active.outputs["Boolean"], n_sw.inputs["Switch"])
+    links.new(n_ratio_on.outputs["Result"], n_sw.inputs["Switch"])
     links.new(n_in.outputs["Geometry"], n_sw.inputs["False"])
-    links.new(n_v2m.outputs["Mesh"], n_sw.inputs["True"])
+    links.new(n_flat.outputs["Geometry"], n_sw.inputs["True"])
 
     n_out = nodes.new("NodeGroupOutput")
-    n_out.location = (1520, 140)
+    n_out.location = (1960, 80)
     links.new(n_sw.outputs["Output"], n_out.inputs["Geometry"])
 
     ng["fdt_gn_version"] = ROUGH_CUTTER_VERSION
