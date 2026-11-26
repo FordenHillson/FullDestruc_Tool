@@ -29,6 +29,19 @@ def _get_socket(sockets, *names: str, index: int = 0):
     return sockets[index]
 
 
+def _set_node_enum(node, prop_name: str, socket_name: str, value: str) -> None:
+    """Set a Geometry Node enum safely across Blender 4.x (property) and 5.2+ (menu input socket)."""
+    if hasattr(node, prop_name):
+        setattr(node, prop_name, value)
+        return
+    sock = node.inputs.get(socket_name)
+    if sock is not None and hasattr(sock, "default_value"):
+        try:
+            sock.default_value = value
+        except Exception:
+            pass
+
+
 def _new_group(name: str) -> bpy.types.NodeTree:
     existing = bpy.data.node_groups.get(name)
     if existing is not None:
@@ -212,7 +225,7 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     # 2. Shell mask: 1.0 near outer surface (d <= 0.82*carve_depth) -> 0.0 at d >= carve_depth
     n_prox = nodes.new("GeometryNodeProximity")
     n_prox.location = (-140, -140)
-    n_prox.target_element = "FACES"
+    _set_node_enum(n_prox, "target_element", "Target Element", "FACES")
     links.new(
         n_in.outputs["Geometry"],
         _get_socket(n_prox.inputs, "Geometry", "Target", index=0),
@@ -300,7 +313,7 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
 
     n_v2m = nodes.new("GeometryNodeVolumeToMesh")
     n_v2m.location = (1100, 140)
-    n_v2m.resolution_mode = "GRID"
+    _set_node_enum(n_v2m, "resolution_mode", "Resolution Mode", "GRID")
     n_v2m.inputs["Threshold"].default_value = 0.25
     n_v2m.inputs["Adaptivity"].default_value = 0.15
     links.new(n_vol.outputs["Volume"], n_v2m.inputs["Volume"])
@@ -308,7 +321,7 @@ def ensure_rough_cutter_group() -> bpy.types.NodeTree:
     # 5. Boolean DIFFERENCE: Cutter - White-Noise Carver Mesh
     n_bool = nodes.new("GeometryNodeMeshBoolean")
     n_bool.location = (1360, 220)
-    n_bool.operation = "DIFFERENCE"
+    _set_node_enum(n_bool, "operation", "Operation", "DIFFERENCE")
     links.new(n_in.outputs["Geometry"], _get_socket(n_bool.inputs, "Mesh 1", index=0))
     links.new(n_v2m.outputs["Mesh"], _get_socket(n_bool.inputs, "Mesh 2", index=1))
 
