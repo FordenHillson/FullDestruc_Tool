@@ -841,7 +841,7 @@ def test_22_user_driven_rename_tool() -> None:
     mock_layout = _MockUILayout()
     panel.layout = mock_layout
     FDT_PT_main_panel.draw(panel, ctx)
-    assert "fdt.rename_objects" in mock_layout.operators, "Rename Objects button was not drawn in N-Panel!"
+    assert "fdt.rename_popup" in mock_layout.operators, "Rename popup button was not drawn in N-Panel!"
 
 
 def test_23_next_box_spawns_cube_and_duplicate_cutter() -> None:

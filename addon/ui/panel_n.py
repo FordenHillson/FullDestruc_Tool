@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import bpy
 
-from ..core import apple_bite, rename_tool, rust_bridge, zone_registry
+from ..core import apple_bite, rust_bridge, zone_registry
 from ..core.session import load_session
 from ..ops import apple_bite_ops
 from ..ops.material_picker import draw_cut_material_row
@@ -20,69 +20,6 @@ _TOOL_TABS = (
     ("CLEANUP", "BRUSH_DATA"),
     ("BATCH", "MOD_ARRAY"),
 )
-
-
-def _draw_rename_box(layout: bpy.types.UILayout, context: bpy.types.Context, settings) -> None:
-    """User-driven Object Rename box — always available, never tied to Zone Registry."""
-    targets = rename_tool.get_target_objects(context)
-    count = len(targets)
-
-    box = layout.box()
-    hdr = box.row(align=True)
-    is_open = bool(getattr(settings, "ui_show_rename", True))
-    hdr.prop(
-        settings,
-        "ui_show_rename",
-        text=f"Rename Objects ({count})" if count else "Rename Objects",
-        icon="TRIA_DOWN" if is_open else "TRIA_RIGHT",
-        emboss=False,
-    )
-    if not is_open:
-        return
-
-    mode = str(getattr(settings, "rename_mode", "FULL") or "FULL")
-    row_mode = box.row(align=True)
-    row_mode.prop(settings, "rename_mode", expand=True)
-
-    row_input = box.row(align=True)
-    row_input.prop(settings, "rename_text", text="ID" if mode == "TAG" else "Name")
-    row_input.operator("fdt.rename_pick_active", text="", icon="EYEDROPPER")
-
-    row_opts = box.row(align=True)
-    if mode == "FULL":
-        row_opts.prop(settings, "rename_auto_number", text="Auto #")
-        if bool(getattr(settings, "rename_auto_number", True)):
-            row_opts.prop(settings, "rename_start_index", text="Start")
-    row_opts.prop(settings, "rename_sync_mesh", text="Sync Mesh")
-
-    raw_text = str(getattr(settings, "rename_text", "") or "").strip()
-    preview_plan = (
-        rename_tool.build_target_names(
-            targets,
-            mode=mode,
-            text=raw_text,
-            auto_number=bool(getattr(settings, "rename_auto_number", True)),
-            start_index=int(getattr(settings, "rename_start_index", 1)),
-        )
-        if targets and raw_text
-        else []
-    )
-    if not targets:
-        box.label(text="Select object(s) in Viewport or Outliner", icon="INFO")
-    elif preview_plan:
-        first_obj, first_new = preview_plan[0]
-        extra = f" (+{len(preview_plan) - 1})" if len(preview_plan) > 1 else ""
-        box.label(text=f"-> {first_new}{extra}", icon="GREASEPENCIL")
-    else:
-        hint = "Type new ID (e.g. A, B, A#B)" if mode == "TAG" else "Type new object name"
-        box.label(text=hint, icon="INFO")
-
-    row_btn = box.row()
-    row_btn.scale_y = 1.2
-    row_btn.enabled = bool(preview_plan)
-    btn_label = f"Rename ({count})" if count > 1 else "Rename"
-    row_btn.operator("fdt.rename_objects", text=btn_label, icon="CHECKMARK")
-
 
 
 _CUTTER_LIST_SYNC_PENDING = False
@@ -270,8 +207,6 @@ class FDT_PT_main_panel(bpy.types.Panel):
             box_batch = detail.box()
             box_batch.label(text="Reserved slot for future Batch Pipeline", icon="TIME")
 
-        _draw_rename_box(detail, context, settings)
-
     def _draw_step1_idle(self, layout: bpy.types.UILayout, context: bpy.types.Context) -> None:
         info = apple_bite.detect_step1_action(context)
 
@@ -329,6 +264,8 @@ class FDT_PT_main_panel(bpy.types.Panel):
                     else "Fill Cut Cap (Auto)"
                 )
                 row_fill.operator("fdt.applebite_fill_cut_caps", text=fill_lbl, icon="FACESEL")
+                row_ren = mat_box.row()
+                row_ren.operator("fdt.rename_popup", text="Rename Selected", icon="GREASEPENCIL")
 
     def _draw_step2_and_step3_active(
         self,
