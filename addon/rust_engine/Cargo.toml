@@ -1,0 +1,22 @@
+[package]
+name = "fdt_bool_engine"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, exact, UV-preserving hybrid Boolean engine for FullDestruc_Tool (Blender 5.2+)"
+
+[lib]
+name = "fdt_bool_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+glam = "0.29"
+rayon = "1.10"
+robust = "1.1"
+smallvec = "1.13"
+spade = "2.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
