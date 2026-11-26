@@ -641,8 +641,8 @@ def test_20_edge_band_inward_rough_cut() -> None:
 
     settings = ctx.scene.fdt_settings
     settings.rough_inward_ratio = 0.35
-    settings.rough_strength = 0.15
-    settings.rough_scale = 3.0
+    settings.rough_carve_amount = 0.55
+    settings.rough_scale = 2.5
     settings.rough_detail = 0.5
     settings.rough_subdiv = 3
     settings.rough_seed = 1.0
@@ -659,7 +659,7 @@ def test_20_edge_band_inward_rough_cut() -> None:
         for item in mod.node_group.interface.items_tree
         if item.item_type == "SOCKET" and item.in_out == "INPUT"
     }
-    for expected in ("Geometry", "Inward Ratio", "Strength", "Noise Scale", "Noise Detail", "Subdiv Level", "Seed"):
+    for expected in ("Geometry", "Inward Ratio", "Carve Amount", "Noise Scale", "Noise Detail", "Resolution", "Seed"):
         assert expected in input_names, f"Missing socket: {expected}"
 
     def _eval_local_verts():
@@ -671,38 +671,30 @@ def test_20_edge_band_inward_rough_cut() -> None:
         finally:
             eval_obj.to_mesh_clear()
 
-    # 1. Inward-only guarantee: no vertex may bulge outside [-1.0, +1.0]
+    # 1. Inward-only guarantee: Boolean DIFFERENCE never bulges outside [-1.0, +1.0]
     verts = _eval_local_verts()
-    assert len(verts) > 200, f"Expected subdivided cutter verts, got {len(verts)}"
+    assert len(verts) > 20, f"Expected carved cutter geometry, got {len(verts)} verts"
     max_abs = max(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
     assert max_abs <= 1.0005, f"Rough cutter bulged outward beyond box bounds: max_abs={max_abs:.5f}"
 
-    # 2. Edge band: center of top face (|x|, |y| < 0.2, z > 0.5) must remain flat (z ~ 1.0),
-    # while edge vertices must carve noticeably inward
-    center_top = [z for x, y, z in verts if abs(x) < 0.2 and abs(y) < 0.2 and z > 0.5]
-    assert center_top, "Expected center vertices on top face"
-    assert max(abs(1.0 - z) for z in center_top) < 1e-3, (
-        f"Center of face should stay smooth at Inward Ratio=0.35, got min z={min(center_top):.4f}"
-    )
+    # 2. Outer shell carved inward, while inner core (distance > 0.35m from outer surface) stays untouched
+    min_max_axis = min(max(abs(x), abs(y), abs(z)) for x, y, z in verts)
+    carved_depth = 1.0 - min_max_axis
+    assert carved_depth > 0.05, f"Expected noticeable white-noise carve chunks, got depth={carved_depth:.4f}"
+    assert min_max_axis >= 0.60, f"Carve penetrated past Inward Ratio=0.35 into core: min_max_axis={min_max_axis:.4f}"
 
-    edge_inward = max(1.0 - max(abs(x), abs(y), abs(z)) for x, y, z in verts)
-    assert edge_inward > 0.01, f"Expected noticeable inward carving near edges, got {edge_inward:.5f}"
-
-    # 3. Inward Ratio = 0.0 -> zero carving everywhere
+    # 3. Inward Ratio = 0.0 -> bypasses Boolean cleanly (original 8 cube verts)
     settings.rough_inward_ratio = 0.0
     apple_bite.rebuild_session(ctx)
     verts_zero = _eval_local_verts()
-    max_dev_zero = max(abs(1.0 - max(abs(x), abs(y), abs(z))) for x, y, z in verts_zero)
-    assert max_dev_zero < 1e-4, f"Expected zero carving at Inward Ratio=0.0, got {max_dev_zero:.5f}"
+    assert len(verts_zero) == 8, f"Expected untouched 8-vert cube at Inward Ratio=0.0, got {len(verts_zero)}"
 
-    # 4. Inward Ratio = 1.0 -> carving reaches inner area of the face
-    settings.rough_inward_ratio = 1.0
+    # 4. Carve Amount = 0.0 -> bypasses Boolean cleanly (original 8 cube verts)
+    settings.rough_inward_ratio = 0.35
+    settings.rough_carve_amount = 0.0
     apple_bite.rebuild_session(ctx)
-    verts_full = _eval_local_verts()
-    inner_top = [z for x, y, z in verts_full if abs(x) < 0.35 and abs(y) < 0.35 and z > 0.5]
-    assert inner_top and max(1.0 - z for z in inner_top) > 0.005, (
-        "Expected inward carving to reach inner face region at Inward Ratio=1.0"
-    )
+    verts_no_carve = _eval_local_verts()
+    assert len(verts_no_carve) == 8, f"Expected untouched 8-vert cube at Carve Amount=0.0, got {len(verts_no_carve)}"
 
 
 ALL_TESTS = [

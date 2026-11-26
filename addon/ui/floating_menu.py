@@ -63,7 +63,7 @@ class FDT_OT_quick_popup(bpy.types.Operator):
         if any_rough:
             box = layout.box()
             box.prop(settings, "rough_inward_ratio", text="Inward Ratio", slider=True)
-            box.prop(settings, "rough_strength", text="Strength")
+            box.prop(settings, "rough_carve_amount", text="Carve Amount", slider=True)
             box.prop(settings, "rough_scale", text="Noise Scale")
             box.prop(settings, "rough_detail", text="Noise Detail", slider=True)
             box.prop(settings, "rough_subdiv", text="Resolution")

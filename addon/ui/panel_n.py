@@ -296,7 +296,7 @@ class FDT_PT_main_panel(bpy.types.Panel):
             if any_rough:
                 rbox = step3.box()
                 rbox.prop(settings, "rough_inward_ratio", text="Inward Ratio", slider=True)
-                rbox.prop(settings, "rough_strength", text="Strength")
+                rbox.prop(settings, "rough_carve_amount", text="Carve Amount", slider=True)
                 rbox.prop(settings, "rough_scale", text="Noise Scale")
                 rbox.prop(settings, "rough_detail", text="Noise Detail", slider=True)
                 rbox.prop(settings, "rough_subdiv", text="Resolution")

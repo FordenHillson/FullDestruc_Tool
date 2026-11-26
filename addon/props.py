@@ -204,16 +204,25 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_inward_ratio: FloatProperty(
         name="Inward Ratio",
-        description="Proportion of rough noise band eating inward from the outer sharp edges (0% = off, 100% = full face)",
+        description="Proportion of outer shell band eating inward from the outer surface (0% = off, 100% = full depth)",
         subtype="FACTOR",
         default=0.35,
         min=0.0,
         max=1.0,
         update=_on_live_setting_changed,
     )
+    rough_carve_amount: FloatProperty(
+        name="Carve Amount",
+        description="White-noise carve threshold (0% = none, 50% = balanced white chunks carved out, 100% = heavy erosion)",
+        subtype="FACTOR",
+        default=0.50,
+        min=0.0,
+        max=1.0,
+        update=_on_live_setting_changed,
+    )
     rough_strength: FloatProperty(
         name="Rough Strength",
-        description="Inward carving depth of rough cut edges (meters)",
+        description="Deprecated legacy displacement depth kept for backward compatibility",
         default=0.08,
         min=0.0,
         max=2.0,
@@ -221,7 +230,7 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_scale: FloatProperty(
         name="Noise Scale",
-        description="Frequency of rough cut noise",
+        description="Frequency / chunk size of 4D carve-out noise",
         default=3.0,
         min=0.1,
         max=50.0,
@@ -238,7 +247,7 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
     )
     rough_subdiv: IntProperty(
         name="Resolution",
-        description="Mesh subdivision level for rough cut edge detail (WYSIWYG in live preview & apply, 1-5)",
+        description="Volume grid resolution level for white-noise carve chunks (WYSIWYG in live preview & apply, 1-5)",
         default=3,
         min=1,
         max=5,

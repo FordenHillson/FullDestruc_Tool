@@ -616,17 +616,25 @@ class FullDestrucWindow(QtWidgets.QWidget):
         inward_row.addWidget(self.spn_rough_inward)
         rp_layout.addRow("Inward Ratio:", inward_row)
 
-        # Strength (meters)
-        self.spn_rough_strength = QtWidgets.QDoubleSpinBox()
-        self.spn_rough_strength.setRange(0.0, 2.0)
-        self.spn_rough_strength.setSingleStep(0.01)
-        self.spn_rough_strength.setDecimals(3)
-        self.spn_rough_strength.setSuffix(" m")
-        self.spn_rough_strength.setValue(0.08)
-        self.spn_rough_strength.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("rough_strength", float(v))
-        )
-        rp_layout.addRow("Strength:", self.spn_rough_strength)
+        # Carve Amount (0-100% white-noise threshold)
+        carve_row = QtWidgets.QHBoxLayout()
+        carve_row.setContentsMargins(0, 0, 0, 0)
+        carve_row.setSpacing(6)
+        self.sld_rough_carve = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sld_rough_carve.setRange(0, 100)
+        self.sld_rough_carve.setValue(50)
+        self.spn_rough_carve = QtWidgets.QDoubleSpinBox()
+        self.spn_rough_carve.setRange(0.0, 100.0)
+        self.spn_rough_carve.setSingleStep(5.0)
+        self.spn_rough_carve.setDecimals(0)
+        self.spn_rough_carve.setSuffix("%")
+        self.spn_rough_carve.setValue(50.0)
+        self.spn_rough_carve.setFixedWidth(64)
+        self.sld_rough_carve.valueChanged.connect(self._on_rough_carve_slider_changed)
+        self.spn_rough_carve.valueChanged.connect(self._on_rough_carve_spin_changed)
+        carve_row.addWidget(self.sld_rough_carve, 1)
+        carve_row.addWidget(self.spn_rough_carve)
+        rp_layout.addRow("Carve Amount:", carve_row)
 
         # Noise Scale
         self.spn_rough_scale = QtWidgets.QDoubleSpinBox()
@@ -802,6 +810,21 @@ class FullDestrucWindow(QtWidgets.QWidget):
             self.sld_rough_inward.setValue(ipct)
             self.sld_rough_inward.blockSignals(False)
         self._on_rough_param_changed("rough_inward_ratio", float(pct) / 100.0)
+
+    def _on_rough_carve_slider_changed(self, pct: int) -> None:
+        if abs(self.spn_rough_carve.value() - float(pct)) > 1e-6:
+            self.spn_rough_carve.blockSignals(True)
+            self.spn_rough_carve.setValue(float(pct))
+            self.spn_rough_carve.blockSignals(False)
+        self._on_rough_param_changed("rough_carve_amount", float(pct) / 100.0)
+
+    def _on_rough_carve_spin_changed(self, pct: float) -> None:
+        ipct = int(round(pct))
+        if self.sld_rough_carve.value() != ipct:
+            self.sld_rough_carve.blockSignals(True)
+            self.sld_rough_carve.setValue(ipct)
+            self.sld_rough_carve.blockSignals(False)
+        self._on_rough_param_changed("rough_carve_amount", float(pct) / 100.0)
 
     def _on_rough_detail_slider_changed(self, pct: int) -> None:
         if abs(self.spn_rough_detail.value() - float(pct)) > 1e-6:
@@ -1167,11 +1190,16 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         self.spn_rough_inward.setValue(inward_pct)
                         self.spn_rough_inward.blockSignals(False)
 
-                    r_str = float(getattr(settings, "rough_strength", 0.08))
-                    if not self.spn_rough_strength.hasFocus() and abs(self.spn_rough_strength.value() - r_str) > 1e-5:
-                        self.spn_rough_strength.blockSignals(True)
-                        self.spn_rough_strength.setValue(r_str)
-                        self.spn_rough_strength.blockSignals(False)
+                    carve_pct = float(getattr(settings, "rough_carve_amount", 0.50)) * 100.0
+                    carve_ipct = int(round(carve_pct))
+                    if not self.sld_rough_carve.isSliderDown() and self.sld_rough_carve.value() != carve_ipct:
+                        self.sld_rough_carve.blockSignals(True)
+                        self.sld_rough_carve.setValue(carve_ipct)
+                        self.sld_rough_carve.blockSignals(False)
+                    if not self.spn_rough_carve.hasFocus() and abs(self.spn_rough_carve.value() - carve_pct) > 0.5:
+                        self.spn_rough_carve.blockSignals(True)
+                        self.spn_rough_carve.setValue(carve_pct)
+                        self.spn_rough_carve.blockSignals(False)
 
                     r_scl = float(getattr(settings, "rough_scale", 3.0))
                     if not self.spn_rough_scale.hasFocus() and abs(self.spn_rough_scale.value() - r_scl) > 1e-4:
