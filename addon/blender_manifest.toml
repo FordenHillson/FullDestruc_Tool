@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+
+id = "full_destruc_tool"
+version = "0.1.0"
+name = "FullDestruc Tool"
+tagline = "Fast boolean cutting and building zone manager for Blender 5.2+"
+maintainer = "FullDestruc Team"
+type = "add-on"
+
+blender_version_min = "5.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
