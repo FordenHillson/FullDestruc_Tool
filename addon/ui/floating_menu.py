@@ -47,14 +47,13 @@ class FDT_OT_quick_popup(bpy.types.Operator):
         settings = context.scene.fdt_settings
         layout.prop(settings, "active_zone", text="Zone (type to search)")
         row_zones = layout.row(align=True)
-        for action, label, icon in (
-            ("NEW", "New", "ADD"),
-            ("RENAME", "Edit Zone", "GREASEPENCIL"),
-            ("DELETE", "Delete", "TRASH"),
-        ):
-            op = row_zones.operator("fdt.zone_manage", text=label, icon=icon)
-            op.action = action
-            op.zone_key = settings.active_zone
+        op_new = row_zones.operator("fdt.zone_manage", text="New", icon="ADD")
+        op_new.action = "NEW"
+        op_new.zone_key = settings.active_zone
+        row_zones.operator("fdt.rename_popup", text="Rename", icon="GREASEPENCIL")
+        op_del = row_zones.operator("fdt.zone_manage", text="Delete", icon="TRASH")
+        op_del.action = "DELETE"
+        op_del.zone_key = settings.active_zone
         layout.prop(settings, "cutter_size", text="Box Size (m)")
         layout.prop(settings, "enable_rough", text="Rough Cut Edge")
         from ..core.session import load_session

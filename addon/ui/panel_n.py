@@ -360,14 +360,13 @@ class FDT_PT_main_panel(bpy.types.Panel):
             op.zone = zdef.key
         step2.prop(settings, "active_zone", text="Zone (type to search)")
         zone_manage = step2.row(align=True)
-        for action, label, icon in (
-            ("NEW", "New Zone", "ADD"),
-            ("RENAME", "Edit Zone", "GREASEPENCIL"),
-            ("DELETE", "Delete", "TRASH"),
-        ):
-            op = zone_manage.operator("fdt.zone_manage", text=label, icon=icon)
-            op.action = action
-            op.zone_key = settings.active_zone
+        op_new = zone_manage.operator("fdt.zone_manage", text="New Zone", icon="ADD")
+        op_new.action = "NEW"
+        op_new.zone_key = settings.active_zone
+        zone_manage.operator("fdt.rename_popup", text="Rename", icon="GREASEPENCIL")
+        op_del_z = zone_manage.operator("fdt.zone_manage", text="Delete", icon="TRASH")
+        op_del_z.action = "DELETE"
+        op_del_z.zone_key = settings.active_zone
 
         row_add = step2.row(align=True)
         row_add.scale_y = 1.2

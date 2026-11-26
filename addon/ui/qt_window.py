@@ -482,14 +482,25 @@ class FullDestrucWindow(QtWidgets.QWidget):
         s2_layout.addWidget(self.cmb_zone)
 
         zone_manage_row = QtWidgets.QHBoxLayout()
-        for action, label in (("NEW", "+ New Zone"), ("RENAME", "Edit Zone"), ("DELETE", "Delete")):
-            btn = QtWidgets.QPushButton(label)
-            btn.clicked.connect(
-                lambda _checked=False, a=action: self._run_op(
-                    bpy.ops.fdt.zone_manage, action=a, zone_key=self._active_zone_key()
-                )
+        btn_z_new = QtWidgets.QPushButton("+ New Zone")
+        btn_z_new.clicked.connect(
+            lambda _checked=False: self._run_op(
+                bpy.ops.fdt.zone_manage, action="NEW", zone_key=self._active_zone_key()
             )
-            zone_manage_row.addWidget(btn)
+        )
+        btn_obj_ren = QtWidgets.QPushButton("Rename")
+        btn_obj_ren.clicked.connect(
+            lambda _checked=False: self._run_invoke_op(bpy.ops.fdt.rename_popup)
+        )
+        btn_z_del = QtWidgets.QPushButton("Delete")
+        btn_z_del.clicked.connect(
+            lambda _checked=False: self._run_op(
+                bpy.ops.fdt.zone_manage, action="DELETE", zone_key=self._active_zone_key()
+            )
+        )
+        zone_manage_row.addWidget(btn_z_new)
+        zone_manage_row.addWidget(btn_obj_ren)
+        zone_manage_row.addWidget(btn_z_del)
         s2_layout.addLayout(zone_manage_row)
 
         row_cut = QtWidgets.QHBoxLayout()
@@ -716,6 +727,15 @@ class FullDestrucWindow(QtWidgets.QWidget):
         try:
             with blender_view3d_override():
                 op_func("EXEC_DEFAULT", **kwargs)
+        except Exception as exc:
+            self.guide_label.setText(f"Notice: {exc}")
+        _tag_all_view3d_redraw()
+        self.refresh_from_blender()
+
+    def _run_invoke_op(self, op_func, **kwargs) -> None:
+        try:
+            with blender_view3d_override():
+                op_func("INVOKE_DEFAULT", **kwargs)
         except Exception as exc:
             self.guide_label.setText(f"Notice: {exc}")
         _tag_all_view3d_redraw()

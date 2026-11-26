@@ -60,14 +60,13 @@ class FDT_OT_zone_picker(bpy.types.Operator):
         layout.prop(self, "zone_key", text="Zone (type to search)")
         layout.separator()
         row = layout.row(align=True)
-        for action, label, icon in (
-            ("NEW", "New", "ADD"),
-            ("RENAME", "Edit Zone", "GREASEPENCIL"),
-            ("DELETE", "Delete", "TRASH"),
-        ):
-            op = row.operator("fdt.zone_manage", text=label, icon=icon)
-            op.action = action
-            op.zone_key = self.zone_key
+        op_new = row.operator("fdt.zone_manage", text="New", icon="ADD")
+        op_new.action = "NEW"
+        op_new.zone_key = self.zone_key
+        row.operator("fdt.rename_popup", text="Rename", icon="GREASEPENCIL")
+        op_del = row.operator("fdt.zone_manage", text="Delete", icon="TRASH")
+        op_del.action = "DELETE"
+        op_del.zone_key = self.zone_key
         layout.label(text=f"Current token: {zone_registry.zone_token(self.zone_key, scene)}")
 
     def execute(self, context):
