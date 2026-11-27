@@ -1180,6 +1180,38 @@ def main():
         f"freestyle_edges={fs_cnt}, sharp_edges={sh_cnt}"
     )
 
+    # Also verify v2.1.1 no-fdt_nrm fast path (high-poly mesh without custom normals, e.g. Subdivided Suzanne)
+    hp_mesh_plain = types.SimpleNamespace(
+        polygons=_HpForeach(
+            np_hp,
+            {
+                "loop_start": np.arange(0, nl_hp, 4, dtype=np.int32),
+                "loop_total": np.full(np_hp, 4, dtype=np.int32),
+            },
+        ),
+        loops=_HpForeach(nl_hp, {"edge_index": le_hp, "vertex_index": lv_hp}),
+        edges=_HpForeach(ne_hp, {}),
+        attributes=_MockAttrMgr(),
+        materials=[],
+        custom_normals_set=None,
+    )
+    hp_mesh_plain.normals_split_custom_set = lambda arr: setattr(hp_mesh_plain, "custom_normals_set", arr)
+    hp_mesh_plain.attributes["fdt_orig"] = _MockAttr("fdt_orig", "FLOAT", "FACE", orig_hp)
+    hp_obj_plain = types.SimpleNamespace(name="Suzanne_400K_Plain", data=hp_mesh_plain)
+
+    t_hp1 = time.perf_counter()
+    real_ab._postprocess_highpoly_numpy(hp_obj_plain, None, orig_is_smooth=True)
+    hp_plain_ms = (time.perf_counter() - t_hp1) * 1000.0
+    assert hp_mesh_plain.custom_normals_set is None, "Must skip normals_split_custom_set when fdt_nrm is absent!"
+    assert int(np.sum(hp_mesh_plain.attributes["freestyle_edge"].data.arr)) == ny_hp
+    assert int(np.sum(hp_mesh_plain.attributes["sharp_edge"].data.arr)) == ny_hp
+    sm_out = hp_mesh_plain.polygons._attrs["use_smooth"]
+    assert int(np.sum(sm_out)) == np_hp // 2, "Orig half should be smooth, cut cap half should be flat!"
+    print(
+        f"[PASS] v2.1.1 Plain High-Poly Fast Path (no custom normals, 200K quads):\n"
+        f"       elapsed={hp_plain_ms:.1f} ms | skipped normals_split_custom_set | smooth={int(np.sum(sm_out))}/{np_hp}"
+    )
+
     # Cleanup
     rust_bridge.destroy_all_sessions()
     gpu_preview.end_drag_preview()

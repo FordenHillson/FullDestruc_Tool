@@ -2497,12 +2497,15 @@ def _ensure_cut_material_vectorized(mesh: bpy.types.Mesh, cut_material: bpy.type
 def _postprocess_highpoly_numpy(
     obj: bpy.types.Object,
     cut_material: bpy.types.Material | None,
+    orig_is_smooth: bool | None = None,
 ) -> int:
     """Vectorized NumPy post-processor for high-poly (>= 50K poly) Rust meshes (~50-200ms vs 45s bmesh!).
 
     Computes exact `freestyle_edge` (`orig != cut` border edges) and `sharp_edge` (border + split-normal
-    discontinuity across shared edge) in O(N) NumPy without ever converting 4M tris into BMesh,
-    then restores exact custom split normals via `normals_split_custom_set`.
+    discontinuity across shared edge) in O(N) NumPy without ever converting 4M tris into BMesh.
+    When `fdt_nrm` is present (source mesh had custom split normals), restores exact custom split normals;
+    otherwise applies clean vectorized smooth/flat shading (smooth original surface + crisp flat cut caps),
+    avoiding Blender's 8-10s RNA conversion inside `normals_split_custom_set` on 8M+ loops!
     """
     import numpy as np
 
@@ -2535,6 +2538,12 @@ def _postprocess_highpoly_numpy(
     sharp_flags = np.zeros(ne, dtype=bool)
     preloaded_nrm_3 = None
     preloaded_good = None
+    is_orig_face = None
+
+    if orig_attr is not None and orig_attr.domain == "FACE":
+        orig_vals = np.empty(np_count, dtype=np.float32)
+        orig_attr.data.foreach_get("value", orig_vals)
+        is_orig_face = orig_vals >= 0.5
 
     if two_edges.size > 0 and loop_poly.size == nl:
         lp_seq = np.arange(nl, dtype=np.int32)
@@ -2546,10 +2555,7 @@ def _postprocess_highpoly_numpy(
         l0 = first_lp[two_edges]
         l1 = second_lp[two_edges]
 
-        if orig_attr is not None and orig_attr.domain == "FACE":
-            orig_vals = np.empty(np_count, dtype=np.float32)
-            orig_attr.data.foreach_get("value", orig_vals)
-            is_orig_face = orig_vals >= 0.5
+        if is_orig_face is not None:
             is_border_2 = is_orig_face[loop_poly[l0]] != is_orig_face[loop_poly[l1]]
             border_edges = two_edges[is_border_2]
             border_flags[border_edges] = True
@@ -2629,12 +2635,18 @@ def _postprocess_highpoly_numpy(
             sh_attr = mesh.attributes.new(name="sharp_edge", type="BOOLEAN", domain="EDGE")
         sh_attr.data.foreach_set("value", sharp_flags)
 
-    _restore_custom_normals_vectorized(
-        mesh,
-        obj.name,
-        preloaded_nrm_3=preloaded_nrm_3,
-        preloaded_good=preloaded_good,
-    )
+    if nrm_attr is not None and nrm_attr.domain == "CORNER":
+        _restore_custom_normals_vectorized(
+            mesh,
+            obj.name,
+            preloaded_nrm_3=preloaded_nrm_3,
+            preloaded_good=preloaded_good,
+        )
+    elif is_orig_face is not None and orig_is_smooth is not None:
+        # High-poly mesh without custom split normals (e.g. Subdivided Suzanne / sculpt):
+        # Smooth original surface + crisp flat cut caps in ~2 ms (skips 9s normals_split_custom_set!)
+        smooth_flags = is_orig_face if orig_is_smooth else np.zeros(np_count, dtype=bool)
+        mesh.polygons.foreach_set("use_smooth", smooth_flags)
     _ensure_cut_material_vectorized(mesh, cut_material)
     return 0
 
@@ -2647,6 +2659,7 @@ def _postprocess_baked_mesh(
     is_cut_main: bool = False,
     line_backfaces: bool = False,
     cutter_bboxes_local: Sequence[tuple[Vector, Vector]] | None = None,
+    orig_is_smooth: bool | None = None,
 ) -> int:
     """Clean degenerate slivers, auto-fill unfilled solid cut-plane cavities, line exposed
     single-sided backfaces, safely dissolve collinear 2-way vertices (preserving UVs & normals),
@@ -2661,7 +2674,7 @@ def _postprocess_baked_mesh(
     # High-poly fast path (>= 50K polys, e.g. 1M–4M tri sculpted/subd models):
     # Pure vectorized NumPy post-process (~50ms vs 45s pure-Python BMesh loops!).
     if len(mesh.polygons) >= _HIGHPOLY_POSTPROCESS_THRESHOLD and mesh.attributes.get(ORIG_ATTR_NAME) is not None:
-        return _postprocess_highpoly_numpy(obj, cut_material)
+        return _postprocess_highpoly_numpy(obj, cut_material, orig_is_smooth=orig_is_smooth)
 
     import numpy as np
     from . import cap_fill
@@ -2953,6 +2966,18 @@ def apply_session(
             _planes_cache: dict[tuple, list] = {}
             _bboxes_cache: dict[tuple, list] = {}
 
+            # Detect per-target smooth shading once (O(1) NumPy, ~1 ms on 2M quads) so high-poly
+            # meshes without custom normals preserve exact smooth surface + crisp flat cut caps!
+            _target_smooth_map: dict[str, bool] = {}
+            if use_rust:
+                import numpy as np
+
+                for orig_t in targets_for_cache:
+                    if orig_t.type == "MESH" and orig_t.data is not None and len(orig_t.data.polygons) > 0:
+                        sm_arr = np.empty(len(orig_t.data.polygons), dtype=bool)
+                        orig_t.data.polygons.foreach_get("use_smooth", sm_arr)
+                        _target_smooth_map[orig_t.name] = bool(np.any(sm_arr))
+
             def _mw_cache_key(mw) -> tuple:
                 return tuple(round(float(mw[r][c]), 5) for r in range(4) for c in range(4))
 
@@ -2960,12 +2985,23 @@ def apply_session(
                 src_obj: bpy.types.Object,
                 final_name: str,
                 is_cut_main: bool = False,
+                orig_name_key: str = "",
             ) -> bpy.types.Object | None:
                 nonlocal total_auto_filled_tris
                 if use_rust and src_obj.type == "MESH" and src_obj.data is not None:
-                    # Rust already wrote the final evaluated mesh directly into src_obj.data
-                    baked_mesh = src_obj.data.copy()
-                    if len(baked_mesh.polygons) < _HIGHPOLY_POSTPROCESS_THRESHOLD:
+                    n_src_polys = len(src_obj.data.polygons)
+                    if n_src_polys == 0:
+                        return None
+                    if n_src_polys >= _HIGHPOLY_POSTPROCESS_THRESHOLD:
+                        # Zero-Copy Move-to-Final: FDT_Bite_* is excluded immediately after Apply
+                        # (and Re-edit rebuilds from Vault), so moving `src_obj.data` avoids cloning
+                        # a 4M-triangle mesh (~2.5s & ~1.5 GB Peak RAM saved!).
+                        baked_mesh = src_obj.data
+                        placeholder = bpy.data.meshes.new(f"{src_obj.name}_Empty"[:MAX_BLENDER_NAME])
+                        src_obj.data = placeholder
+                    else:
+                        # Rust already wrote the final evaluated mesh directly into src_obj.data
+                        baked_mesh = src_obj.data.copy()
                         baked_mesh.validate(verbose=False, clean_customdata=False)
                 else:
                     eval_obj = src_obj.evaluated_get(depsgraph)
@@ -3021,6 +3057,7 @@ def apply_session(
                     is_cut_main=is_cut_main,
                     line_backfaces=line_backfaces,
                     cutter_bboxes_local=cutter_bboxes,
+                    orig_is_smooth=_target_smooth_map.get(orig_name_key, True),
                 )
                 return new_obj
 
@@ -3028,7 +3065,7 @@ def apply_session(
                 for res_obj in list(results_col.objects):
                     orig_name = str(res_obj.get(RESULT_SOURCE_PROP, res_obj.name))
                     final_name = f"{_strip_existing_fdst_id(orig_name)}_Cut"[:MAX_BLENDER_NAME]
-                    baked = _bake_one(res_obj, final_name, is_cut_main=True)
+                    baked = _bake_one(res_obj, final_name, is_cut_main=True, orig_name_key=orig_name)
                     if baked is not None:
                         baked_objects.append(baked)
 
@@ -3037,7 +3074,7 @@ def apply_session(
                     orig_name = str(piece_obj.get(RESULT_SOURCE_PROP, piece_obj.name))
                     zone = str(piece_obj.get(PIECE_ZONE_PROP, "A") or "A")
                     final_name = _format_zone_name(orig_name, _zone_name_token(zone, scene))
-                    baked = _bake_one(piece_obj, final_name, is_cut_main=False)
+                    baked = _bake_one(piece_obj, final_name, is_cut_main=False, orig_name_key=orig_name)
                     if baked is not None:
                         baked_objects.append(baked)
 

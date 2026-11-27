@@ -594,6 +594,7 @@ def write_output_to_mesh(
     cut_material: bpy.types.Material | None,
     write_orig_attr: bool = True,
     apply_custom_normals: bool = True,
+    write_nrm_attr: bool = True,
 ) -> bool:
     """Write a Rust `FdtMeshOutput` directly into `dst_mesh` via foreach_set.
 
@@ -663,9 +664,10 @@ def write_output_to_mesh(
             orig_attr = dst_mesh.attributes.new(name=ORIG_ATTR_NAME, type="FLOAT", domain="FACE")
         orig_attr.data.foreach_set("value", orig_flags)
 
-    # Store preserved per-loop split normals in `fdt_nrm` CORNER attribute (fast 0.05 ms)
+    # Store preserved per-loop split normals in `fdt_nrm` CORNER attribute when needed
+    # (skipped for high-poly meshes without custom normals -> saves ~100MB & ~9s on 4M tris!)
     nrm_3 = None
-    if nl > 0 and bool(out.loop_normals):
+    if write_nrm_attr and nl > 0 and bool(out.loop_normals):
         nrm_flat = np.ctypeslib.as_array(out.loop_normals, shape=(nl * 3,)).copy()
         nrm_3 = nrm_flat.reshape(-1, 3)
         if write_orig_attr:
@@ -888,6 +890,9 @@ def evaluate_target_with_cutters(
 
             dirty_from = int(eval_out.dirty_from_idx)
             write_orig_attr = not is_live
+            write_nrm_attr = (len(src_mesh.polygons) < 50_000) or bool(
+                getattr(src_mesh, "has_custom_normals", False)
+            )
 
             res_ok = False
             out_rem_verts = int(eval_out.remaining.num_verts)
@@ -910,6 +915,7 @@ def evaluate_target_with_cutters(
                         cut_material,
                         write_orig_attr=write_orig_attr,
                         apply_custom_normals=apply_custom_normals,
+                        write_nrm_attr=write_nrm_attr,
                     )
 
             pieces_ok: list[bool] = []
@@ -937,6 +943,7 @@ def evaluate_target_with_cutters(
                             cut_material,
                             write_orig_attr=write_orig_attr,
                             apply_custom_normals=apply_custom_normals,
+                            write_nrm_attr=write_nrm_attr,
                         )
                         pieces_ok.append(ok)
                     else:
@@ -1297,6 +1304,10 @@ def commit_target_cached_eval(
         if eval_out.status != 0:
             return False, []
 
+        write_nrm_attr = (len(src_mesh.polygons) < 50_000) or bool(
+            getattr(src_mesh, "has_custom_normals", False)
+        )
+
         res_ok = False
         out_rem_verts = int(eval_out.remaining.num_verts)
         out_rem_polys = int(eval_out.remaining.num_polys)
@@ -1309,6 +1320,7 @@ def commit_target_cached_eval(
                 cut_material,
                 write_orig_attr=write_orig_attr,
                 apply_custom_normals=apply_custom_normals,
+                write_nrm_attr=write_nrm_attr,
             )
 
         pieces_ok: list[bool] = []
@@ -1329,6 +1341,7 @@ def commit_target_cached_eval(
                     cut_material,
                     write_orig_attr=write_orig_attr,
                     apply_custom_normals=apply_custom_normals,
+                    write_nrm_attr=write_nrm_attr,
                 )
                 pieces_ok.append(ok)
             else:
