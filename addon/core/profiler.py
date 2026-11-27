@@ -271,13 +271,15 @@ def set_recording(enabled: bool) -> None:
 
 def start_new_session_log() -> None:
     """Clear in-memory timeline and start a fresh timeline_latest.jsonl file."""
-    global _TIMELINE_START, _SEQ, _LOG_INITIALIZED
+    global _TIMELINE_START, _SEQ, _LOG_INITIALIZED, _CACHED_SCORE_SEQ, _CACHED_SCORE_REPORT
     _PENDING_JSONL.clear()
     _HISTORY.clear()
     _TIMELINE.clear()
     _TIMELINE_START = time.perf_counter()
     _SEQ = 0
     _LOG_INITIALIZED = False
+    _CACHED_SCORE_SEQ = -1
+    _CACHED_SCORE_REPORT = None
 
 
 @contextmanager
@@ -387,12 +389,29 @@ def _get_active_solver() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reports for AI & JSON Export
+# Reports for AI, Benchmark Scoring & JSON Export
 # ---------------------------------------------------------------------------
 
+_CACHED_SCORE_SEQ: int = -1
+_CACHED_SCORE_REPORT = None
 
-def build_report_dict() -> dict:
-    from . import gpu_preview, rust_bridge
+
+def get_current_score(force: bool = False):
+    """Return cached uncapped Benchmark PerformanceScoreReport for the current timeline."""
+    global _CACHED_SCORE_SEQ, _CACHED_SCORE_REPORT
+    from . import perf_score
+
+    if not force and _CACHED_SCORE_REPORT is not None and _CACHED_SCORE_SEQ == _SEQ:
+        return _CACHED_SCORE_REPORT
+    rep = build_report_dict(include_score=False)
+    score = perf_score.compute_score_from_report(rep)
+    _CACHED_SCORE_SEQ = _SEQ
+    _CACHED_SCORE_REPORT = score
+    return score
+
+
+def build_report_dict(include_score: bool = True) -> dict:
+    from . import gpu_preview, perf_score, rust_bridge
 
     sys_stats = get_system_stats()
     history = get_history()
@@ -429,7 +448,7 @@ def build_report_dict() -> dict:
         reverse=True,
     )[:5]
 
-    return {
+    rep = {
         "system": sys_stats,
         "engine": {
             "selected_solver": active_solver,
@@ -444,11 +463,18 @@ def build_report_dict() -> dict:
         "latest": asdict(latest) if latest else None,
         "timeline": [asdict(e) for e in timeline],
     }
+    if include_score:
+        score = perf_score.compute_score_from_report(rep)
+        rep["benchmark_score"] = score.to_dict()
+    return rep
 
 
 def format_timeline_summary_for_ai() -> str:
-    """Create a compact Timeline summary grouped by Action + Top 5 slowest spikes."""
-    rep = build_report_dict()
+    """Create a compact Timeline summary with Benchmark Score, Action breakdown & Top 5 spikes."""
+    from . import perf_score
+
+    rep = build_report_dict(include_score=False)
+    score = perf_score.compute_score_from_report(rep)
     sys_s = rep["system"]
     eng = rep["engine"]
     timeline = get_timeline()
@@ -459,6 +485,7 @@ def format_timeline_summary_for_ai() -> str:
         f"Process: CPU {sys_s['process_cpu_pct']}% | RAM {sys_s['process_ram_mb']} MB (Peak {sys_s['process_peak_ram_mb']} MB)",
         f"Engine: {eng['selected_solver']} | Rust DLL OK: {eng['rust_dll_available']} | ZoneGrid: {eng['zone_grid_enabled']}",
         f"Total Events: {len(timeline)} | Auto-Log: {eng['auto_log_path']}",
+        perf_score.format_score_summary_text(score),
     ]
     if eng.get("gpu_materials"):
         lines.append("--- GPU Materials ---")

@@ -24,6 +24,7 @@ _RELOAD_ORDER = (
     "core.vault",
     "core.session",
     "core.geonodes",
+    "core.perf_score",
     "core.profiler",
     "core.rust_bridge",
     "core.gpu_preview",
