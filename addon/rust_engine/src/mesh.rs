@@ -6,6 +6,7 @@
 
 use crate::bvh::Bvh;
 use glam::{DMat4, DVec3};
+use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 
@@ -820,17 +821,157 @@ impl HybridMesh {
         (edge_verts, loop_edges)
     }
 
-    /// Build a flat triangle-only representation for fast spatial/winding queries.
-    pub fn extract_triangles(&self) -> Vec<TriRef> {
-        let mut tris = Vec::with_capacity(self.num_polys() * 2);
-        for poly_idx in 0..self.num_polys() {
-            for (vs, ls) in self.triangulate_poly(poly_idx) {
-                tris.push(TriRef {
-                    poly_idx: poly_idx as u32,
-                    v: vs,
-                    l: [ls[0] as u32, ls[1] as u32, ls[2] as u32],
-                });
+    /// Extract a subset of polygons by index in O(K) time (never allocates O(V_total)
+    /// when `poly_indices` is a small fraction of a 1M-vertex base mesh).
+    pub fn extract_subset(&self, poly_indices: &[u32]) -> HybridMesh {
+        let num_uv = self.num_uv_layers();
+        let mut out = HybridMesh::new(num_uv);
+        if poly_indices.is_empty() || self.is_empty() {
+            return out;
+        }
+        let k = poly_indices.len();
+        out.poly_starts.reserve(k);
+        out.mat_ids.reserve(k);
+        out.is_cut_face.reserve(k);
+        out.loop_verts.reserve(k * 4);
+        out.loop_normals.reserve(k * 4);
+        for l in &mut out.uv_layers {
+            l.reserve(k * 4);
+        }
+
+        let has_nrms = self.loop_normals.len() == self.loop_verts.len();
+        if k * 16 < self.positions.len() {
+            let mut vmap: HashMap<u32, u32> = HashMap::with_capacity(k * 2);
+            for &pi_u32 in poly_indices {
+                let pi = pi_u32 as usize;
+                let range = self.poly_loop_range(pi);
+                let n = range.len();
+                if n < 3 {
+                    continue;
+                }
+                for li in range.clone() {
+                    let orig_vi = self.loop_verts[li];
+                    let mapped = match vmap.get(&orig_vi) {
+                        Some(&m) => m,
+                        None => {
+                            let m = out.positions.len() as u32;
+                            out.positions.push(self.positions[orig_vi as usize]);
+                            vmap.insert(orig_vi, m);
+                            m
+                        }
+                    };
+                    out.loop_verts.push(mapped);
+                }
+                for (layer_idx, dst_layer) in out.uv_layers.iter_mut().enumerate() {
+                    if let Some(src_layer) = self.uv_layers.get(layer_idx) {
+                        dst_layer.extend_from_slice(&src_layer[range.clone()]);
+                    } else {
+                        for _ in 0..n {
+                            dst_layer.push([0.0, 0.0]);
+                        }
+                    }
+                }
+                if has_nrms {
+                    out.loop_normals.extend_from_slice(&self.loop_normals[range]);
+                } else {
+                    let pn = self.poly_normal(pi);
+                    let nf = [pn[0] as f32, pn[1] as f32, pn[2] as f32];
+                    for _ in 0..n {
+                        out.loop_normals.push(nf);
+                    }
+                }
+                out.poly_starts.push(out.loop_verts.len() as u32);
+                out.mat_ids.push(self.mat_ids[pi]);
+                out.is_cut_face.push(self.is_cut_face[pi]);
             }
+        } else {
+            let mut remap = vec![u32::MAX; self.positions.len()];
+            for &pi_u32 in poly_indices {
+                out.push_poly_from_shared(self, pi_u32 as usize, &mut remap);
+            }
+        }
+        out
+    }
+
+    /// Bulk-append all geometry from `other` into `self` with vertex/loop offset remapping.
+    pub fn append_mesh(&mut self, other: &HybridMesh) {
+        if other.is_empty() {
+            return;
+        }
+        let v_off = self.positions.len() as u32;
+        let l_off = self.loop_verts.len() as u32;
+        self.positions.extend_from_slice(&other.positions);
+        self.loop_verts.reserve(other.loop_verts.len());
+        for &vi in &other.loop_verts {
+            self.loop_verts.push(vi + v_off);
+        }
+        self.poly_starts.reserve(other.num_polys());
+        for &s in &other.poly_starts[1..] {
+            self.poly_starts.push(s + l_off);
+        }
+        for (layer_idx, dst_layer) in self.uv_layers.iter_mut().enumerate() {
+            if let Some(src_layer) = other.uv_layers.get(layer_idx) {
+                dst_layer.extend_from_slice(src_layer);
+            } else {
+                dst_layer.resize(dst_layer.len() + other.loop_verts.len(), [0.0, 0.0]);
+            }
+        }
+        if other.loop_normals.len() == other.loop_verts.len() {
+            self.loop_normals.extend_from_slice(&other.loop_normals);
+        } else {
+            let np = other.num_polys();
+            for pi in 0..np {
+                let pn = other.poly_normal(pi);
+                let nf = [pn[0] as f32, pn[1] as f32, pn[2] as f32];
+                let cnt = other.poly_loop_range(pi).len();
+                for _ in 0..cnt {
+                    self.loop_normals.push(nf);
+                }
+            }
+        }
+        self.mat_ids.extend_from_slice(&other.mat_ids);
+        self.is_cut_face.extend_from_slice(&other.is_cut_face);
+    }
+
+    /// Build a flat triangle-only representation for fast spatial/winding queries (parallel on large meshes).
+    pub fn extract_triangles(&self) -> Vec<TriRef> {
+        let np = self.num_polys();
+        if np < 4096 {
+            let mut tris = Vec::with_capacity(np * 2);
+            for poly_idx in 0..np {
+                for (vs, ls) in self.triangulate_poly(poly_idx) {
+                    tris.push(TriRef {
+                        poly_idx: poly_idx as u32,
+                        v: vs,
+                        l: [ls[0] as u32, ls[1] as u32, ls[2] as u32],
+                    });
+                }
+            }
+            return tris;
+        }
+        let chunk_sz = 4096;
+        let parts: Vec<Vec<TriRef>> = (0..np)
+            .into_par_iter()
+            .step_by(chunk_sz)
+            .map(|start| {
+                let end = (start + chunk_sz).min(np);
+                let mut local = Vec::with_capacity((end - start) * 2);
+                for poly_idx in start..end {
+                    for (vs, ls) in self.triangulate_poly(poly_idx) {
+                        local.push(TriRef {
+                            poly_idx: poly_idx as u32,
+                            v: vs,
+                            l: [ls[0] as u32, ls[1] as u32, ls[2] as u32],
+                        });
+                    }
+                }
+                local
+            })
+            .collect();
+        let total: usize = parts.iter().map(|v| v.len()).sum();
+        let mut tris = Vec::with_capacity(total);
+        for p in parts {
+            tris.extend(p);
         }
         tris
     }
@@ -843,11 +984,12 @@ pub struct TriRef {
     pub l: [u32; 3],
 }
 
-/// Precomputed triangle + Dipole BVH acceleration bundle cached across live-drag frames.
+/// Precomputed triangle + Dipole BVH + per-polygon AABB acceleration bundle cached across frames.
 #[derive(Clone, Debug)]
 pub struct CachedMeshGeo {
     pub mesh: HybridMesh,
     pub aabb: Aabb,
+    pub poly_aabbs: Vec<Aabb>,
     pub tris: Vec<TriRef>,
     pub tri_aabbs: Vec<Aabb>,
     pub bvh: Bvh,
@@ -855,7 +997,72 @@ pub struct CachedMeshGeo {
 
 impl CachedMeshGeo {
     pub fn from_mesh(mesh: HybridMesh) -> Self {
-        let aabb = mesh.mesh_aabb();
+        let np = mesh.num_polys();
+        let poly_aabbs: Vec<Aabb> = if np >= 4096 {
+            (0..np)
+                .into_par_iter()
+                .map(|pi| mesh.poly_aabb(pi))
+                .collect()
+        } else {
+            (0..np).map(|pi| mesh.poly_aabb(pi)).collect()
+        };
+
+        let aabb = if np >= 4096 {
+            poly_aabbs
+                .par_iter()
+                .copied()
+                .reduce(Aabb::empty, |mut acc, b| {
+                    acc.expand_aabb(&b);
+                    acc
+                })
+        } else {
+            let mut b = Aabb::empty();
+            for pa in &poly_aabbs {
+                b.expand_aabb(pa);
+            }
+            b
+        };
+
+        let tris = mesh.extract_triangles();
+        let tri_aabbs: Vec<Aabb> = if tris.len() >= 4096 {
+            tris.par_iter()
+                .map(|t| {
+                    let mut b = Aabb::from_point(mesh.positions[t.v[0] as usize]);
+                    b.expand_point(mesh.positions[t.v[1] as usize]);
+                    b.expand_point(mesh.positions[t.v[2] as usize]);
+                    b
+                })
+                .collect()
+        } else {
+            tris.iter()
+                .map(|t| {
+                    let mut b = Aabb::from_point(mesh.positions[t.v[0] as usize]);
+                    b.expand_point(mesh.positions[t.v[1] as usize]);
+                    b.expand_point(mesh.positions[t.v[2] as usize]);
+                    b
+                })
+                .collect()
+        };
+        let bvh = Bvh::build_with_dipoles(&tri_aabbs, &mesh.positions, &tris);
+        Self {
+            mesh,
+            aabb,
+            poly_aabbs,
+            tris,
+            tri_aabbs,
+            bvh,
+        }
+    }
+
+    /// Lightweight `CachedMeshGeo` using AABB-only BVH (skips winding dipole computation).
+    /// Used for local spatial islands where the full base mesh provides the global winding BVH.
+    pub fn from_mesh_aabb_only(mesh: HybridMesh) -> Self {
+        let np = mesh.num_polys();
+        let poly_aabbs: Vec<Aabb> = (0..np).map(|pi| mesh.poly_aabb(pi)).collect();
+        let mut aabb = Aabb::empty();
+        for pa in &poly_aabbs {
+            aabb.expand_aabb(pa);
+        }
         let tris = mesh.extract_triangles();
         let tri_aabbs: Vec<Aabb> = tris
             .iter()
@@ -866,10 +1073,11 @@ impl CachedMeshGeo {
                 b
             })
             .collect();
-        let bvh = Bvh::build_with_dipoles(&tri_aabbs, &mesh.positions, &tris);
+        let bvh = Bvh::build_aabbs(&tri_aabbs);
         Self {
             mesh,
             aabb,
+            poly_aabbs,
             tris,
             tri_aabbs,
             bvh,

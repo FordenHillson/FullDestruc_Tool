@@ -1,9 +1,9 @@
 //! Single-pass hybrid Boolean engine (`split_mesh`, `difference`, `intersect`, `union`)
 //! with multi-threaded execution (`rayon`) and prefix caching for real-time multi-cutter workflows.
 
-use crate::box_uv::apply_cut_face_box_uv;
+use crate::box_uv::apply_cut_face_box_uv_from;
 use crate::bvh::Bvh;
-use crate::classify::{classify_point, Location};
+use crate::classify::{check_coplanar_surface, classify_point, Location};
 use crate::mesh::{Aabb, CachedMeshGeo, HybridMesh, TriRef};
 use crate::predicates::{tri_tri_intersect, TriTriHit};
 use crate::retriangulate::{split_triangle, triangulate_cutter_poly_regions, OrientedCutSeg};
@@ -39,7 +39,7 @@ fn tri_centroid_and_normal(pts: &[[f64; 3]; 3]) -> ([f64; 3], [f64; 3]) {
 
 /// Perform a single-pass split of `target` by `cutter` (both in target-local space).
 ///
-/// Builds target BVH on the fly. For real-time dragging, prefer `split_mesh_cached`.
+/// Builds target BVH on the fly. For real-time dragging, prefer `split_mesh_cached` or `split_mesh_local`.
 pub fn split_mesh(
     target: &HybridMesh,
     cutter: &HybridMesh,
@@ -52,7 +52,7 @@ pub fn split_mesh(
         return (target.clone(), HybridMesh::new(num_uv_layers));
     }
     let target_geo = CachedMeshGeo::from_mesh(target.clone());
-    split_mesh_cached(&target_geo, cutter, target_world, cut_mat_idx, uv_scale)
+    split_mesh_local(&target_geo, cutter, target_world, cut_mat_idx, uv_scale, None)
 }
 
 /// High-speed single-pass split using a precomputed `CachedMeshGeo` for `target`.
@@ -66,6 +66,91 @@ pub fn split_mesh_cached(
     cut_mat_idx: i32,
     uv_scale: f32,
 ) -> (HybridMesh, HybridMesh) {
+    split_mesh_local(target_geo, cutter, target_world, cut_mat_idx, uv_scale, None)
+}
+
+/// Precomputed earlier-layer cutter volume inside an overlapping Spatial Island.
+/// Points inside any excluded volume were already removed by a higher-priority cutter.
+pub struct ExcludedVolume<'a> {
+    pub aabb: Aabb,
+    pub positions: &'a [[f64; 3]],
+    pub tris: &'a [TriRef],
+    pub bvh: &'a Bvh,
+}
+
+#[inline]
+fn classify_point_in_remaining(
+    p: [f64; 3],
+    n: [f64; 3],
+    local_geo: &CachedMeshGeo,
+    w_aabb: &Aabb,
+    w_positions: &[[f64; 3]],
+    w_tris: &[TriRef],
+    w_bvh: &Bvh,
+    excluded: &[ExcludedVolume<'_>],
+) -> Location {
+    // 1. Check coplanar Z-fighting against the ACTUAL current remaining mesh (including prior cut caps!)
+    if local_geo.aabb.expanded(PAIR_EPS * 10.0).contains_point(p) {
+        if let Some(dot) = check_coplanar_surface(
+            p,
+            n,
+            &local_geo.mesh.positions,
+            &local_geo.tris,
+            &local_geo.bvh,
+        ) {
+            return if dot >= 0.0 {
+                Location::CoplanarSame
+            } else {
+                Location::CoplanarOpposite
+            };
+        }
+    }
+    // 2. Reject any point strictly inside (or coplanar-same with) a higher-priority excluded cutter
+    for ex in excluded {
+        if ex.aabb.expanded(PAIR_EPS).contains_point(p) {
+            let loc = classify_point(p, n, &ex.aabb, ex.positions, ex.tris, ex.bvh);
+            if matches!(loc, Location::Inside | Location::CoplanarSame) {
+                return Location::Outside;
+            }
+        }
+    }
+    // 3. Classify against the global base winding BVH
+    classify_point(p, n, w_aabb, w_positions, w_tris, w_bvh)
+}
+
+/// Spatial-island local split: intersects & splits ONLY `target_geo` (a small local subset of
+/// base polygons overlapping the cutter/island), while optionally using `winding_geo` (the full
+/// base mesh Dipole BVH) for exact 3D Fast Winding Number cap classification on open/hollow meshes.
+pub fn split_mesh_local(
+    target_geo: &CachedMeshGeo,
+    cutter: &HybridMesh,
+    target_world: &DMat4,
+    cut_mat_idx: i32,
+    uv_scale: f32,
+    winding_geo: Option<&CachedMeshGeo>,
+) -> (HybridMesh, HybridMesh) {
+    split_mesh_local_with_exclusions(
+        target_geo,
+        cutter,
+        target_world,
+        cut_mat_idx,
+        uv_scale,
+        winding_geo,
+        &[],
+    )
+}
+
+/// Same as `split_mesh_local`, additionally subtracting `excluded_volumes` (higher-priority
+/// overlapping cutters already applied in this island) from `winding_geo` inside/outside tests.
+pub fn split_mesh_local_with_exclusions(
+    target_geo: &CachedMeshGeo,
+    cutter: &HybridMesh,
+    target_world: &DMat4,
+    cut_mat_idx: i32,
+    uv_scale: f32,
+    winding_geo: Option<&CachedMeshGeo>,
+    excluded_volumes: &[ExcludedVolume<'_>],
+) -> (HybridMesh, HybridMesh) {
     let target = &target_geo.mesh;
     let num_uv_layers = target.num_uv_layers();
 
@@ -78,6 +163,13 @@ pub fn split_mesh_cached(
     if !target_aabb.expanded(PAIR_EPS).overlaps(&cutter_aabb) {
         return (target.clone(), HybridMesh::new(num_uv_layers));
     }
+
+    // Winding reference for cut-cap inside/outside tests (full base mesh when splitting a local subset!)
+    let w_geo = winding_geo.unwrap_or(target_geo);
+    let w_aabb = w_geo.aabb;
+    let w_positions = &w_geo.mesh.positions;
+    let w_tris = &w_geo.tris;
+    let w_bvh = &w_geo.bvh;
 
     // 1. Build cutter triangle BVH (cutters are small, typically 6-200 polys)
     let cutter_tris = cutter.extract_triangles();
@@ -187,7 +279,7 @@ pub fn split_mesh_cached(
             if touched_target_polys[poly_idx] {
                 return PolyDest::Split;
             }
-            let paabb = target.poly_aabb(poly_idx);
+            let paabb = target_geo.poly_aabbs[poly_idx];
             if !paabb.expanded(PAIR_EPS).overlaps(&cutter_aabb) {
                 return PolyDest::Remaining;
             }
@@ -354,7 +446,7 @@ pub fn split_mesh_cached(
         .into_par_iter()
         .flat_map(|poly_idx| {
             let paabb = cutter.poly_aabb(poly_idx);
-            if !paabb.expanded(PAIR_EPS).overlaps(&target_aabb) {
+            if !paabb.expanded(PAIR_EPS).overlaps(&w_aabb) {
                 return Vec::new();
             }
 
@@ -368,13 +460,15 @@ pub fn split_mesh_cached(
             // Fast path: untouched cutter polygon (either fully inside solid or fully outside in sky)
             if segs.is_empty() {
                 let c = cutter.poly_centroid(poly_idx);
-                let loc = classify_point(
+                let loc = classify_point_in_remaining(
                     c,
                     poly_n,
-                    &target_aabb,
-                    &target.positions,
-                    &target_tris,
-                    &target_bvh,
+                    target_geo,
+                    &w_aabb,
+                    w_positions,
+                    w_tris,
+                    w_bvh,
+                    excluded_volumes,
                 );
                 if loc != Location::Inside {
                     return Vec::new();
@@ -405,17 +499,41 @@ pub fn split_mesh_cached(
                 if region.tris.is_empty() || region.rep_points.is_empty() {
                     continue;
                 }
-                // Check coplanar Z-fighting on largest triangle centroid first
-                let primary_loc = classify_point(
+                // Check coplanar Z-fighting & excluded prior cutter volumes on largest triangle centroid first
+                let primary_loc = classify_point_in_remaining(
                     region.rep_points[0].0,
                     poly_n,
-                    &target_aabb,
-                    &target.positions,
-                    &target_tris,
-                    &target_bvh,
+                    target_geo,
+                    &w_aabb,
+                    w_positions,
+                    w_tris,
+                    w_bvh,
+                    excluded_volumes,
                 );
                 if matches!(primary_loc, Location::CoplanarSame | Location::CoplanarOpposite) {
                     continue;
+                }
+
+                // If the region's representative point lies strictly inside (or coplanar-same with)
+                // a higher-priority excluded cutter, discard it (already claimed by Layer #1..k-1).
+                if !excluded_volumes.is_empty() && primary_loc == Location::Outside {
+                    let in_ex = excluded_volumes.iter().any(|ex| {
+                        ex.aabb.expanded(PAIR_EPS).contains_point(region.rep_points[0].0)
+                            && matches!(
+                                classify_point(
+                                    region.rep_points[0].0,
+                                    poly_n,
+                                    &ex.aabb,
+                                    ex.positions,
+                                    ex.tris,
+                                    ex.bvh
+                                ),
+                                Location::Inside | Location::CoplanarSame
+                            )
+                    });
+                    if in_ex {
+                        continue;
+                    }
                 }
 
                 // 2-level classifier:
@@ -443,13 +561,15 @@ pub fn split_mesh_cached(
                             let tri_pts = &region.tris[i];
                             let hf = region.tri_field[i];
                             let (c, n) = tri_centroid_and_normal(tri_pts);
-                            let loc = classify_point(
+                            let loc = classify_point_in_remaining(
                                 c,
                                 n,
-                                &target_aabb,
-                                &target.positions,
-                                &target_tris,
-                                &target_bvh,
+                                target_geo,
+                                &w_aabb,
+                                w_positions,
+                                w_tris,
+                                w_bvh,
+                                excluded_volumes,
                             );
                             if matches!(loc, Location::CoplanarSame | Location::CoplanarOpposite) {
                                 is_coplanar[i] = true;
@@ -491,10 +611,10 @@ pub fn split_mesh_cached(
                                 } else if open_air_edges == 1 {
                                     if wn_cache[i] < 0.0 {
                                         let (c, _) = tri_centroid_and_normal(&region.tris[i]);
-                                        wn_cache[i] = target_bvh.fast_winding_number(
+                                        wn_cache[i] = w_bvh.fast_winding_number(
                                             c,
-                                            &target.positions,
-                                            &target_tris,
+                                            w_positions,
+                                            w_tris,
                                         );
                                     }
                                     let long_open = perim > 1e-8 && (open_air_len / perim) > 0.55;
@@ -549,6 +669,8 @@ pub fn split_mesh_cached(
     let empty_uvs: Vec<SmallVec<[[f32; 2]; 4]>> =
         vec![SmallVec::from_slice(&[[0.0, 0.0]; 3]); num_uv_layers];
 
+    let rem_cap_start = remaining.num_polys();
+    let piece_cap_start = piece.num_polys();
     for cap in cut_caps {
         // For `remaining = target \ cutter`, flip cap normal inward so it faces out of the cavity
         let flipped = [cap[0], cap[2], cap[1]];
@@ -557,9 +679,10 @@ pub fn split_mesh_cached(
         piece.push_poly_with_positions(&cap, &empty_uvs, cut_mat_idx, true);
     }
 
-    // 7. Apply world-space Box UV to new cut cap faces only, then partially weld new cut vertices
-    apply_cut_face_box_uv(&mut remaining, target_world, uv_scale);
-    apply_cut_face_box_uv(&mut piece, target_world, uv_scale);
+    // 7. Apply world-space Box UV to ONLY newly added cut cap faces (O(caps) instead of O(1M)),
+    //    then partially weld new cut vertices
+    apply_cut_face_box_uv_from(&mut remaining, rem_cap_start, target_world, uv_scale);
+    apply_cut_face_box_uv_from(&mut piece, piece_cap_start, target_world, uv_scale);
 
     remaining.weld_partial(rem_fixed_verts, rem_fixed_polys, &rem_seam_verts, WELD_EPS);
     piece.weld_partial(piece_fixed_verts, piece_fixed_polys, &piece_seam_verts, WELD_EPS);

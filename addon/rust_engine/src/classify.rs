@@ -54,7 +54,7 @@ pub fn winding_number(p: [f64; 3], positions: &[[f64; 3]], tris: &[TriRef]) -> f
 
 /// Check if point `p` lies on any triangle of the reference mesh (via BVH query).
 /// If so, returns `Some(dot(query_normal, ref_normal))`.
-fn check_coplanar_surface(
+pub fn check_coplanar_surface(
     p: [f64; 3],
     query_normal: [f64; 3],
     positions: &[[f64; 3]],

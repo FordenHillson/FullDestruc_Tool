@@ -11,13 +11,27 @@ use glam::{DMat4, DVec3};
 ///
 /// `uv_scale` is typically `texel_per_meter / texture_size` (e.g. `512.0 / 1024.0 = 0.5`).
 pub fn apply_cut_face_box_uv(mesh: &mut HybridMesh, object_world: &DMat4, uv_scale: f32) {
+    apply_cut_face_box_uv_from(mesh, 0, object_world, uv_scale);
+}
+
+/// Apply world-space Box UV only to polygons in `start_poly..mesh.num_polys()` marked `is_cut_face == true`.
+/// Avoids O(M) full-mesh scans on 1M-polygon meshes when only tail cut cap faces were added.
+pub fn apply_cut_face_box_uv_from(
+    mesh: &mut HybridMesh,
+    start_poly: usize,
+    object_world: &DMat4,
+    uv_scale: f32,
+) {
     if mesh.uv_layers.is_empty() || mesh.is_empty() {
         return;
     }
     let scale = uv_scale as f64;
     let num_polys = mesh.num_polys();
+    if start_poly >= num_polys {
+        return;
+    }
 
-    for poly_idx in 0..num_polys {
+    for poly_idx in start_poly..num_polys {
         if !mesh.is_cut_face[poly_idx] {
             continue;
         }

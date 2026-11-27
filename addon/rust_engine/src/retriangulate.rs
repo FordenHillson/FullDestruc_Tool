@@ -327,16 +327,31 @@ fn build_clean_pslg(raw_segs: &[Seg2D], snap_eps: f64) -> Pslg {
         ts.push(1.0);
     }
 
-    // 1. Pairwise AABB-gated crossing & T-junction intersection splitting
-    for i in 0..ns {
+    // 1. X-axis Sweep-and-Prune pairwise crossing & T-junction intersection splitting (O(S log S + K))
+    let mut seg_order: Vec<usize> = (0..ns).collect();
+    if ns > 16 {
+        seg_order.sort_unstable_by(|&a, &b| {
+            segs[a].min[0]
+                .partial_cmp(&segs[b].min[0])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    for oi in 0..ns {
+        let i = seg_order[oi];
         let si = &segs[i];
         let di = sub_2d(si.b, si.a);
         let len_i_sq = di[0] * di[0] + di[1] * di[1];
         if len_i_sq <= snap_sq {
             continue;
         }
-        for j in (i + 1)..ns {
+        let len_i = len_i_sq.sqrt();
+        for oj in (oi + 1)..ns {
+            let j = seg_order[oj];
             let sj = &segs[j];
+            if ns > 16 && sj.min[0] > si.max[0] {
+                break;
+            }
             if si.max[0] < sj.min[0]
                 || si.min[0] > sj.max[0]
                 || si.max[1] < sj.min[1]
@@ -349,14 +364,15 @@ fn build_clean_pslg(raw_segs: &[Seg2D], snap_eps: f64) -> Pslg {
             if len_j_sq <= snap_sq {
                 continue;
             }
+            let len_j = len_j_sq.sqrt();
 
             let denom = cross_2d(di, dj);
             let r = sub_2d(sj.a, si.a);
-            if denom.abs() > 1e-12 * (len_i_sq * len_j_sq).sqrt() {
+            if denom.abs() > 1e-12 * (len_i * len_j) {
                 let t = cross_2d(r, dj) / denom;
                 let u = cross_2d(r, di) / denom;
-                let eps_t = (snap_eps / len_i_sq.sqrt()).min(0.25);
-                let eps_u = (snap_eps / len_j_sq.sqrt()).min(0.25);
+                let eps_t = (snap_eps / len_i).min(0.25);
+                let eps_u = (snap_eps / len_j).min(0.25);
                 if t >= -eps_t && t <= 1.0 + eps_t && u >= -eps_u && u <= 1.0 + eps_u {
                     let tc = t.clamp(0.0, 1.0);
                     let uc = u.clamp(0.0, 1.0);
@@ -369,7 +385,7 @@ fn build_clean_pslg(raw_segs: &[Seg2D], snap_eps: f64) -> Pslg {
                 }
             } else {
                 // Parallel / nearly collinear: project endpoints of each onto the other
-                let cross_dist = cross_2d(r, di).abs() / len_i_sq.sqrt();
+                let cross_dist = cross_2d(r, di).abs() / len_i;
                 if cross_dist <= snap_eps * 1.5 {
                     for &pt in &[sj.a, sj.b] {
                         let t = ((pt[0] - si.a[0]) * di[0] + (pt[1] - si.a[1]) * di[1]) / len_i_sq;
@@ -388,8 +404,18 @@ fn build_clean_pslg(raw_segs: &[Seg2D], snap_eps: f64) -> Pslg {
         }
     }
 
-    // 2. Also ensure every existing vertex lying on the interior of any segment splits that segment
+    // 2. Ensure every existing vertex lying on the interior of any segment splits that segment
+    //    Uses X-sorted vertex list + binary search (`O(S log V + K)` instead of `O(S * V)`).
     let initial_vert_count = verts.len();
+    let mut vert_order: Vec<usize> = (0..initial_vert_count).collect();
+    if initial_vert_count > 16 {
+        vert_order.sort_unstable_by(|&a, &b| {
+            verts[a][0]
+                .partial_cmp(&verts[b][0])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     for i in 0..ns {
         let si = &segs[i];
         let di = sub_2d(si.b, si.a);
@@ -398,8 +424,16 @@ fn build_clean_pslg(raw_segs: &[Seg2D], snap_eps: f64) -> Pslg {
             continue;
         }
         let inv_len = 1.0 / len_sq.sqrt();
-        for vi in 0..initial_vert_count {
+        let start_k = if initial_vert_count > 16 {
+            vert_order.partition_point(|&vi| verts[vi][0] < si.min[0])
+        } else {
+            0
+        };
+        for &vi in &vert_order[start_k..] {
             let p = verts[vi];
+            if initial_vert_count > 16 && p[0] > si.max[0] {
+                break;
+            }
             if p[0] < si.min[0] || p[0] > si.max[0] || p[1] < si.min[1] || p[1] > si.max[1] {
                 continue;
             }

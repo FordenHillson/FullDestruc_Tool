@@ -34,9 +34,35 @@ impl GpuPackedMesh {
     }
 
     /// Pack a `HybridMesh` into material-grouped world-space GPU triangle buffers in parallel.
+    /// Uses thread-local material buckets (`fold`/`reduce`) to avoid per-polygon heap allocations.
     pub fn from_hybrid_mesh(mesh: &HybridMesh, world_mat: &DMat4) -> Self {
         let num_polys = mesh.num_polys();
         if num_polys == 0 {
+            return Self::default();
+        }
+        Self::pack_poly_slice(mesh, None, world_mat)
+    }
+
+    /// Pack a subset of polygons (e.g. untouched polygons of a single spatial chunk) directly
+    /// into world-space GPU triangle buffers without allocating an intermediate `HybridMesh`.
+    pub fn from_hybrid_mesh_subset(
+        mesh: &HybridMesh,
+        poly_indices: &[u32],
+        world_mat: &DMat4,
+    ) -> Self {
+        if poly_indices.is_empty() || mesh.is_empty() {
+            return Self::default();
+        }
+        Self::pack_poly_slice(mesh, Some(poly_indices), world_mat)
+    }
+
+    fn pack_poly_slice(
+        mesh: &HybridMesh,
+        subset: Option<&[u32]>,
+        world_mat: &DMat4,
+    ) -> Self {
+        let count = subset.map_or_else(|| mesh.num_polys(), |s| s.len());
+        if count == 0 {
             return Self::default();
         }
 
@@ -49,91 +75,11 @@ impl GpuPackedMesh {
         };
         let normal_mat = world_mat.inverse().transpose();
 
-        // Pre-transform all vertices into world space once (O(V))
-        let world_verts: Vec<DVec3> = mesh
-            .positions
-            .par_iter()
-            .map(|&p| world_mat.transform_point3(DVec3::from_array(p)))
-            .collect();
-
-        // Triangulate polygons and compute world-space normals + UV0/UV1 in parallel
-        let per_poly: Vec<(i32, Vec<([f32; 9], [f32; 9], [f32; 6], [f32; 6])>)> = (0..num_polys)
-            .into_par_iter()
-            .map(|poly_idx| {
-                let mat_id = mesh.mat_ids[poly_idx];
-                let tris = mesh.triangulate_poly(poly_idx);
-                let mut local = Vec::with_capacity(tris.len());
-                for (vs, ls) in tris {
-                    let p0 = world_verts[vs[0] as usize];
-                    let p1 = world_verts[vs[1] as usize];
-                    let p2 = world_verts[vs[2] as usize];
-                    let pos9 = [
-                        p0.x as f32, p0.y as f32, p0.z as f32,
-                        p1.x as f32, p1.y as f32, p1.z as f32,
-                        p2.x as f32, p2.y as f32, p2.z as f32,
-                    ];
-                    let nor9 = if let Some(nrms) = loop_nrms {
-                        let wn0 = normal_mat
-                            .transform_vector3(DVec3::new(
-                                nrms[ls[0]][0] as f64,
-                                nrms[ls[0]][1] as f64,
-                                nrms[ls[0]][2] as f64,
-                            ))
-                            .normalize_or_zero();
-                        let wn1 = normal_mat
-                            .transform_vector3(DVec3::new(
-                                nrms[ls[1]][0] as f64,
-                                nrms[ls[1]][1] as f64,
-                                nrms[ls[1]][2] as f64,
-                            ))
-                            .normalize_or_zero();
-                        let wn2 = normal_mat
-                            .transform_vector3(DVec3::new(
-                                nrms[ls[2]][0] as f64,
-                                nrms[ls[2]][1] as f64,
-                                nrms[ls[2]][2] as f64,
-                            ))
-                            .normalize_or_zero();
-                        [
-                            wn0.x as f32, wn0.y as f32, wn0.z as f32,
-                            wn1.x as f32, wn1.y as f32, wn1.z as f32,
-                            wn2.x as f32, wn2.y as f32, wn2.z as f32,
-                        ]
-                    } else {
-                        let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
-                        [
-                            n.x as f32, n.y as f32, n.z as f32,
-                            n.x as f32, n.y as f32, n.z as f32,
-                            n.x as f32, n.y as f32, n.z as f32,
-                        ]
-                    };
-                    let uv6 = if let Some(uvs) = uv0 {
-                        let u0 = uvs[ls[0]];
-                        let u1 = uvs[ls[1]];
-                        let u2 = uvs[ls[2]];
-                        [u0[0], u0[1], u1[0], u1[1], u2[0], u2[1]]
-                    } else {
-                        [0.0f32; 6]
-                    };
-                    let uv1_6 = if let Some(uvs) = uv1 {
-                        let u0 = uvs[ls[0]];
-                        let u1 = uvs[ls[1]];
-                        let u2 = uvs[ls[2]];
-                        [u0[0], u0[1], u1[0], u1[1], u2[0], u2[1]]
-                    } else {
-                        [0.0f32; 6]
-                    };
-                    local.push((pos9, nor9, uv6, uv1_6));
-                }
-                (mat_id, local)
-            })
-            .collect();
-
-        // Group into material buckets (typically 2-8 slots)
-        let mut buckets: HashMap<i32, GpuSubMesh> = HashMap::new();
-        for (mat_id, tris) in per_poly {
+        let pack_one = |buckets: &mut HashMap<i32, GpuSubMesh>, poly_idx: usize| {
+            let mat_id = mesh.mat_ids[poly_idx];
+            let tris = mesh.triangulate_poly(poly_idx);
             if tris.is_empty() {
-                continue;
+                return;
             }
             let entry = buckets.entry(mat_id).or_insert_with(|| GpuSubMesh {
                 mat_id,
@@ -143,14 +89,127 @@ impl GpuPackedMesh {
                 uv_xy: Vec::new(),
                 uv1_xy: Vec::new(),
             });
-            for (p9, n9, u6, u1_6) in tris {
-                entry.pos_xyz.extend_from_slice(&p9);
-                entry.nor_xyz.extend_from_slice(&n9);
-                entry.uv_xy.extend_from_slice(&u6);
-                entry.uv1_xy.extend_from_slice(&u1_6);
+            for (vs, ls) in tris {
+                let p0 = world_mat.transform_point3(DVec3::from_array(mesh.positions[vs[0] as usize]));
+                let p1 = world_mat.transform_point3(DVec3::from_array(mesh.positions[vs[1] as usize]));
+                let p2 = world_mat.transform_point3(DVec3::from_array(mesh.positions[vs[2] as usize]));
+                entry.pos_xyz.extend_from_slice(&[
+                    p0.x as f32, p0.y as f32, p0.z as f32,
+                    p1.x as f32, p1.y as f32, p1.z as f32,
+                    p2.x as f32, p2.y as f32, p2.z as f32,
+                ]);
+                if let Some(nrms) = loop_nrms {
+                    let wn0 = normal_mat
+                        .transform_vector3(DVec3::new(
+                            nrms[ls[0]][0] as f64,
+                            nrms[ls[0]][1] as f64,
+                            nrms[ls[0]][2] as f64,
+                        ))
+                        .normalize_or_zero();
+                    let wn1 = normal_mat
+                        .transform_vector3(DVec3::new(
+                            nrms[ls[1]][0] as f64,
+                            nrms[ls[1]][1] as f64,
+                            nrms[ls[1]][2] as f64,
+                        ))
+                        .normalize_or_zero();
+                    let wn2 = normal_mat
+                        .transform_vector3(DVec3::new(
+                            nrms[ls[2]][0] as f64,
+                            nrms[ls[2]][1] as f64,
+                            nrms[ls[2]][2] as f64,
+                        ))
+                        .normalize_or_zero();
+                    entry.nor_xyz.extend_from_slice(&[
+                        wn0.x as f32, wn0.y as f32, wn0.z as f32,
+                        wn1.x as f32, wn1.y as f32, wn1.z as f32,
+                        wn2.x as f32, wn2.y as f32, wn2.z as f32,
+                    ]);
+                } else {
+                    let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                    let nx = n.x as f32;
+                    let ny = n.y as f32;
+                    let nz = n.z as f32;
+                    entry.nor_xyz.extend_from_slice(&[nx, ny, nz, nx, ny, nz, nx, ny, nz]);
+                }
+                if let Some(uvs) = uv0 {
+                    let u0 = uvs[ls[0]];
+                    let u1 = uvs[ls[1]];
+                    let u2 = uvs[ls[2]];
+                    entry
+                        .uv_xy
+                        .extend_from_slice(&[u0[0], u0[1], u1[0], u1[1], u2[0], u2[1]]);
+                } else {
+                    entry.uv_xy.extend_from_slice(&[0.0f32; 6]);
+                }
+                if let Some(uvs) = uv1 {
+                    let u0 = uvs[ls[0]];
+                    let u1 = uvs[ls[1]];
+                    let u2 = uvs[ls[2]];
+                    entry
+                        .uv1_xy
+                        .extend_from_slice(&[u0[0], u0[1], u1[0], u1[1], u2[0], u2[1]]);
+                } else {
+                    entry.uv1_xy.extend_from_slice(&[0.0f32; 6]);
+                }
                 entry.num_tris += 1;
             }
-        }
+        };
+
+        let merge_buckets = |mut a: HashMap<i32, GpuSubMesh>, b: HashMap<i32, GpuSubMesh>| {
+            for (mat_id, sub) in b {
+                if sub.num_tris == 0 {
+                    continue;
+                }
+                match a.get_mut(&mat_id) {
+                    Some(dst) => {
+                        dst.pos_xyz.extend_from_slice(&sub.pos_xyz);
+                        dst.nor_xyz.extend_from_slice(&sub.nor_xyz);
+                        dst.uv_xy.extend_from_slice(&sub.uv_xy);
+                        dst.uv1_xy.extend_from_slice(&sub.uv1_xy);
+                        dst.num_tris += sub.num_tris;
+                    }
+                    None => {
+                        a.insert(mat_id, sub);
+                    }
+                }
+            }
+            a
+        };
+
+        let buckets: HashMap<i32, GpuSubMesh> = if count < 1024 {
+            let mut local = HashMap::new();
+            match subset {
+                Some(idxs) => {
+                    for &pi in idxs {
+                        pack_one(&mut local, pi as usize);
+                    }
+                }
+                None => {
+                    for pi in 0..count {
+                        pack_one(&mut local, pi);
+                    }
+                }
+            }
+            local
+        } else {
+            match subset {
+                Some(idxs) => idxs
+                    .par_iter()
+                    .fold(HashMap::new, |mut acc, &pi| {
+                        pack_one(&mut acc, pi as usize);
+                        acc
+                    })
+                    .reduce(HashMap::new, merge_buckets),
+                None => (0..count)
+                    .into_par_iter()
+                    .fold(HashMap::new, |mut acc, pi| {
+                        pack_one(&mut acc, pi);
+                        acc
+                    })
+                    .reduce(HashMap::new, merge_buckets),
+            }
+        };
 
         let mut submeshes: Vec<GpuSubMesh> = buckets.into_values().collect();
         submeshes.sort_by_key(|s| s.mat_id);

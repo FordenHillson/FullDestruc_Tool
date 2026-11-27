@@ -3,10 +3,13 @@
 
 use crate::mesh::{Aabb, TriRef};
 use glam::DVec3;
+use rayon::prelude::*;
+use smallvec::SmallVec;
 use std::f64::consts::PI;
 
 const LEAF_MAX: usize = 8;
-const PARALLEL_THRESHOLD: usize = 512;
+const PARALLEL_THRESHOLD: usize = 1024;
+const STATS_PAR_THRESHOLD: usize = 16384;
 
 #[derive(Clone, Copy, Debug)]
 pub struct BvhNode {
@@ -39,7 +42,79 @@ struct TriDipole {
 }
 
 impl Bvh {
-    /// Build a BVH with Fast Winding Number dipole moments using parallel `rayon::join`.
+    /// Build a lightweight AABB-only BVH (no winding dipoles) for Chunk / Cutter broadphase.
+    pub fn build_aabbs(aabbs: &[Aabb]) -> Self {
+        let n = aabbs.len();
+        if n == 0 {
+            return Self {
+                nodes: Vec::new(),
+                indices: Vec::new(),
+            };
+        }
+        let mut indices: Vec<u32> = (0..n as u32).collect();
+        let centers: Vec<[f64; 3]> = aabbs.iter().map(|b| b.center()).collect();
+        let mut nodes = Vec::with_capacity(n * 2);
+        Self::build_aabb_serial_into(&mut nodes, &mut indices, 0, aabbs, &centers);
+        Self { nodes, indices }
+    }
+
+    fn build_aabb_serial_into(
+        nodes: &mut Vec<BvhNode>,
+        slice: &mut [u32],
+        global_start: usize,
+        aabbs: &[Aabb],
+        centers: &[[f64; 3]],
+    ) -> u32 {
+        let count = slice.len();
+        let mut bounds = Aabb::empty();
+        let mut centroid_bounds = Aabb::empty();
+        for &idx in slice.iter() {
+            let ui = idx as usize;
+            bounds.expand_aabb(&aabbs[ui]);
+            centroid_bounds.expand_point(centers[ui]);
+        }
+
+        let my_idx = nodes.len() as u32;
+        if count <= LEAF_MAX {
+            nodes.push(BvhNode {
+                aabb: bounds,
+                left_or_first: global_start as u32,
+                right_child: 0,
+                count: count as u32,
+                area_normal: [0.0; 3],
+                weighted_center: bounds.center(),
+                radius: 0.0,
+            });
+            return my_idx;
+        }
+
+        nodes.push(BvhNode {
+            aabb: bounds,
+            left_or_first: 0,
+            right_child: 0,
+            count: 0,
+            area_normal: [0.0; 3],
+            weighted_center: bounds.center(),
+            radius: 0.0,
+        });
+
+        let left_count = Self::partition_slice(slice, &centroid_bounds, centers);
+        let (left_slice, right_slice) = slice.split_at_mut(left_count);
+        let left_child =
+            Self::build_aabb_serial_into(nodes, left_slice, global_start, aabbs, centers);
+        let right_child = Self::build_aabb_serial_into(
+            nodes,
+            right_slice,
+            global_start + left_count,
+            aabbs,
+            centers,
+        );
+        nodes[my_idx as usize].left_or_first = left_child;
+        nodes[my_idx as usize].right_child = right_child;
+        my_idx
+    }
+
+    /// Build a BVH with Fast Winding Number dipole moments using parallel `rayon`.
     pub fn build_with_dipoles(
         aabbs: &[Aabb],
         positions: &[[f64; 3]],
@@ -53,25 +128,46 @@ impl Bvh {
             };
         }
 
-        let dipoles: Vec<TriDipole> = tris
-            .iter()
-            .map(|t| {
-                let a = DVec3::from_array(positions[t.v[0] as usize]);
-                let b = DVec3::from_array(positions[t.v[1] as usize]);
-                let c = DVec3::from_array(positions[t.v[2] as usize]);
-                let an = 0.5 * (b - a).cross(c - a);
-                let area = an.length();
-                let center = (a + b + c) * (1.0 / 3.0);
-                TriDipole {
-                    area_normal: an,
-                    center,
-                    area,
-                }
-            })
-            .collect();
+        let dipoles: Vec<TriDipole> = if n >= PARALLEL_THRESHOLD {
+            tris.par_iter()
+                .map(|t| {
+                    let a = DVec3::from_array(positions[t.v[0] as usize]);
+                    let b = DVec3::from_array(positions[t.v[1] as usize]);
+                    let c = DVec3::from_array(positions[t.v[2] as usize]);
+                    let an = 0.5 * (b - a).cross(c - a);
+                    let area = an.length();
+                    let center = (a + b + c) * (1.0 / 3.0);
+                    TriDipole {
+                        area_normal: an,
+                        center,
+                        area,
+                    }
+                })
+                .collect()
+        } else {
+            tris.iter()
+                .map(|t| {
+                    let a = DVec3::from_array(positions[t.v[0] as usize]);
+                    let b = DVec3::from_array(positions[t.v[1] as usize]);
+                    let c = DVec3::from_array(positions[t.v[2] as usize]);
+                    let an = 0.5 * (b - a).cross(c - a);
+                    let area = an.length();
+                    let center = (a + b + c) * (1.0 / 3.0);
+                    TriDipole {
+                        area_normal: an,
+                        center,
+                        area,
+                    }
+                })
+                .collect()
+        };
 
         let mut indices: Vec<u32> = (0..n as u32).collect();
-        let centers: Vec<[f64; 3]> = aabbs.iter().map(|b| b.center()).collect();
+        let centers: Vec<[f64; 3]> = if n >= PARALLEL_THRESHOLD {
+            aabbs.par_iter().map(|b| b.center()).collect()
+        } else {
+            aabbs.iter().map(|b| b.center()).collect()
+        };
 
         let nodes = Self::build_subtree_parallel(&mut indices, 0, aabbs, &centers, &dipoles);
         Self { nodes, indices }
@@ -83,21 +179,55 @@ impl Bvh {
         centers: &[[f64; 3]],
         dipoles: &[TriDipole],
     ) -> (Aabb, Aabb, [f64; 3], [f64; 3], f64) {
-        let mut bounds = Aabb::empty();
-        let mut centroid_bounds = Aabb::empty();
-        let mut sum_an = DVec3::ZERO;
-        let mut sum_wc = DVec3::ZERO;
-        let mut sum_area = 0.0;
-
-        for &idx in slice {
-            let ui = idx as usize;
-            bounds.expand_aabb(&aabbs[ui]);
-            centroid_bounds.expand_point(centers[ui]);
-            let d = dipoles[ui];
-            sum_an += d.area_normal;
-            sum_wc += d.center * d.area;
-            sum_area += d.area;
-        }
+        let (bounds, centroid_bounds, sum_an, sum_wc, sum_area) =
+            if slice.len() >= STATS_PAR_THRESHOLD {
+                slice
+                    .par_chunks(4096)
+                    .map(|chunk| {
+                        let mut b = Aabb::empty();
+                        let mut cb = Aabb::empty();
+                        let mut an = DVec3::ZERO;
+                        let mut wc = DVec3::ZERO;
+                        let mut area = 0.0;
+                        for &idx in chunk {
+                            let ui = idx as usize;
+                            b.expand_aabb(&aabbs[ui]);
+                            cb.expand_point(centers[ui]);
+                            let d = dipoles[ui];
+                            an += d.area_normal;
+                            wc += d.center * d.area;
+                            area += d.area;
+                        }
+                        (b, cb, an, wc, area)
+                    })
+                    .reduce(
+                        || (Aabb::empty(), Aabb::empty(), DVec3::ZERO, DVec3::ZERO, 0.0),
+                        |mut acc, cur| {
+                            acc.0.expand_aabb(&cur.0);
+                            acc.1.expand_aabb(&cur.1);
+                            acc.2 += cur.2;
+                            acc.3 += cur.3;
+                            acc.4 += cur.4;
+                            acc
+                        },
+                    )
+            } else {
+                let mut bounds = Aabb::empty();
+                let mut centroid_bounds = Aabb::empty();
+                let mut sum_an = DVec3::ZERO;
+                let mut sum_wc = DVec3::ZERO;
+                let mut sum_area = 0.0;
+                for &idx in slice {
+                    let ui = idx as usize;
+                    bounds.expand_aabb(&aabbs[ui]);
+                    centroid_bounds.expand_point(centers[ui]);
+                    let d = dipoles[ui];
+                    sum_an += d.area_normal;
+                    sum_wc += d.center * d.area;
+                    sum_area += d.area;
+                }
+                (bounds, centroid_bounds, sum_an, sum_wc, sum_area)
+            };
 
         let wc = if sum_area > 1e-18 {
             sum_wc / sum_area
@@ -273,14 +403,11 @@ impl Bvh {
         if self.nodes.is_empty() || !self.nodes[0].aabb.overlaps(query) {
             return;
         }
-        let mut stack = [0usize; 64];
-        let mut sp = 0usize;
-        stack[sp] = 0;
-        sp += 1;
+        let mut stack: SmallVec<[usize; 64]> = SmallVec::new();
+        stack.push(0);
 
-        while sp > 0 {
-            sp -= 1;
-            let node = &self.nodes[stack[sp]];
+        while let Some(ni) = stack.pop() {
+            let node = &self.nodes[ni];
             if node.count > 0 {
                 let first = node.left_or_first as usize;
                 let end = first + node.count as usize;
@@ -288,13 +415,11 @@ impl Bvh {
             } else {
                 let left = node.left_or_first as usize;
                 let right = node.right_child as usize;
-                if self.nodes[left].aabb.overlaps(query) && sp < 64 {
-                    stack[sp] = left;
-                    sp += 1;
+                if self.nodes[left].aabb.overlaps(query) {
+                    stack.push(left);
                 }
-                if self.nodes[right].aabb.overlaps(query) && sp < 64 {
-                    stack[sp] = right;
-                    sp += 1;
+                if self.nodes[right].aabb.overlaps(query) {
+                    stack.push(right);
                 }
             }
         }
@@ -315,14 +440,11 @@ impl Bvh {
         let pv = DVec3::from_array(p);
         let mut total_omega = 0.0;
 
-        let mut stack = [0usize; 64];
-        let mut sp = 0usize;
-        stack[sp] = 0;
-        sp += 1;
+        let mut stack: SmallVec<[usize; 64]> = SmallVec::new();
+        stack.push(0);
 
-        while sp > 0 {
-            sp -= 1;
-            let node = &self.nodes[stack[sp]];
+        while let Some(ni) = stack.pop() {
+            let node = &self.nodes[ni];
             let wc = DVec3::from_array(node.weighted_center);
             let diff = wc - pv;
             let dist_sq = diff.length_squared();
@@ -348,12 +470,8 @@ impl Bvh {
             } else {
                 let left = node.left_or_first as usize;
                 let right = node.right_child as usize;
-                if sp + 2 <= 64 {
-                    stack[sp] = left;
-                    sp += 1;
-                    stack[sp] = right;
-                    sp += 1;
-                }
+                stack.push(left);
+                stack.push(right);
             }
         }
 
