@@ -28,6 +28,7 @@ _BASIC_SHADER_FAILED = False
 _MULTI_SHADER = None
 _MULTI_SHADER_FAILED = False
 _LINE_SHADER = None
+_LINE_COLOR_SHADER = None
 _FALLBACK_TEX = None
 _DRAW_HANDLE = None
 
@@ -37,17 +38,30 @@ _CUTTERS_COL_NAME: str = ""
 
 # target_name -> {
 #   "materials": [mat_desc_dict, ...],
-#   "rem_batches": [(mat_id, is_multi_bool, GPUBatch), ...],
-#   "piece_batches": [([(mat_id, is_multi_bool, GPUBatch), ...], zone_rgba, zone_letter), ...],
-#   "piece_wire": [(GPUBatch, zone_rgba), ...],
+#   "rem_chunks": {chunk_id: [(mat_id, is_multi_bool, GPUBatch), ...]},
+#   "rem_flat": [(mat_id, is_multi_bool, GPUBatch), ...],
+#   "piece_raw_by_id": {cutter_id: (raw_submeshes, zone_rgba, zone_letter)},
+#   "piece_buckets": {(zone_letter, bucket_idx): (zone_rgba, [(mat_id, is_multi_bool, GPUBatch), ...])},
+#   "piece_wire_buckets": {(zone_letter, bucket_idx): (zone_rgba, GPUBatch | None)},
+#   "piece_wire_dirty": set[tuple[str, int]],
 # }
 _GPU_STATE: dict[str, dict] = {}
 # (mat_ptr, mat_name, dll_ver) -> mat_desc_dict
 _MAT_CACHE: dict[tuple[int, str, int], dict] = {}
+# Cutter wireframe caches (eliminates 500x foreach_get + batch_for_shader per frame!)
+# (mesh_ptr, n_verts, n_edges) -> np.ndarray shape (E*2, 3) float32 in local space
+_CUTTER_LOCAL_EDGE_CACHE: dict[tuple[int, int, int], np.ndarray] = {}
+# (mesh_ptr, n_verts, n_edges) -> GPUBatch in local space (for selected/active transform-matrix draw)
+_CUTTER_LOCAL_BATCH_CACHE: dict[tuple[int, int, int], object] = {}
+# Cached merged batch for all unselected static cutters: {"fast_key": ..., "front": batch, "xray": batch, "use_color": ...}
+_UNSEL_WIRE_CACHE: dict[str, object] = {}
+_UNSEL_WIRE_REV: int = 0
 _LAST_MAT_DEBUG: list[str] = []
 _GRID_SIZE: float = 0.35
 _SHOW_GRID: bool = True
 _DISPLAY_MODE: str = "ALL"  # "ALL" | "PIECES" | "MAIN" | "MAIN_WIRE"
+_PIECE_BUCKET_SIZE: int = 64
+_ISLAND_CHUNK_FLAG: int = 0x80000000
 
 _NON_COLOR_KEYWORDS = (
     "_nmo",
@@ -1216,6 +1230,7 @@ def _draw_submesh_list(
     grid_strength: float,
 ) -> None:
     bound = None
+    last_mat_key: tuple[str, int] | None = None
     for mat_id, is_multi, batch in sub_batches:
         desc = mat_infos[mat_id] if (0 <= mat_id < len(mat_infos)) else None
 
@@ -1226,14 +1241,18 @@ def _draw_submesh_list(
                 multi_shader.uniform_float("zone_tint", zone_tint)
                 multi_shader.uniform_float("grid_params", (_GRID_SIZE, grid_strength, 0.0, 0.0))
                 bound = "MULTI"
-            bcr_texs = desc["bcr_texs"]
-            multi_shader.uniform_sampler("bcr1_tex", bcr_texs[0] or fallback_tex)
-            multi_shader.uniform_sampler("bcr2_tex", bcr_texs[1] or fallback_tex)
-            multi_shader.uniform_sampler("bcr3_tex", bcr_texs[2] or fallback_tex)
-            multi_shader.uniform_sampler("bcr4_tex", bcr_texs[3] or fallback_tex)
-            multi_shader.uniform_sampler("mask_tex", desc["mask_tex"] or fallback_tex)
-            multi_shader.uniform_sampler("mcr_tex", desc["mcr_tex"] or fallback_tex)
-            multi_shader.uniform_block("u_mm", desc["ubo"])
+                last_mat_key = None
+            mkey = ("MULTI", mat_id)
+            if last_mat_key != mkey:
+                bcr_texs = desc["bcr_texs"]
+                multi_shader.uniform_sampler("bcr1_tex", bcr_texs[0] or fallback_tex)
+                multi_shader.uniform_sampler("bcr2_tex", bcr_texs[1] or fallback_tex)
+                multi_shader.uniform_sampler("bcr3_tex", bcr_texs[2] or fallback_tex)
+                multi_shader.uniform_sampler("bcr4_tex", bcr_texs[3] or fallback_tex)
+                multi_shader.uniform_sampler("mask_tex", desc["mask_tex"] or fallback_tex)
+                multi_shader.uniform_sampler("mcr_tex", desc["mcr_tex"] or fallback_tex)
+                multi_shader.uniform_block("u_mm", desc["ubo"])
+                last_mat_key = mkey
             batch.draw(multi_shader)
         elif basic_shader is not None:
             if bound != "BASIC":
@@ -1241,28 +1260,32 @@ def _draw_submesh_list(
                 basic_shader.uniform_float("ModelViewProjectionMatrix", mvp)
                 basic_shader.uniform_float("zone_tint", zone_tint)
                 bound = "BASIC"
-            if desc is not None and desc.get("kind") == "BASIC":
-                gtex = desc["gtex"]
-                bcol = desc["base_col"]
-                uv_xf = desc["uv_xform"]
-                has_tex = bool(desc["use_tex"] and gtex is not None)
-                dec_srgb = bool(desc["dec_srgb"])
-            else:
-                gtex = None
-                bcol = (0.76, 0.77, 0.80, 1.0)
-                uv_xf = (1.0, 1.0, 0.0, 0.0)
-                has_tex = False
-                dec_srgb = False
+                last_mat_key = None
+            mkey = ("BASIC", mat_id)
+            if last_mat_key != mkey:
+                if desc is not None and desc.get("kind") == "BASIC":
+                    gtex = desc["gtex"]
+                    bcol = desc["base_col"]
+                    uv_xf = desc["uv_xform"]
+                    has_tex = bool(desc["use_tex"] and gtex is not None)
+                    dec_srgb = bool(desc["dec_srgb"])
+                else:
+                    gtex = None
+                    bcol = (0.76, 0.77, 0.80, 1.0)
+                    uv_xf = (1.0, 1.0, 0.0, 0.0)
+                    has_tex = False
+                    dec_srgb = False
 
-            tex_to_bind = gtex if has_tex else fallback_tex
-            if tex_to_bind is not None:
-                basic_shader.uniform_sampler("base_tex", tex_to_bind)
-            basic_shader.uniform_float("base_color", bcol)
-            basic_shader.uniform_float("uv_transform", uv_xf)
-            basic_shader.uniform_float(
-                "params",
-                (1.0 if has_tex else 0.0, 1.0 if dec_srgb else 0.0, _GRID_SIZE, grid_strength),
-            )
+                tex_to_bind = gtex if has_tex else fallback_tex
+                if tex_to_bind is not None:
+                    basic_shader.uniform_sampler("base_tex", tex_to_bind)
+                basic_shader.uniform_float("base_color", bcol)
+                basic_shader.uniform_float("uv_transform", uv_xf)
+                basic_shader.uniform_float(
+                    "params",
+                    (1.0 if has_tex else 0.0, 1.0 if dec_srgb else 0.0, _GRID_SIZE, grid_strength),
+                )
+                last_mat_key = mkey
             batch.draw(basic_shader)
 
 
@@ -1271,6 +1294,7 @@ _BBOX_EDGES = (
     (4, 5), (5, 6), (6, 7), (7, 4),
     (0, 4), (1, 5), (2, 6), (3, 7),
 )
+_BBOX_EDGE_IDX = np.asarray([i for pair in _BBOX_EDGES for i in pair], dtype=np.int32)
 
 
 def _get_line_shader():
@@ -1287,6 +1311,102 @@ def _get_line_shader():
         except Exception:
             _LINE_SHADER = None
     return _LINE_SHADER
+
+
+def _get_line_color_shader():
+    """Return a per-vertex colored line shader for 1-draw-call batched unselected cutters."""
+    global _LINE_COLOR_SHADER
+    if _LINE_COLOR_SHADER is not None:
+        return _LINE_COLOR_SHADER
+    if bpy.app.background:
+        return None
+    try:
+        _LINE_COLOR_SHADER = gpu.shader.from_builtin("POLYLINE_FLAT_COLOR")
+    except Exception:
+        try:
+            _LINE_COLOR_SHADER = gpu.shader.from_builtin("FLAT_COLOR")
+        except Exception:
+            _LINE_COLOR_SHADER = None
+    return _LINE_COLOR_SHADER
+
+
+def invalidate_cutter_wire_cache(mesh_ptr: int | None = None) -> None:
+    """Clear cached local cutter wireframes (all or for a specific edited mesh pointer)."""
+    _UNSEL_WIRE_CACHE.clear()
+    if mesh_ptr is None:
+        _CUTTER_LOCAL_EDGE_CACHE.clear()
+        _CUTTER_LOCAL_BATCH_CACHE.clear()
+        return
+    for d in (_CUTTER_LOCAL_EDGE_CACHE, _CUTTER_LOCAL_BATCH_CACHE):
+        for k in list(d.keys()):
+            if k[0] == mesh_ptr:
+                d.pop(k, None)
+
+
+def _cutter_local_cache_key(obj: bpy.types.Object) -> tuple | None:
+    me = getattr(obj, "data", None)
+    if me is None:
+        return None
+    try:
+        mptr = int(me.as_pointer())
+    except Exception:
+        mptr = id(me)
+    nv = len(me.vertices)
+    ne = len(me.edges)
+    bb = obj.bound_box
+    if bb:
+        bb_k = (
+            round(float(bb[0][0]), 4), round(float(bb[0][1]), 4), round(float(bb[0][2]), 4),
+            round(float(bb[6][0]), 4), round(float(bb[6][1]), 4), round(float(bb[6][2]), 4),
+        )
+    else:
+        bb_k = ()
+    return (mptr, nv, ne, bb_k)
+
+
+def _get_cutter_local_edges(obj: bpy.types.Object) -> tuple[tuple | None, np.ndarray | None]:
+    """Return `(cache_key, (E*2, 3) float32 local-space line endpoints)` with O(1) cache hit."""
+    key = _cutter_local_cache_key(obj)
+    if key is None:
+        return None, None
+    cached = _CUTTER_LOCAL_EDGE_CACHE.get(key)
+    if cached is not None:
+        return key, cached
+
+    me = obj.data
+    _, nv, num_edges, _ = key
+    pts: np.ndarray | None = None
+    if 0 < num_edges <= 256 and nv > 0:
+        co = np.empty(nv * 3, dtype=np.float32)
+        me.vertices.foreach_get("co", co)
+        verts_l = co.reshape(-1, 3)
+        e_idx = np.empty(num_edges * 2, dtype=np.int32)
+        me.edges.foreach_get("vertices", e_idx)
+        pts = np.ascontiguousarray(verts_l[e_idx], dtype=np.float32)
+    else:
+        # Dense mesh (e.g. Rough Edge cutter): clean 12-edge local bounding box
+        bb = np.asarray([tuple(c) for c in obj.bound_box], dtype=np.float32)
+        if bb.shape == (8, 3):
+            pts = np.ascontiguousarray(bb[_BBOX_EDGE_IDX], dtype=np.float32)
+
+    if pts is not None:
+        if len(_CUTTER_LOCAL_EDGE_CACHE) > 2048:
+            _CUTTER_LOCAL_EDGE_CACHE.clear()
+            _CUTTER_LOCAL_BATCH_CACHE.clear()
+        _CUTTER_LOCAL_EDGE_CACHE[key] = pts
+    return key, pts
+
+
+def _get_cutter_local_batch(obj: bpy.types.Object, line_shader):
+    """Return a cached local-space GPUBatch for a cutter (0 allocs during transform drag)."""
+    key, pts = _get_cutter_local_edges(obj)
+    if key is None or pts is None or pts.size == 0:
+        return None
+    batch = _CUTTER_LOCAL_BATCH_CACHE.get(key)
+    if batch is None:
+        batch = batch_for_shader(line_shader, "LINES", {"pos": pts})
+        _CUTTER_LOCAL_BATCH_CACHE[key] = batch
+    return batch
 
 
 def _extract_cutter_line_positions(obj: bpy.types.Object) -> np.ndarray | None:
@@ -1315,25 +1435,10 @@ def _extract_cutter_line_positions(obj: bpy.types.Object) -> np.ndarray | None:
         except Exception:
             pass
 
-    num_edges = len(me.edges)
-    if 0 < num_edges <= 256:
-        nv = len(me.vertices)
-        if nv == 0:
-            return None
-        co = np.empty(nv * 3, dtype=np.float32)
-        me.vertices.foreach_get("co", co)
-        verts_w = (co.reshape(-1, 3) @ rot_scale.T) + trans
-        e_idx = np.empty(num_edges * 2, dtype=np.int32)
-        me.edges.foreach_get("vertices", e_idx)
-        return np.ascontiguousarray(verts_w[e_idx], dtype=np.float32)
-
-    # Dense mesh (e.g. Rough Edge cutter): draw clean 12-edge bounding box
-    bb = np.asarray([tuple(c) for c in obj.bound_box], dtype=np.float32)
-    if bb.shape != (8, 3):
+    _, local_pts = _get_cutter_local_edges(obj)
+    if local_pts is None or local_pts.size == 0:
         return None
-    bb_w = (bb @ rot_scale.T) + trans
-    idx = np.asarray([i for pair in _BBOX_EDGES for i in pair], dtype=np.int32)
-    return np.ascontiguousarray(bb_w[idx], dtype=np.float32)
+    return np.ascontiguousarray((local_pts @ rot_scale.T) + trans, dtype=np.float32)
 
 
 def _draw_edit_mode_cutter_overlay(
@@ -1490,8 +1595,14 @@ def get_selected_cutter_zones() -> set[str]:
     return zones
 
 
+def mark_cutter_wireframes_dirty() -> None:
+    """Bump the unselected cutter wireframe revision so the static batch rebuilds on next frame."""
+    global _UNSEL_WIRE_REV
+    _UNSEL_WIRE_REV += 1
+
+
 def _draw_session_cutters_xray() -> None:
-    """Draw dual-pass X-ray cutter wireframes so newly added boxes inside buildings are always visible."""
+    """Draw dual-pass X-ray cutter wireframes in O(1) CPU + O(1) draw calls for 500 boxes."""
     if not _CUTTERS_COL_NAME:
         return
     col = bpy.data.collections.get(_CUTTERS_COL_NAME)
@@ -1516,75 +1627,189 @@ def _draw_session_cutters_xray() -> None:
     )
 
     active_obj = getattr(bpy.context, "active_object", None)
+    sel_list = list(getattr(bpy.context, "selected_objects", ()) or ())
+    if active_obj is not None and active_obj not in sel_list:
+        sel_list.append(active_obj)
     sel_zones = get_selected_cutter_zones() if _DISPLAY_MODE == "PIECES" else set()
-    line_shader.bind()
-    try:
-        line_shader.uniform_float("viewportSize", vp_size)
-    except Exception:
-        is_poly = False
+
+    # Collect selected / Edit-mode cutters directly from selection (typically 0-1 objects, O(1)!)
+    edit_objs: list[bpy.types.Object] = []
+    sel_objs: list[tuple[bpy.types.Object, bool]] = []
+    sel_ids: list[int] = []
+    for o in sel_list:
+        if o is None or o.type != "MESH" or o.hide_get() or o.hide_viewport:
+            continue
+        if not bool(o.get("fdt_is_cutter", False)):
+            continue
+        sel_ids.append(id(o))
+        if o.mode == "EDIT":
+            edit_objs.append(o)
+        else:
+            sel_objs.append((o, o == active_obj))
+
+    color_shader = _get_line_color_shader()
+    use_color_shader = color_shader is not None
+
+    # O(1) cache key: on orbit or transform drag of selected cutter(s), skip scanning all 499 unselected boxes!
+    fast_key = (
+        _UNSEL_WIRE_REV,
+        _CUTTERS_COL_NAME,
+        len(col.objects),
+        id(active_obj) if active_obj is not None else 0,
+        tuple(sel_ids),
+        frozenset(sel_zones),
+        use_xray,
+        use_color_shader,
+    )
+
+    if _UNSEL_WIRE_CACHE.get("fast_key") != fast_key:
+        sel_id_set = set(sel_ids)
+        front_pos_parts: list[np.ndarray] = []
+        front_col_parts: list[np.ndarray] = []
+        xray_pos_parts: list[np.ndarray] = []
+        xray_col_parts: list[np.ndarray] = []
+
+        for obj in col.objects:
+            if obj.type != "MESH" or obj.hide_get() or obj.hide_viewport:
+                continue
+            oid = id(obj)
+            if oid in sel_id_set or obj.mode == "EDIT":
+                continue
+            _, local_pts = _get_cutter_local_edges(obj)
+            if local_pts is None or local_pts.size == 0:
+                continue
+            mat = np.asarray(obj.matrix_world, dtype=np.float32)
+            w_pts = (local_pts @ mat[:3, :3].T) + mat[:3, 3]
+            n_v = w_pts.shape[0]
+            c_zone = str(obj.get("fdt_cutter_zone", "A") or "A").strip() or "A"
+            is_dimmed = bool(sel_zones) and (c_zone not in sel_zones)
+            oc = obj.color
+            r, g, b = float(oc[0]), float(oc[1]), float(oc[2])
+            a_front = 0.22 if is_dimmed else 0.78
+            front_pos_parts.append(w_pts)
+            if use_color_shader:
+                c_f = np.empty((n_v, 4), dtype=np.float32)
+                c_f[:, 0], c_f[:, 1], c_f[:, 2], c_f[:, 3] = r, g, b, a_front
+                front_col_parts.append(c_f)
+            if use_xray or obj.show_in_front:
+                a_xray = 0.08 if is_dimmed else 0.25
+                xray_pos_parts.append(w_pts)
+                if use_color_shader:
+                    c_x = np.empty((n_v, 4), dtype=np.float32)
+                    c_x[:, 0], c_x[:, 1], c_x[:, 2], c_x[:, 3] = r, g, b, a_xray
+                    xray_col_parts.append(c_x)
+
+        front_batch = None
+        xray_batch = None
+        if front_pos_parts:
+            f_pos = np.ascontiguousarray(np.concatenate(front_pos_parts, axis=0), dtype=np.float32)
+            if use_color_shader:
+                f_col = np.ascontiguousarray(np.concatenate(front_col_parts, axis=0), dtype=np.float32)
+                front_batch = batch_for_shader(color_shader, "LINES", {"pos": f_pos, "color": f_col})
+            else:
+                front_batch = batch_for_shader(line_shader, "LINES", {"pos": f_pos})
+        if xray_pos_parts:
+            x_pos = np.ascontiguousarray(np.concatenate(xray_pos_parts, axis=0), dtype=np.float32)
+            if use_color_shader:
+                x_col = np.ascontiguousarray(np.concatenate(xray_col_parts, axis=0), dtype=np.float32)
+                xray_batch = batch_for_shader(color_shader, "LINES", {"pos": x_pos, "color": x_col})
+            else:
+                xray_batch = batch_for_shader(line_shader, "LINES", {"pos": x_pos})
+
+        _UNSEL_WIRE_CACHE["fast_key"] = fast_key
+        _UNSEL_WIRE_CACHE["front"] = front_batch
+        _UNSEL_WIRE_CACHE["xray"] = xray_batch
+        _UNSEL_WIRE_CACHE["use_color"] = use_color_shader
 
     gpu.state.depth_mask_set(False)
     gpu.state.blend_set("ALPHA")
 
-    for obj in col.objects:
-        if obj.type != "MESH" or obj.hide_get() or obj.hide_viewport:
-            continue
-        if obj.mode == "EDIT":
-            _draw_edit_mode_cutter_overlay(obj, line_shader, is_poly)
-            continue
-        pts = _extract_cutter_line_positions(obj)
-        if pts is None or pts.size == 0:
-            continue
-        batch = batch_for_shader(line_shader, "LINES", {"pos": pts})
-
-        is_active = (obj == active_obj)
-        is_sel = obj.select_get()
-        c_zone = str(obj.get("fdt_cutter_zone", "A") or "A").strip() or "A"
-        is_other_zone_dimmed = bool(sel_zones) and (c_zone not in sel_zones)
-        if is_active:
-            rgb = (1.0, 0.64, 0.16)
-            w_front, w_xray = 2.2, 1.4
-            a_front, a_xray = 1.0, 0.45
-        elif is_sel:
-            rgb = (1.0, 0.45, 0.08)
-            w_front, w_xray = 1.9, 1.2
-            a_front, a_xray = 0.95, 0.38
-        elif is_other_zone_dimmed:
-            oc = obj.color
-            rgb = (float(oc[0]), float(oc[1]), float(oc[2]))
-            w_front, w_xray = 1.0, 0.8
-            a_front, a_xray = 0.22, 0.08
+    # 1. Draw ALL unselected cutters in 1-2 cached draw calls (0 loops, 0 allocs during orbit or drag!)
+    front_batch = _UNSEL_WIRE_CACHE.get("front")
+    xray_batch = _UNSEL_WIRE_CACHE.get("xray")
+    if front_batch is not None or xray_batch is not None:
+        if _UNSEL_WIRE_CACHE.get("use_color") and color_shader is not None:
+            color_shader.bind()
+            c_poly = True
+            try:
+                color_shader.uniform_float("viewportSize", vp_size)
+            except Exception:
+                c_poly = False
+            if xray_batch is not None:
+                gpu.state.depth_test_set("GREATER")
+                if c_poly:
+                    color_shader.uniform_float("lineWidth", 1.0)
+                xray_batch.draw(color_shader)
+            if front_batch is not None:
+                gpu.state.depth_test_set("LESS_EQUAL")
+                if c_poly:
+                    color_shader.uniform_float("lineWidth", 1.4)
+                front_batch.draw(color_shader)
         else:
-            oc = obj.color
-            rgb = (float(oc[0]), float(oc[1]), float(oc[2]))
-            w_front, w_xray = 1.4, 1.0
-            a_front, a_xray = 0.78, 0.25
+            line_shader.bind()
+            try:
+                line_shader.uniform_float("viewportSize", vp_size)
+            except Exception:
+                is_poly = False
+            if xray_batch is not None:
+                gpu.state.depth_test_set("GREATER")
+                if is_poly:
+                    line_shader.uniform_float("lineWidth", 1.0)
+                line_shader.uniform_float("color", (0.75, 0.78, 0.85, 0.25))
+                xray_batch.draw(line_shader)
+            if front_batch is not None:
+                gpu.state.depth_test_set("LESS_EQUAL")
+                if is_poly:
+                    line_shader.uniform_float("lineWidth", 1.4)
+                line_shader.uniform_float("color", (0.75, 0.78, 0.85, 0.78))
+                front_batch.draw(line_shader)
 
-        # Pass A: Occluded lines only when Blender X-Ray (Alt+Z) or obj.show_in_front is enabled
-        if use_xray or obj.show_in_front:
-            gpu.state.depth_test_set("GREATER")
-            if is_poly:
-                line_shader.uniform_float("lineWidth", w_xray)
-            line_shader.uniform_float("color", (rgb[0], rgb[1], rgb[2], a_xray))
-            batch.draw(line_shader)
+    # 2. Draw selected/active cutter(s) via cached local GPUBatch + GPU matrix push (0 VBO allocs on drag!)
+    if sel_objs or edit_objs:
+        line_shader.bind()
+        try:
+            line_shader.uniform_float("viewportSize", vp_size)
+        except Exception:
+            is_poly = False
 
-        # Pass B: Depth-tested visible outline (occluded naturally behind walls/roof)
-        gpu.state.depth_test_set("LESS_EQUAL")
-        if is_poly:
-            line_shader.uniform_float("lineWidth", w_front)
-        line_shader.uniform_float("color", (rgb[0], rgb[1], rgb[2], a_front))
-        batch.draw(line_shader)
+        for obj, is_active in sel_objs:
+            batch = _get_cutter_local_batch(obj, line_shader)
+            if batch is None:
+                continue
+            if is_active:
+                rgb = (1.0, 0.64, 0.16)
+                w_front, w_xray = 2.2, 1.4
+                a_front, a_xray = 1.0, 0.45
+            else:
+                rgb = (1.0, 0.45, 0.08)
+                w_front, w_xray = 1.9, 1.2
+                a_front, a_xray = 0.95, 0.38
+
+            gpu.matrix.push()
+            try:
+                gpu.matrix.multiply_matrix(obj.matrix_world)
+                if use_xray or obj.show_in_front:
+                    gpu.state.depth_test_set("GREATER")
+                    if is_poly:
+                        line_shader.uniform_float("lineWidth", w_xray)
+                    line_shader.uniform_float("color", (rgb[0], rgb[1], rgb[2], a_xray))
+                    batch.draw(line_shader)
+
+                gpu.state.depth_test_set("LESS_EQUAL")
+                if is_poly:
+                    line_shader.uniform_float("lineWidth", w_front)
+                line_shader.uniform_float("color", (rgb[0], rgb[1], rgb[2], a_front))
+                batch.draw(line_shader)
+            finally:
+                gpu.matrix.pop()
+
+        for obj in edit_objs:
+            _draw_edit_mode_cutter_overlay(obj, line_shader, is_poly)
 
 
-def _build_piece_wire_batches(
-    p_subs: Sequence[tuple],
-    z_col: tuple[float, float, float, float],
-) -> list[tuple[object, tuple[float, float, float, float]]]:
-    """Turn the cut-piece triangle batches into zone-colored line batches for Hole + Wire."""
-    line_shader = _get_line_shader()
-    if line_shader is None:
-        return []
-    result: list[tuple[object, tuple[float, float, float, float]]] = []
+def _extract_wire_points_from_submeshes(p_subs: Sequence[tuple]) -> np.ndarray | None:
+    """Turn cut-piece triangle arrays into flat `(E*2, 3)` float32 edge endpoints."""
+    parts: list[np.ndarray] = []
     for item in p_subs:
         if len(item) < 2:
             continue
@@ -1600,19 +1825,51 @@ def _build_piece_wire_batches(
             (tris[:, [0, 1], :], tris[:, [1, 2], :], tris[:, [2, 0], :]),
             axis=1,
         )
-        pts = np.ascontiguousarray(edges.reshape(-1, 3), dtype=np.float32)
-        if pts.shape[0] == 0:
+        parts.append(edges.reshape(-1, 3))
+    if not parts:
+        return None
+    return np.ascontiguousarray(np.concatenate(parts, axis=0), dtype=np.float32)
+
+
+def _rebuild_dirty_piece_wireframes(state: dict, line_shader) -> None:
+    """Lazily build merged wireframe batches ONLY for dirty zone buckets when in MAIN_WIRE mode."""
+    dirty: set[tuple[str, int]] = state.get("piece_wire_dirty")
+    if not dirty:
+        return
+    wire_buckets: dict[tuple[str, int], tuple[tuple[float, float, float, float], object]] = state["piece_wire_buckets"]
+    piece_raw: dict[int, tuple[Sequence[tuple], tuple[float, float, float, float], str]] = state["piece_raw_by_id"]
+    bucket_members: dict[tuple[str, int], set[int]] = state["bucket_members"]
+
+    for bkey in list(dirty):
+        members = bucket_members.get(bkey)
+        if not members:
+            wire_buckets.pop(bkey, None)
             continue
-        try:
-            batch = batch_for_shader(line_shader, "LINES", {"pos": pts})
-        except Exception:
-            continue
-        result.append((batch, z_col))
-    return result
+        pts_list: list[np.ndarray] = []
+        z_col = (1.0, 0.5, 0.12, 1.0)
+        for cid in members:
+            entry = piece_raw.get(cid)
+            if entry is None:
+                continue
+            subs, p_col, _p_z = entry
+            z_col = p_col
+            wpts = _extract_wire_points_from_submeshes(subs)
+            if wpts is not None and wpts.shape[0] > 0:
+                pts_list.append(wpts)
+        if pts_list:
+            merged = np.ascontiguousarray(np.concatenate(pts_list, axis=0), dtype=np.float32)
+            try:
+                batch = batch_for_shader(line_shader, "LINES", {"pos": merged})
+                wire_buckets[bkey] = (z_col, batch)
+            except Exception:
+                wire_buckets.pop(bkey, None)
+        else:
+            wire_buckets.pop(bkey, None)
+    dirty.clear()
 
 
 def _draw_piece_wireframes() -> None:
-    """Overlay the removed/cut meshes as wireframe in their cutter zone color."""
+    """Overlay the removed/cut meshes as wireframe in their cutter zone color (lazily built)."""
     line_shader = _get_line_shader()
     if line_shader is None:
         return
@@ -1635,7 +1892,10 @@ def _draw_piece_wireframes() -> None:
     except Exception:
         pass
     for state in _GPU_STATE.values():
-        for batch, z_col in state.get("piece_wire", ()):
+        _rebuild_dirty_piece_wireframes(state, line_shader)
+        for z_col, batch in state.get("piece_wire_buckets", {}).values():
+            if batch is None:
+                continue
             line_shader.uniform_float("color", (z_col[0], z_col[1], z_col[2], 0.85))
             batch.draw(line_shader)
 
@@ -1674,17 +1934,15 @@ def _draw_callback() -> None:
                     mvp,
                     fallback_tex,
                     mat_infos,
-                    state["rem_batches"],
+                    state["rem_flat"],
                     zone_tint=(0.0, 0.0, 0.0, 0.0),
                     grid_strength=0.0,
                 )
 
             if draw_pieces:
-                for p_entry in state["piece_batches"]:
-                    if len(p_entry) >= 3:
-                        p_subs, z_col, p_zone = p_entry[0], p_entry[1], p_entry[2]
-                    else:
-                        p_subs, z_col, p_zone = p_entry[0], p_entry[1], "A"
+                for (p_zone, _bidx), (z_col, p_subs) in state["piece_buckets"].items():
+                    if not p_subs:
+                        continue
                     if sel_zones and p_zone not in sel_zones:
                         continue
                     if _SHOW_GRID:
@@ -1707,7 +1965,7 @@ def _draw_callback() -> None:
         if _DISPLAY_MODE == "MAIN_WIRE":
             _draw_piece_wireframes()
 
-        # Pass 3: Dual-pass X-Ray Cutter Wireframes (visible immediately even inside building!)
+        # Pass 3: Dual-pass X-Ray Cutter Wireframes (batched O(1) draw calls for 500 boxes!)
         _draw_session_cutters_xray()
     except Exception as exc:
         print(f"[FullDestruc_Tool] Textured GPU Preview draw error: {exc}")
@@ -1803,20 +2061,11 @@ def _build_submesh_batches(
     return batches
 
 
-def update_target_gpu_batches(
-    target_name: str,
+def _resolve_target_materials(
     src_materials: Sequence[bpy.types.Material | None],
     cut_material: bpy.types.Material | None,
-    rem_submeshes: Sequence[tuple],
-    pieces_submeshes: Sequence[tuple[Sequence[tuple], tuple[float, float, float, float]]],
-) -> None:
-    """Upload material-grouped world-space NumPy arrays from Rust straight into GPU VRAM batches."""
+) -> list[dict]:
     global _LAST_MAT_DEBUG
-    basic_shader = _get_preview_shader()
-    multi_shader = _get_multimat_shader()
-    if basic_shader is None and multi_shader is None:
-        return
-
     mat_slots: list[bpy.types.Material | None] = list(src_materials)
     if cut_material is not None and cut_material not in mat_slots:
         mat_slots.append(cut_material)
@@ -1828,27 +2077,413 @@ def update_target_gpu_batches(
         mat_infos.append(desc)
         dbg_notes.append(f"[{idx}] {desc['note']}")
     _LAST_MAT_DEBUG = dbg_notes
+    return mat_infos
 
+
+def _rebuild_rem_flat(state: dict) -> None:
+    """Flatten chunked remaining batches sorted by `(is_multi, mat_id)` for minimal GPU material binds."""
+    flat: list[tuple[int, bool, object]] = []
+    for chunk_batches in state["rem_chunks"].values():
+        if chunk_batches:
+            flat.extend(chunk_batches)
+    for island_batches in state.get("rem_island_buckets", {}).values():
+        if island_batches:
+            flat.extend(island_batches)
+    flat.sort(key=lambda item: (1 if item[1] else 0, item[0]))
+    state["rem_flat"] = flat
+
+
+def _assign_rem_island_bucket(state: dict, cid: int) -> int:
+    bucket_of: dict[int, int] = state["rem_island_bucket_of"]
+    members_map: dict[int, set[int]] = state["rem_island_members"]
+    cur = bucket_of.get(cid)
+    if cur is not None:
+        members_map.setdefault(cur, set()).add(cid)
+        return cur
+    b_idx = 0
+    while True:
+        members = members_map.get(b_idx)
+        if members is None or len(members) < _PIECE_BUCKET_SIZE:
+            members_map.setdefault(b_idx, set()).add(cid)
+            bucket_of[cid] = b_idx
+            return b_idx
+        b_idx += 1
+
+
+def _remove_rem_island_bucket(state: dict, cid: int) -> int | None:
+    bucket_of: dict[int, int] = state["rem_island_bucket_of"]
+    members_map: dict[int, set[int]] = state["rem_island_members"]
+    old = bucket_of.pop(cid, None)
+    if old is not None:
+        m = members_map.get(old)
+        if m is not None:
+            m.discard(cid)
+            if not m:
+                members_map.pop(old, None)
+    return old
+
+
+def _rebuild_rem_island_bucket(
+    state: dict,
+    b_idx: int,
+    mat_infos: list[dict],
+    basic_shader,
+    multi_shader,
+) -> None:
+    members = state["rem_island_members"].get(b_idx)
+    if not members:
+        state["rem_island_buckets"].pop(b_idx, None)
+        return
+    raw_map = state["rem_island_raw"]
+    by_mat: dict[int, tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]] = {}
+    for cid in members:
+        subs = raw_map.get(cid)
+        if not subs:
+            continue
+        for item in subs:
+            if len(item) >= 5:
+                mid, pos, nor, uv0, uv1 = item[:5]
+            else:
+                mid, pos, nor, uv0 = item[:4]
+                uv1 = uv0
+            if pos.size == 0:
+                continue
+            grp = by_mat.get(mid)
+            if grp is None:
+                grp = ([], [], [], [])
+                by_mat[mid] = grp
+            grp[0].append(pos)
+            grp[1].append(nor)
+            grp[2].append(uv0)
+            grp[3].append(uv1)
+    if not by_mat:
+        state["rem_island_buckets"].pop(b_idx, None)
+        return
+    merged_subs: list[tuple] = []
+    for mid in sorted(by_mat.keys()):
+        p_l, n_l, u0_l, u1_l = by_mat[mid]
+        if len(p_l) == 1:
+            merged_subs.append((mid, p_l[0], n_l[0], u0_l[0], u1_l[0]))
+        else:
+            merged_subs.append(
+                (
+                    mid,
+                    np.ascontiguousarray(np.concatenate(p_l, axis=0), dtype=np.float32),
+                    np.ascontiguousarray(np.concatenate(n_l, axis=0), dtype=np.float32),
+                    np.ascontiguousarray(np.concatenate(u0_l, axis=0), dtype=np.float32),
+                    np.ascontiguousarray(np.concatenate(u1_l, axis=0), dtype=np.float32),
+                )
+            )
+    batches = _build_submesh_batches(merged_subs, mat_infos, basic_shader, multi_shader)
+    if batches:
+        state["rem_island_buckets"][b_idx] = batches
+    else:
+        state["rem_island_buckets"].pop(b_idx, None)
+
+
+def _assign_piece_bucket(state: dict, cid: int, z_let: str) -> tuple[str, int]:
+    """Assign `cid` to a dense per-zone bucket `(z_let, b_idx)` of size <= _PIECE_BUCKET_SIZE."""
+    bucket_of: dict[int, tuple[str, int]] = state["piece_bucket_of"]
+    bucket_members: dict[tuple[str, int], set[int]] = state["bucket_members"]
+    cur = bucket_of.get(cid)
+    if cur is not None and cur[0] == z_let:
+        bucket_members.setdefault(cur, set()).add(cid)
+        return cur
+    if cur is not None:
+        old_m = bucket_members.get(cur)
+        if old_m is not None:
+            old_m.discard(cid)
+            if not old_m:
+                bucket_members.pop(cur, None)
+    b_idx = 0
+    while True:
+        cand = (z_let, b_idx)
+        members = bucket_members.get(cand)
+        if members is None or len(members) < _PIECE_BUCKET_SIZE:
+            bucket_members.setdefault(cand, set()).add(cid)
+            bucket_of[cid] = cand
+            return cand
+        b_idx += 1
+
+
+def _remove_piece_bucket(state: dict, cid: int) -> tuple[str, int] | None:
+    bucket_of: dict[int, tuple[str, int]] = state["piece_bucket_of"]
+    bucket_members: dict[tuple[str, int], set[int]] = state["bucket_members"]
+    old = bucket_of.pop(cid, None)
+    if old is not None:
+        old_m = bucket_members.get(old)
+        if old_m is not None:
+            old_m.discard(cid)
+            if not old_m:
+                bucket_members.pop(old, None)
+    return old
+
+
+def _rebuild_piece_bucket(
+    state: dict,
+    bucket_key: tuple[str, int],
+    mat_infos: list[dict],
+    basic_shader,
+    multi_shader,
+) -> None:
+    """Merge all pieces belonging to `(zone_letter, bucket_idx)` into 1 GPUBatch per material."""
+    members = state["bucket_members"].get(bucket_key)
+    if not members:
+        state["piece_buckets"].pop(bucket_key, None)
+        state["piece_wire_buckets"].pop(bucket_key, None)
+        state["piece_wire_dirty"].discard(bucket_key)
+        return
+
+    piece_raw = state["piece_raw_by_id"]
+    by_mat: dict[int, tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]] = {}
+    z_col = (1.0, 0.5, 0.12, 1.0)
+    found_any = False
+
+    for cid in members:
+        entry = piece_raw.get(cid)
+        if entry is None:
+            continue
+        subs, p_col, _p_z = entry
+        found_any = True
+        z_col = p_col
+        for item in subs:
+            if len(item) >= 5:
+                mid, pos, nor, uv0, uv1 = item[:5]
+            else:
+                mid, pos, nor, uv0 = item[:4]
+                uv1 = uv0
+            if pos.size == 0:
+                continue
+            grp = by_mat.get(mid)
+            if grp is None:
+                grp = ([], [], [], [])
+                by_mat[mid] = grp
+            grp[0].append(pos)
+            grp[1].append(nor)
+            grp[2].append(uv0)
+            grp[3].append(uv1)
+
+    if not found_any or not by_mat:
+        state["piece_buckets"].pop(bucket_key, None)
+        state["piece_wire_buckets"].pop(bucket_key, None)
+        state["piece_wire_dirty"].discard(bucket_key)
+        return
+
+    merged_subs: list[tuple] = []
+    for mid in sorted(by_mat.keys()):
+        p_l, n_l, u0_l, u1_l = by_mat[mid]
+        if len(p_l) == 1:
+            merged_subs.append((mid, p_l[0], n_l[0], u0_l[0], u1_l[0]))
+        else:
+            merged_subs.append(
+                (
+                    mid,
+                    np.ascontiguousarray(np.concatenate(p_l, axis=0), dtype=np.float32),
+                    np.ascontiguousarray(np.concatenate(n_l, axis=0), dtype=np.float32),
+                    np.ascontiguousarray(np.concatenate(u0_l, axis=0), dtype=np.float32),
+                    np.ascontiguousarray(np.concatenate(u1_l, axis=0), dtype=np.float32),
+                )
+            )
+
+    batches = _build_submesh_batches(merged_subs, mat_infos, basic_shader, multi_shader)
+    batches.sort(key=lambda item: (1 if item[1] else 0, item[0]))
+    if batches:
+        state["piece_buckets"][bucket_key] = (z_col, batches)
+        state["piece_wire_dirty"].add(bucket_key)
+    else:
+        state["piece_buckets"].pop(bucket_key, None)
+        state["piece_wire_buckets"].pop(bucket_key, None)
+        state["piece_wire_dirty"].discard(bucket_key)
+
+
+def apply_target_gpu_delta(
+    target_name: str,
+    src_materials: Sequence[bpy.types.Material | None],
+    cut_material: bpy.types.Material | None,
+    updated_chunks: Sequence[tuple[int, Sequence[tuple]]],
+    removed_chunk_ids: Sequence[int],
+    updated_pieces: Sequence[tuple[int, Sequence[tuple]]],
+    removed_piece_ids: Sequence[int],
+    ordered_piece_ids: Sequence[int],
+    piece_meta_by_id: dict[int, tuple[tuple[float, float, float, float], str]],
+) -> None:
+    """v200 Incremental VRAM patch: uploads ONLY dirty chunks & dirty piece buckets (0 ms on untouched 98%!)."""
+    basic_shader = _get_preview_shader()
+    multi_shader = _get_multimat_shader()
+    if basic_shader is None and multi_shader is None:
+        return
+
+    mat_infos = _resolve_target_materials(src_materials, cut_material)
+
+    state = _GPU_STATE.get(target_name)
+    if state is None:
+        state = {
+            "materials": mat_infos,
+            "rem_chunks": {},
+            "rem_island_raw": {},
+            "rem_island_bucket_of": {},
+            "rem_island_members": {},
+            "rem_island_buckets": {},
+            "rem_flat": [],
+            "piece_raw_by_id": {},
+            "piece_bucket_of": {},
+            "bucket_members": {},
+            "piece_buckets": {},
+            "piece_wire_buckets": {},
+            "piece_wire_dirty": set(),
+        }
+        _GPU_STATE[target_name] = state
+    else:
+        state["materials"] = mat_infos
+
+    # 1. Patch dirty remaining chunks:
+    #    - Base chunks (cid < _ISLAND_CHUNK_FLAG) stay 1-to-1 resident in VRAM (untouched 98% untouched!)
+    #    - Tiny island-rem chunks (cid >= _ISLAND_CHUNK_FLAG) are merged into dense 64-island buckets!
+    rem_chunks: dict[int, list[tuple[int, bool, object]]] = state["rem_chunks"]
+    rem_island_raw: dict[int, Sequence[tuple]] = state["rem_island_raw"]
+    dirty_island_buckets: set[int] = set()
+    rem_changed = False
+
+    for rcid in removed_chunk_ids:
+        rcid_i = int(rcid)
+        if rcid_i >= _ISLAND_CHUNK_FLAG:
+            rem_island_raw.pop(rcid_i, None)
+            old_ib = _remove_rem_island_bucket(state, rcid_i)
+            if old_ib is not None:
+                dirty_island_buckets.add(old_ib)
+                rem_changed = True
+        else:
+            if rem_chunks.pop(rcid_i, None) is not None:
+                rem_changed = True
+
+    for cid, submeshes in updated_chunks:
+        cid_i = int(cid)
+        if cid_i >= _ISLAND_CHUNK_FLAG:
+            if submeshes:
+                rem_island_raw[cid_i] = submeshes
+                ib = _assign_rem_island_bucket(state, cid_i)
+                dirty_island_buckets.add(ib)
+            else:
+                rem_island_raw.pop(cid_i, None)
+                old_ib = _remove_rem_island_bucket(state, cid_i)
+                if old_ib is not None:
+                    dirty_island_buckets.add(old_ib)
+            rem_changed = True
+        else:
+            batches = _build_submesh_batches(submeshes, mat_infos, basic_shader, multi_shader)
+            if batches:
+                rem_chunks[cid_i] = batches
+            else:
+                rem_chunks.pop(cid_i, None)
+            rem_changed = True
+
+    for ib in dirty_island_buckets:
+        _rebuild_rem_island_bucket(state, ib, mat_infos, basic_shader, multi_shader)
+    if rem_changed:
+        _rebuild_rem_flat(state)
+
+    # 2. Patch dirty pieces & rebuild ONLY affected dense per-zone merged buckets
+    piece_raw: dict[int, tuple[Sequence[tuple], tuple[float, float, float, float], str]] = state["piece_raw_by_id"]
+    dirty_buckets: set[tuple[str, int]] = set()
+
+    active_id_set = {int(cid) for cid in ordered_piece_ids}
+    # Remove explicitly deleted or no-longer-active pieces
+    to_remove = set(int(rpid) for rpid in removed_piece_ids)
+    for existing_cid in list(piece_raw.keys()):
+        if existing_cid not in active_id_set:
+            to_remove.add(existing_cid)
+
+    for rpid in to_remove:
+        piece_raw.pop(rpid, None)
+        old_b = _remove_piece_bucket(state, rpid)
+        if old_b is not None:
+            dirty_buckets.add(old_b)
+
+    # Apply updated piece geometry
+    for pid, p_subs in updated_pieces:
+        pid_i = int(pid)
+        old_b = state["piece_bucket_of"].get(pid_i)
+        z_col, z_let = piece_meta_by_id.get(pid_i, ((1.0, 0.5, 0.12, 1.0), "A"))
+        if p_subs:
+            piece_raw[pid_i] = (p_subs, z_col, z_let)
+            new_b = _assign_piece_bucket(state, pid_i, z_let)
+            if old_b is not None and old_b != new_b:
+                dirty_buckets.add(old_b)
+            dirty_buckets.add(new_b)
+        else:
+            piece_raw.pop(pid_i, None)
+            rem_b = _remove_piece_bucket(state, pid_i)
+            if rem_b is not None:
+                dirty_buckets.add(rem_b)
+
+    # Also detect zone/color reassignment on existing unchanged pieces
+    for cid in active_id_set:
+        prev = piece_raw.get(cid)
+        if prev is None:
+            continue
+        new_meta = piece_meta_by_id.get(cid)
+        if new_meta is not None and (prev[1] != new_meta[0] or prev[2] != new_meta[1]):
+            old_b = state["piece_bucket_of"].get(cid)
+            piece_raw[cid] = (prev[0], new_meta[0], new_meta[1])
+            new_b = _assign_piece_bucket(state, cid, new_meta[1])
+            if old_b is not None:
+                dirty_buckets.add(old_b)
+            dirty_buckets.add(new_b)
+
+    for bkey in dirty_buckets:
+        _rebuild_piece_bucket(state, bkey, mat_infos, basic_shader, multi_shader)
+
+    _tag_all_view3d_redraw()
+
+
+def update_target_gpu_batches(
+    target_name: str,
+    src_materials: Sequence[bpy.types.Material | None],
+    cut_material: bpy.types.Material | None,
+    rem_submeshes: Sequence[tuple],
+    pieces_submeshes: Sequence[tuple[Sequence[tuple], tuple[float, float, float, float]]],
+) -> None:
+    """Legacy full-upload path (DLL < v200): populates the unified chunk/bucket GPU state."""
+    basic_shader = _get_preview_shader()
+    multi_shader = _get_multimat_shader()
+    if basic_shader is None and multi_shader is None:
+        return
+
+    mat_infos = _resolve_target_materials(src_materials, cut_material)
     rem_batches = _build_submesh_batches(rem_submeshes, mat_infos, basic_shader, multi_shader)
 
-    piece_batches: list[tuple[list[tuple[int, bool, object]], tuple[float, float, float, float], str]] = []
-    piece_wire: list[tuple[object, tuple[float, float, float, float]]] = []
-    for p_item in pieces_submeshes:
+    state = {
+        "materials": mat_infos,
+        "rem_chunks": {0: rem_batches} if rem_batches else {},
+        "rem_island_raw": {},
+        "rem_island_bucket_of": {},
+        "rem_island_members": {},
+        "rem_island_buckets": {},
+        "rem_flat": [],
+        "piece_raw_by_id": {},
+        "piece_bucket_of": {},
+        "bucket_members": {},
+        "piece_buckets": {},
+        "piece_wire_buckets": {},
+        "piece_wire_dirty": set(),
+    }
+    _rebuild_rem_flat(state)
+
+    dirty_buckets: set[tuple[str, int]] = set()
+    for idx, p_item in enumerate(pieces_submeshes):
         if len(p_item) >= 3:
             sub_list, z_col, z_let = p_item[0], p_item[1], str(p_item[2] or "A").strip() or "A"
         else:
             sub_list, z_col, z_let = p_item[0], p_item[1], "A"
-        p_subs = _build_submesh_batches(sub_list, mat_infos, basic_shader, multi_shader)
-        if p_subs:
-            piece_batches.append((p_subs, z_col, z_let))
-            piece_wire.extend(_build_piece_wire_batches(sub_list, z_col))
+        if sub_list:
+            cid = idx + 1
+            state["piece_raw_by_id"][cid] = (sub_list, z_col, z_let)
+            dirty_buckets.add(_assign_piece_bucket(state, cid, z_let))
 
-    _GPU_STATE[target_name] = {
-        "materials": mat_infos,
-        "rem_batches": rem_batches,
-        "piece_batches": piece_batches,
-        "piece_wire": piece_wire,
-    }
+    for bkey in dirty_buckets:
+        _rebuild_piece_bucket(state, bkey, mat_infos, basic_shader, multi_shader)
+
+    _GPU_STATE[target_name] = state
     _tag_all_view3d_redraw()
 
 
@@ -1860,6 +2495,9 @@ def end_drag_preview() -> None:
     _CUTTERS_COL_NAME = ""
     _GPU_STATE.clear()
     _MAT_CACHE.clear()
+    _CUTTER_LOCAL_EDGE_CACHE.clear()
+    _CUTTER_LOCAL_BATCH_CACHE.clear()
+    _UNSEL_WIRE_CACHE.clear()
 
     for obj in _HIDDEN_OBJECTS:
         try:
@@ -1885,7 +2523,8 @@ def register() -> None:
 
 
 def unregister() -> None:
-    global _DRAW_HANDLE, _BASIC_SHADER, _BASIC_SHADER_FAILED, _MULTI_SHADER, _MULTI_SHADER_FAILED, _LINE_SHADER, _FALLBACK_TEX
+    global _DRAW_HANDLE, _BASIC_SHADER, _BASIC_SHADER_FAILED, _MULTI_SHADER, _MULTI_SHADER_FAILED
+    global _LINE_SHADER, _LINE_COLOR_SHADER, _FALLBACK_TEX
     end_drag_preview()
     if _DRAW_HANDLE is not None:
         try:
@@ -1898,4 +2537,6 @@ def unregister() -> None:
     _MULTI_SHADER = None
     _MULTI_SHADER_FAILED = False
     _LINE_SHADER = None
+    _LINE_COLOR_SHADER = None
     _FALLBACK_TEX = None
+
