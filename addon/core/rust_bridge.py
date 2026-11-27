@@ -147,6 +147,31 @@ class FdtGpuPieceDelta(ctypes.Structure):
     ]
 
 
+class FdtGpuChunkOwner(ctypes.Structure):
+    _fields_ = [
+        ("chunk_id", ctypes.c_uint32),
+        ("owner_cutter_id", ctypes.c_uint32),
+    ]
+
+
+class FdtGpuDeltaOutputV200(ctypes.Structure):
+    _fields_ = [
+        ("job_id", ctypes.c_uint64),
+        ("compute_ms", ctypes.c_float),
+        ("recomputed_islands", ctypes.c_uint32),
+        ("num_updated_chunks", ctypes.c_uint32),
+        ("updated_chunks", ctypes.POINTER(FdtGpuChunkDelta)),
+        ("num_removed_chunks", ctypes.c_uint32),
+        ("removed_chunk_ids", ctypes.POINTER(ctypes.c_uint32)),
+        ("num_updated_pieces", ctypes.c_uint32),
+        ("updated_pieces", ctypes.POINTER(FdtGpuPieceDelta)),
+        ("num_removed_pieces", ctypes.c_uint32),
+        ("removed_piece_ids", ctypes.POINTER(ctypes.c_uint32)),
+        ("num_ordered_pieces", ctypes.c_uint32),
+        ("ordered_piece_ids", ctypes.POINTER(ctypes.c_uint32)),
+    ]
+
+
 class FdtGpuDeltaOutput(ctypes.Structure):
     _fields_ = [
         ("job_id", ctypes.c_uint64),
@@ -162,6 +187,8 @@ class FdtGpuDeltaOutput(ctypes.Structure):
         ("removed_piece_ids", ctypes.POINTER(ctypes.c_uint32)),
         ("num_ordered_pieces", ctypes.c_uint32),
         ("ordered_piece_ids", ctypes.POINTER(ctypes.c_uint32)),
+        ("num_chunk_owners", ctypes.c_uint32),
+        ("chunk_owners", ctypes.POINTER(FdtGpuChunkOwner)),
     ]
 
 
@@ -272,6 +299,7 @@ def get_dll() -> ctypes.CDLL | None:
         dll.fdt_session_fetch_cached_eval.restype = ctypes.POINTER(FdtEvalOutput)
 
         if ver >= 200:
+            delta_out_type = FdtGpuDeltaOutput if ver >= 210 else FdtGpuDeltaOutputV200
             dll.fdt_session_submit_async_delta.argtypes = [
                 ctypes.c_uint64,
                 ctypes.c_uint32,
@@ -290,10 +318,18 @@ def get_dll() -> ctypes.CDLL | None:
                 ctypes.c_uint32,
                 ctypes.c_uint64,
             ]
-            dll.fdt_session_poll_gpu_delta.restype = ctypes.POINTER(FdtGpuDeltaOutput)
+            dll.fdt_session_poll_gpu_delta.restype = ctypes.POINTER(delta_out_type)
 
-            dll.fdt_gpu_delta_free.argtypes = [ctypes.POINTER(FdtGpuDeltaOutput)]
+            dll.fdt_gpu_delta_free.argtypes = [ctypes.POINTER(delta_out_type)]
             dll.fdt_gpu_delta_free.restype = None
+
+        if ver >= 210:
+            dll.fdt_session_set_target_async.argtypes = [
+                ctypes.c_uint64,
+                ctypes.c_uint32,
+                ctypes.POINTER(FdtMeshInput),
+            ]
+            dll.fdt_session_set_target_async.restype = ctypes.c_int32
 
         _DLL = dll
         _DLL_VERSION = ver
@@ -313,6 +349,10 @@ def get_dll_version() -> int:
 
 def supports_delta_gpu() -> bool:
     return get_dll_version() >= 200
+
+
+def supports_async_target() -> bool:
+    return get_dll_version() >= 210
 
 
 def is_available() -> bool:
@@ -553,6 +593,7 @@ def write_output_to_mesh(
     src_materials: Sequence[bpy.types.Material | None],
     cut_material: bpy.types.Material | None,
     write_orig_attr: bool = True,
+    apply_custom_normals: bool = True,
 ) -> bool:
     """Write a Rust `FdtMeshOutput` directly into `dst_mesh` via foreach_set.
 
@@ -638,8 +679,9 @@ def write_output_to_mesh(
 
     dst_mesh.update(calc_edges=not has_precomputed_edges)
 
-    # Apply exact custom split normals on commit/rebuild (so working meshes look 100% seamless too!)
-    if write_orig_attr and nrm_3 is not None and len(dst_mesh.loops) == nl:
+    # Apply exact custom split normals on commit/rebuild (skipped on Apply because
+    # `_postprocess_baked_mesh` applies them ONCE on the final baked copy!)
+    if apply_custom_normals and write_orig_attr and nrm_3 is not None and len(dst_mesh.loops) == nl:
         try:
             # Sanitize any degenerate zero-length normals before setting custom normals
             lens = np.linalg.norm(nrm_3, axis=1)
@@ -713,10 +755,19 @@ def _target_signature(obj: bpy.types.Object) -> tuple:
     )
 
 
+def has_session_target(session_id: str, target_obj: bpy.types.Object) -> bool:
+    """Return True if `target_obj` is already uploaded in Rust for `session_id` with matching signature."""
+    entry = _SESSION_CACHE.get(session_id)
+    if entry is None:
+        return False
+    return entry.target_sigs.get(target_obj.name) == _target_signature(target_obj)
+
+
 def ensure_session_target(
     session_id: str,
     target_obj: bpy.types.Object,
     force_upload: bool = False,
+    allow_async: bool = False,
 ) -> tuple[int, int, bool] | None:
     """Ensure `target_obj` is uploaded and cached in Rust. Returns `(handle, target_id, uploaded)`."""
     dll = get_dll()
@@ -738,7 +789,10 @@ def ensure_session_target(
         inp, keepalive = mesh_to_input(
             target_obj.data, _compute_true_matrix_world(target_obj), include_uvs=True
         )
-        rc = int(dll.fdt_session_set_target(entry.handle, tid, ctypes.byref(inp)))
+        if allow_async and supports_async_target():
+            rc = int(dll.fdt_session_set_target_async(entry.handle, tid, ctypes.byref(inp)))
+        else:
+            rc = int(dll.fdt_session_set_target(entry.handle, tid, ctypes.byref(inp)))
         del keepalive
         if rc != 0:
             return None
@@ -747,6 +801,13 @@ def ensure_session_target(
         uploaded = True
 
     return entry.handle, tid, uploaded
+
+
+def preupload_target_async(session_id: str, target_obj: bpy.types.Object) -> bool:
+    """Kick off background target BVH + SpatialChunks + Base GPU build immediately on Enter Cut Mode."""
+    if not supports_async_target():
+        return False
+    return ensure_session_target(session_id, target_obj, allow_async=True) is not None
 
 
 def evaluate_target_with_cutters(
@@ -760,6 +821,8 @@ def evaluate_target_with_cutters(
     piece_objs: Sequence[bpy.types.Object | None],
     is_live: bool = False,
     force_write: bool = False,
+    include_edges: bool | None = None,
+    apply_custom_normals: bool = True,
 ) -> tuple[bool, list[bool]]:
     """Run Rust sequential split for `target_obj` against `cutter_objs` and write outputs directly.
 
@@ -804,6 +867,7 @@ def evaluate_target_with_cutters(
 
         t_extract_done = time.perf_counter()
 
+        gen_edges = bool(is_live) if include_edges is None else bool(include_edges)
         eval_ptr = dll.fdt_session_eval_cutters(
             handle,
             tid,
@@ -811,7 +875,7 @@ def evaluate_target_with_cutters(
             nc,
             cut_mat_idx,
             ctypes.c_float(float(uv_scale)),
-            ctypes.c_uint8(1 if is_live else 0),
+            ctypes.c_uint8(1 if gen_edges else 0),
         )
         t_rust_done = time.perf_counter()
         if not eval_ptr:
@@ -845,6 +909,7 @@ def evaluate_target_with_cutters(
                         src_materials,
                         cut_material,
                         write_orig_attr=write_orig_attr,
+                        apply_custom_normals=apply_custom_normals,
                     )
 
             pieces_ok: list[bool] = []
@@ -871,6 +936,7 @@ def evaluate_target_with_cutters(
                             src_materials,
                             cut_material,
                             write_orig_attr=write_orig_attr,
+                            apply_custom_normals=apply_custom_normals,
                         )
                         pieces_ok.append(ok)
                     else:
@@ -1049,7 +1115,7 @@ def submit_target_async_delta(
     if not supports_delta_gpu():
         return submit_target_async(session_id, target_obj, cutter_objs, depsgraph, cut_material, uv_scale)
 
-    info = ensure_session_target(session_id, target_obj)
+    info = ensure_session_target(session_id, target_obj, allow_async=True)
     if info is None:
         return 0
     handle, tid, _ = info
@@ -1123,7 +1189,7 @@ def poll_target_gpu_delta(
     target_obj: bpy.types.Object,
     last_seen_job_id: int,
 ) -> dict | None:
-    """v200 Non-blocking Delta GPU poll: returns ONLY changed chunks & pieces (0 ms on untouched 98%!)."""
+    """v210 Non-blocking Delta GPU poll: returns ONLY changed chunks, owner flips, & boundary pieces."""
     dll = get_dll()
     if dll is None or not supports_delta_gpu():
         return None
@@ -1169,12 +1235,22 @@ def poll_target_gpu_delta(
         if nop > 0 and bool(out.ordered_piece_ids):
             ordered_piece_ids = [int(out.ordered_piece_ids[i]) for i in range(nop)]
 
+        chunk_owners: list[tuple[int, int]] = []
+        if _DLL_VERSION >= 210:
+            nco = int(out.num_chunk_owners)
+            if nco > 0 and bool(out.chunk_owners):
+                chunk_owners = [
+                    (int(out.chunk_owners[i].chunk_id), int(out.chunk_owners[i].owner_cutter_id))
+                    for i in range(nco)
+                ]
+
         return {
             "job_id": int(out.job_id),
             "compute_ms": float(out.compute_ms),
             "recomputed_islands": int(out.recomputed_islands),
             "updated_chunks": updated_chunks,
             "removed_chunk_ids": removed_chunk_ids,
+            "chunk_owners": chunk_owners,
             "updated_pieces": updated_pieces,
             "removed_piece_ids": removed_piece_ids,
             "ordered_piece_ids": ordered_piece_ids,
@@ -1189,6 +1265,9 @@ def commit_target_cached_eval(
     cut_material: bpy.types.Material | None,
     res_obj: bpy.types.Object | None,
     piece_objs: Sequence[bpy.types.Object | None],
+    write_orig_attr: bool = False,
+    include_edges: bool = True,
+    apply_custom_normals: bool = True,
 ) -> tuple[bool, list[bool]]:
     """Fetch the already-computed Rust cached result (0 ms recompute) and write into real Blender meshes."""
     t_start = time.perf_counter()
@@ -1206,7 +1285,9 @@ def commit_target_cached_eval(
     src_materials = [src_mesh.materials[i] for i in range(len(src_mesh.materials))]
     uv_names = [uv.name for uv in _ordered_uv_layers(src_mesh)]
 
-    eval_ptr = dll.fdt_session_fetch_cached_eval(entry.handle, tid, ctypes.c_uint8(1))
+    eval_ptr = dll.fdt_session_fetch_cached_eval(
+        entry.handle, tid, ctypes.c_uint8(1 if include_edges else 0)
+    )
     t_fetch_done = time.perf_counter()
     if not eval_ptr:
         return False, []
@@ -1226,7 +1307,8 @@ def commit_target_cached_eval(
                 uv_names,
                 src_materials,
                 cut_material,
-                write_orig_attr=False,
+                write_orig_attr=write_orig_attr,
+                apply_custom_normals=apply_custom_normals,
             )
 
         pieces_ok: list[bool] = []
@@ -1245,7 +1327,8 @@ def commit_target_cached_eval(
                     uv_names,
                     src_materials,
                     cut_material,
-                    write_orig_attr=False,
+                    write_orig_attr=write_orig_attr,
+                    apply_custom_normals=apply_custom_normals,
                 )
                 pieces_ok.append(ok)
             else:

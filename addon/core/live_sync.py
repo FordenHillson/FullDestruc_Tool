@@ -323,6 +323,7 @@ def _gpu_poll_timer() -> float | None:
                         res["removed_piece_ids"],
                         res["ordered_piece_ids"],
                         piece_meta_by_id,
+                        chunk_owners=res.get("chunk_owners", ()),
                     )
                     gpu_upload_ms = (time.perf_counter() - t_p0) * 1000.0
                     delta_tris = sum(

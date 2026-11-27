@@ -1962,6 +1962,28 @@ def _draw_callback() -> None:
                         grid_strength=gs,
                     )
 
+                for p_zone, (z_col, owned_subs) in state.get("piece_owned_chunks", {}).items():
+                    if not owned_subs:
+                        continue
+                    if sel_zones and p_zone not in sel_zones:
+                        continue
+                    if _SHOW_GRID:
+                        zt = (z_col[0], z_col[1], z_col[2], 0.22)
+                        gs = 0.65
+                    else:
+                        zt = (0.0, 0.0, 0.0, 0.0)
+                        gs = 0.0
+                    _draw_submesh_list(
+                        basic_shader,
+                        multi_shader,
+                        mvp,
+                        fallback_tex,
+                        mat_infos,
+                        owned_subs,
+                        zone_tint=zt,
+                        grid_strength=gs,
+                    )
+
         if _DISPLAY_MODE == "MAIN_WIRE":
             _draw_piece_wireframes()
 
@@ -2081,16 +2103,51 @@ def _resolve_target_materials(
 
 
 def _rebuild_rem_flat(state: dict) -> None:
-    """Flatten chunked remaining batches sorted by `(is_multi, mat_id)` for minimal GPU material binds."""
+    """Flatten chunked remaining batches sorted by `(is_multi, mat_id)` for minimal GPU material binds.
+
+    v210: base chunks whose `base_chunk_owner[cid] > 0` are excluded from Remaining and drawn
+    as Pieces in `_rebuild_piece_owned_chunks` with ZERO VRAM re-upload!
+    """
     flat: list[tuple[int, bool, object]] = []
-    for chunk_batches in state["rem_chunks"].values():
-        if chunk_batches:
+    owners: dict[int, int] = state.get("base_chunk_owner", {})
+    for cid, chunk_batches in state["rem_chunks"].items():
+        if chunk_batches and owners.get(cid, 0) == 0:
             flat.extend(chunk_batches)
     for island_batches in state.get("rem_island_buckets", {}).values():
         if island_batches:
             flat.extend(island_batches)
     flat.sort(key=lambda item: (1 if item[1] else 0, item[0]))
     state["rem_flat"] = flat
+
+
+def _rebuild_piece_owned_chunks(state: dict) -> None:
+    """Group static base chunks owned by cutters into per-zone Piece draw lists (0 bytes VRAM copy!)."""
+    owners: dict[int, int] = state.get("base_chunk_owner", {})
+    if not owners:
+        state["piece_owned_chunks"] = {}
+        return
+    rem_chunks: dict[int, list[tuple[int, bool, object]]] = state["rem_chunks"]
+    meta_map: dict[int, tuple[tuple[float, float, float, float], str]] = state.get("piece_meta_by_id", {})
+    by_zone: dict[str, tuple[tuple[float, float, float, float], list[tuple[int, bool, object]]]] = {}
+
+    for cid, owner_cid in owners.items():
+        if owner_cid <= 0:
+            continue
+        batches = rem_chunks.get(cid)
+        if not batches:
+            continue
+        z_col, z_let = meta_map.get(owner_cid, ((1.0, 0.5, 0.12, 1.0), "A"))
+        entry = by_zone.get(z_let)
+        if entry is None:
+            by_zone[z_let] = (z_col, list(batches))
+        else:
+            entry[1].extend(batches)
+
+    out: dict[str, tuple[tuple[float, float, float, float], list[tuple[int, bool, object]]]] = {}
+    for z_let, (z_col, blist) in by_zone.items():
+        blist.sort(key=lambda item: (1 if item[1] else 0, item[0]))
+        out[z_let] = (z_col, blist)
+    state["piece_owned_chunks"] = out
 
 
 def _assign_rem_island_bucket(state: dict, cid: int) -> int:
@@ -2306,8 +2363,9 @@ def apply_target_gpu_delta(
     removed_piece_ids: Sequence[int],
     ordered_piece_ids: Sequence[int],
     piece_meta_by_id: dict[int, tuple[tuple[float, float, float, float], str]],
+    chunk_owners: Sequence[tuple[int, int]] = (),
 ) -> None:
-    """v200 Incremental VRAM patch: uploads ONLY dirty chunks & dirty piece buckets (0 ms on untouched 98%!)."""
+    """v210 Incremental VRAM patch: uploads ONLY dirty boundary chunks & flips interior chunk owners in 0 ms!"""
     basic_shader = _get_preview_shader()
     multi_shader = _get_multimat_shader()
     if basic_shader is None and multi_shader is None:
@@ -2320,6 +2378,9 @@ def apply_target_gpu_delta(
         state = {
             "materials": mat_infos,
             "rem_chunks": {},
+            "base_chunk_owner": {},
+            "piece_meta_by_id": {},
+            "piece_owned_chunks": {},
             "rem_island_raw": {},
             "rem_island_bucket_of": {},
             "rem_island_members": {},
@@ -2336,13 +2397,19 @@ def apply_target_gpu_delta(
     else:
         state["materials"] = mat_infos
 
+    prev_meta = state.get("piece_meta_by_id", {})
+    meta_changed = (prev_meta != piece_meta_by_id)
+    state["piece_meta_by_id"] = dict(piece_meta_by_id)
+
     # 1. Patch dirty remaining chunks:
     #    - Base chunks (cid < _ISLAND_CHUNK_FLAG) stay 1-to-1 resident in VRAM (untouched 98% untouched!)
     #    - Tiny island-rem chunks (cid >= _ISLAND_CHUNK_FLAG) are merged into dense 64-island buckets!
     rem_chunks: dict[int, list[tuple[int, bool, object]]] = state["rem_chunks"]
+    base_chunk_owner: dict[int, int] = state["base_chunk_owner"]
     rem_island_raw: dict[int, Sequence[tuple]] = state["rem_island_raw"]
     dirty_island_buckets: set[int] = set()
     rem_changed = False
+    owners_changed = False
 
     for rcid in removed_chunk_ids:
         rcid_i = int(rcid)
@@ -2355,6 +2422,8 @@ def apply_target_gpu_delta(
         else:
             if rem_chunks.pop(rcid_i, None) is not None:
                 rem_changed = True
+            if base_chunk_owner.pop(rcid_i, None) is not None:
+                owners_changed = True
 
     for cid, submeshes in updated_chunks:
         cid_i = int(cid)
@@ -2376,11 +2445,28 @@ def apply_target_gpu_delta(
             else:
                 rem_chunks.pop(cid_i, None)
             rem_changed = True
+            if cid_i in base_chunk_owner:
+                owners_changed = True
+
+    for cid, owner_cid in chunk_owners:
+        cid_i = int(cid)
+        own_i = int(owner_cid)
+        if own_i <= 0:
+            if base_chunk_owner.pop(cid_i, None) is not None:
+                owners_changed = True
+                rem_changed = True
+        else:
+            if base_chunk_owner.get(cid_i, 0) != own_i:
+                base_chunk_owner[cid_i] = own_i
+                owners_changed = True
+                rem_changed = True
 
     for ib in dirty_island_buckets:
         _rebuild_rem_island_bucket(state, ib, mat_infos, basic_shader, multi_shader)
     if rem_changed:
         _rebuild_rem_flat(state)
+    if owners_changed or (meta_changed and base_chunk_owner):
+        _rebuild_piece_owned_chunks(state)
 
     # 2. Patch dirty pieces & rebuild ONLY affected dense per-zone merged buckets
     piece_raw: dict[int, tuple[Sequence[tuple], tuple[float, float, float, float], str]] = state["piece_raw_by_id"]
@@ -2455,6 +2541,9 @@ def update_target_gpu_batches(
     state = {
         "materials": mat_infos,
         "rem_chunks": {0: rem_batches} if rem_batches else {},
+        "base_chunk_owner": {},
+        "piece_meta_by_id": {},
+        "piece_owned_chunks": {},
         "rem_island_raw": {},
         "rem_island_bucket_of": {},
         "rem_island_members": {},
