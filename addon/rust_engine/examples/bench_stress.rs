@@ -407,22 +407,142 @@ fn bench_500_boxes_on_mesh(label: &str, grid_n: usize, num_boxes: usize) {
     );
 }
 
+fn bench_4m_tri_monkey_large_box() {
+    // 577 x 577 x 6 = 1,997,574 quads = 3,995,148 triangles (~4,000,000 tris!)
+    // Scaled down to Suzanne size (~2.0m x 2.0m x 1.5m) so a standard 2.0m cutter box
+    // covers > 50% of the ENTIRE 4M-triangle mesh!
+    let n = 577usize;
+    let np_expected = 6 * n * n;
+    println!(
+        "\n=== Case E: 4,000,000-Triangle Suzanne-Scale Mesh ({} quads / {} tris) + Giant 2.0m Box (>50% coverage!) ===",
+        np_expected,
+        np_expected * 2
+    );
+    let rss0 = read_rss_mb();
+    let t_gen = Instant::now();
+    let mut base = make_subdivided_building(n);
+    // Rescale 20x20x10m building -> 2.4m x 2.0m x 1.6m (Suzanne dimensions)
+    for p in &mut base.positions {
+        p[0] *= 0.12;
+        p[1] *= 0.10;
+        p[2] *= 0.16;
+    }
+    let gen_ms = t_gen.elapsed().as_secs_f64() * 1000.0;
+
+    let t_up = Instant::now();
+    let mut state = IslandTargetState::new(base, DMat4::IDENTITY);
+    let up_ms = t_up.elapsed().as_secs_f64() * 1000.0;
+
+    let t_pre = Instant::now();
+    state.prewarm_base_gpu();
+    let pre_ms = t_pre.elapsed().as_secs_f64() * 1000.0;
+    let rss_up = read_rss_mb();
+    println!(
+        "  Mesh gen: {:.1} ms | Target BVH+Chunks ({} chunks): {:.1} ms | Prewarm Base GPU: {:.1} ms | RSS: {:.1} MB (+{:.1} MB)",
+        gen_ms,
+        state.chunks.len(),
+        up_ms,
+        pre_ms,
+        rss_up,
+        (rss_up - rss0).max(0.0)
+    );
+
+    // Initial 0-cutter GPU sync (uploads base chunks once)
+    state.evaluate_active(&[], 4, 0.5, true);
+    let _init_snap = state.take_gpu_delta();
+
+    // Place a giant 2.0m x 2.0m x 2.0m box covering >50% of Suzanne (x in [0.0, 2.0])
+    let cid = 1u32;
+    let ordered = vec![cid];
+    let c0 = make_box([1.0, 0.05, 0.02], [1.0, 1.0, 1.0], 0);
+    let t_first = Instant::now();
+    state.upsert_cutters(vec![(cid, c0, DMat4::IDENTITY)]);
+    state.evaluate_active(&ordered, 4, 0.5, true);
+    let first_delta = state.take_gpu_delta();
+    let first_ms = t_first.elapsed().as_secs_f64() * 1000.0;
+    let first_owned = first_delta.chunk_owners.iter().filter(|&&(_, o)| o == cid).count();
+    let first_mb = (first_delta.updated_chunks.iter().map(|(_, g)| gpu_bytes(g)).sum::<usize>()
+        + first_delta.updated_pieces.iter().map(|(_, g)| gpu_bytes(g)).sum::<usize>()) as f64
+        / (1024.0 * 1024.0);
+    println!(
+        "  First Giant Cut (2m box covering >50% of 4M tris): {:.1} ms | {} interior chunks flipped (0 VRAM upload!) | delta={:.2} MB",
+        first_ms, first_owned, first_mb
+    );
+
+    // Drag the giant 2.0m box across the 4M-triangle Suzanne for 15 frames
+    let mut drag_ms = Vec::with_capacity(15);
+    let mut delta_mb_sum = 0.0f64;
+    let mut owner_flips_sum = 0usize;
+    for step in 0..15 {
+        let cx = 0.85 + (step as f64) * 0.025;
+        let cm = make_box([cx, 0.05, 0.02], [1.0, 1.0, 1.0], 0);
+        let t0 = Instant::now();
+        state.upsert_cutters(vec![(cid, cm, DMat4::IDENTITY)]);
+        state.evaluate_active(&ordered, 4, 0.5, true);
+        let delta = state.take_gpu_delta();
+        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+        let mb = (delta.updated_chunks.iter().map(|(_, g)| gpu_bytes(g)).sum::<usize>()
+            + delta.updated_pieces.iter().map(|(_, g)| gpu_bytes(g)).sum::<usize>()) as f64
+            / (1024.0 * 1024.0);
+        drag_ms.push(dt);
+        delta_mb_sum += mb;
+        owner_flips_sum += delta.chunk_owners.len();
+    }
+    drag_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let avg = drag_ms.iter().sum::<f64>() / drag_ms.len() as f64;
+    let p95 = drag_ms[(drag_ms.len() as f64 * 0.95).min((drag_ms.len() - 1) as f64) as usize];
+    println!(
+        "  Drag 15f [Giant 2m Box on 4M Tris]: avg={:.1} ms ({:.1} Hz update!) | p95={:.1} ms | max={:.1} ms | avg delta={:.2} MB/f | avg owner flips={:.1}/f",
+        avg,
+        1000.0 / avg.max(0.01),
+        p95,
+        drag_ms.last().unwrap(),
+        delta_mb_sum / drag_ms.len() as f64,
+        owner_flips_sum as f64 / drag_ms.len() as f64,
+    );
+
+    // Measure Apply full assembly on 4M tris
+    let t_apply = Instant::now();
+    let (rem, pieces) = state.assemble_full_eval();
+    let apply_ms = t_apply.elapsed().as_secs_f64() * 1000.0;
+    println!(
+        "  Apply Full Assembly (4M Tris): {:.1} ms (rem={} quads, piece={} quads) | Peak RSS: {:.1} MB",
+        apply_ms,
+        rem.num_polys(),
+        pieces.first().map_or(0, |p| p.num_polys()),
+        read_rss_mb()
+    );
+    assert!(rem.num_polys() > 500_000, "Remaining must keep outside half of 4M-tri mesh");
+    assert!(
+        pieces.first().map_or(0, |p| p.num_polys()) > 500_000,
+        "Piece must include all owned interior chunks of 4M-tri mesh"
+    );
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let only_4m = args.iter().any(|a| a == "--4m-only");
+
     println!("==================================================================");
-    println!("  FullDestruc_Tool Rust Engine v2.0 High-Scale Stress Benchmark");
+    println!("  FullDestruc_Tool Rust Engine v2.1 High-Scale Stress Benchmark");
     println!("==================================================================");
 
-    bench_equivalence();
+    if !only_4m {
+        bench_equivalence();
 
-    // Case A: 100 boxes on 21,600-quad (43,200-tri) building
-    bench_500_boxes_on_mesh("Case A: 100 Boxes on 43K-tri Building", 60, 100);
+        // Case A: 100 boxes on 21,600-quad (43,200-tri) building
+        bench_500_boxes_on_mesh("Case A: 100 Boxes on 43K-tri Building", 60, 100);
 
-    // Case B: 500 boxes on 21,600-quad (43,200-tri) building
-    bench_500_boxes_on_mesh("Case B: 500 Boxes on 43K-tri Building", 60, 500);
+        // Case B: 500 boxes on 21,600-quad (43,200-tri) building
+        bench_500_boxes_on_mesh("Case B: 500 Boxes on 43K-tri Building", 60, 500);
 
-    // Case C: 1,000,000-Polygon Mesh (408 x 408 x 6 = 998,784 quads ≈ 1.00M polys / 2.00M tris!) with 100 boxes
-    bench_500_boxes_on_mesh("Case C: 1,000,000 Polygons (2M Tris) + 100 Boxes", 408, 100);
+        // Case C: 1,000,000-Polygon Mesh (408 x 408 x 6 = 998,784 quads ≈ 1.00M polys / 2.00M tris!) with 100 boxes
+        bench_500_boxes_on_mesh("Case C: 1,000,000 Polygons (2M Tris) + 100 Boxes", 408, 100);
 
-    // Case D: 1,000,000-Polygon Mesh (2M Tris) + 500 Boxes!
-    bench_500_boxes_on_mesh("Case D: 1,000,000 Polygons (2M Tris) + 500 Boxes", 408, 500);
+        // Case D: 1,000,000-Polygon Mesh (2M Tris) + 500 Boxes!
+        bench_500_boxes_on_mesh("Case D: 1,000,000 Polygons (2M Tris) + 500 Boxes", 408, 500);
+    }
+
+    // Case E: 4,000,000-Triangle Suzanne-Scale Mesh + Giant 2.0m Box (>50% coverage!)
+    bench_4m_tri_monkey_large_box();
 }

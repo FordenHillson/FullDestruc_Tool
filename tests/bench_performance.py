@@ -772,6 +772,7 @@ def main():
         res0["removed_piece_ids"],
         res0["ordered_piece_ids"],
         meta0,
+        chunk_owners=res0.get("chunk_owners", ()),
     )
     state_1m = gpu_preview._GPU_STATE[target_1m.name]
     print(
@@ -783,7 +784,7 @@ def main():
     assert len(state_1m["piece_wire_buckets"]) == 0, "piece_wire should NOT be built in ALL mode!"
     assert len(state_1m["piece_buckets"]) <= 24, f"Expected <=24 merged piece buckets for 500 pieces, got {len(state_1m['piece_buckets'])}"
 
-    # Drag Box #1 (Layer #1 TOP) for 30 frames via REAL C-ABI v200 Delta + gpu_preview!
+    # Drag Box #1 (Layer #1 TOP) for 30 frames via REAL C-ABI v210 Delta + gpu_preview!
     submit_times = []
     poll_patch_times = []
     rust_times = []
@@ -826,6 +827,7 @@ def main():
             res["removed_piece_ids"],
             res["ordered_piece_ids"],
             meta,
+            chunk_owners=res.get("chunk_owners", ()),
         )
         t_p1 = time.perf_counter()
         poll_patch_times.append((t_p1 - t_p0) * 1000.0)
@@ -1000,6 +1002,183 @@ def main():
         )
     prof_ms = (time.perf_counter() - t_pr0) * 1000.0
     print(f"[PASS] profiler.record_eval (500 samples): {prof_ms:.2f} ms ({prof_ms / 500.0:.4f} ms/sample)")
+
+    # Release S1 1M+500 benchmark memory before running isolated v2.1 tests
+    rust_bridge.destroy_all_sessions()
+    gpu_preview.end_drag_preview()
+
+    # ------------------------------------------------------------------
+    # 9. v2.1 Async Target Upload + Chunk-Level Interior Ownership + Vectorized High-Poly Apply
+    # ------------------------------------------------------------------
+    assert rust_bridge.get_dll_version() >= 210, f"Expected DLL v210+, got {rust_bridge.get_dll_version()}"
+    assert rust_bridge.supports_async_target(), "Expected supports_async_target() == True on v210+"
+
+    # Build a 60x60x6 = 21,600-quad mesh at Suzanne scale ([-1, 1]^3) and upload ASYNC
+    t_sz_mesh = make_subdivided_box_mesh("Suzanne_Mock_Mesh", 1.0, 1.0, 1.0, 60, mat_base)
+    t_sz_obj = _MockObject("Suzanne_Mock", t_sz_mesh)
+    t_a0 = time.perf_counter()
+    assert rust_bridge.preupload_target_async("S_V210", t_sz_obj)
+    async_up_ms = (time.perf_counter() - t_a0) * 1000.0
+
+    # Place a giant 3m box centered at x=1.5 covering the ENTIRE +X half (x in [0, 3])
+    giant_mesh = make_cube_mesh("GiantBox_V210_Mesh", half=1.5)
+    giant_box = _MockObject("GiantBox_V210", giant_mesh, matrix_world=_MockMatrix.Translation((1.5, 0.0, 0.0)))
+    giant_box["fdt_is_cutter"] = True
+    giant_box["fdt_cutter_zone"] = "B"
+
+    jid_v1 = rust_bridge.submit_target_async_delta("S_V210", t_sz_obj, [giant_box], None, mat_cut, 0.5)
+    res_v1 = None
+    while res_v1 is None:
+        res_v1 = rust_bridge.poll_target_gpu_delta("S_V210", t_sz_obj, 0)
+        if res_v1 is None:
+            time.sleep(0.001)
+    assert len(res_v1["chunk_owners"]) > 0, "Expected v210 chunk_owners flips for giant box!"
+    meta_v1 = {res_v1["ordered_piece_ids"][0]: ((0.2, 0.6, 1.0, 1.0), "B")}
+    gpu_preview.apply_target_gpu_delta(
+        t_sz_obj.name,
+        [mat_base],
+        mat_cut,
+        res_v1["updated_chunks"],
+        res_v1["removed_chunk_ids"],
+        res_v1["updated_pieces"],
+        res_v1["removed_piece_ids"],
+        res_v1["ordered_piece_ids"],
+        meta_v1,
+        chunk_owners=res_v1["chunk_owners"],
+    )
+    st_sz = gpu_preview._GPU_STATE[t_sz_obj.name]
+    owned_cnt = len(st_sz["base_chunk_owner"])
+    assert owned_cnt > 0 and "B" in st_sz["piece_owned_chunks"], "Expected owned interior chunks routed to Piece zone B!"
+    # Verify draw callback draws owned chunks with 0 VBO allocs
+    GPU_COUNTERS["batch_for_shader_calls"] = 0
+    gpu_preview._draw_callback()
+    assert GPU_COUNTERS["batch_for_shader_calls"] == 0
+
+    # Move giant box outside -> all owned interior chunks must return to Remaining!
+    giant_box.matrix_world = _MockMatrix.Translation((10.0, 0.0, 0.0))
+    jid_v2 = rust_bridge.submit_target_async_delta(
+        "S_V210", t_sz_obj, [giant_box], None, mat_cut, 0.5, dirty_cutter_names={giant_box.name}
+    )
+    res_v2 = None
+    while res_v2 is None:
+        res_v2 = rust_bridge.poll_target_gpu_delta("S_V210", t_sz_obj, jid_v1)
+        if res_v2 is None:
+            time.sleep(0.001)
+    gpu_preview.apply_target_gpu_delta(
+        t_sz_obj.name,
+        [mat_base],
+        mat_cut,
+        res_v2["updated_chunks"],
+        res_v2["removed_chunk_ids"],
+        res_v2["updated_pieces"],
+        res_v2["removed_piece_ids"],
+        res_v2["ordered_piece_ids"],
+        meta_v1,
+        chunk_owners=res_v2["chunk_owners"],
+    )
+    assert len(st_sz["base_chunk_owner"]) == 0 and len(st_sz["piece_owned_chunks"]) == 0
+    print(
+        f"[PASS] v2.1 Async Target + Chunk Ownership Routing:\n"
+        f"       preupload_target_async={async_up_ms:.2f}ms | {owned_cnt} interior chunks flipped to Piece & released (0 VRAM copy!)"
+    )
+
+    # Vectorized NumPy High-Poly Apply Postprocess benchmark & exactness check (200K quads = 400K tris!)
+    sys.modules.pop("addon.core.apple_bite", None)
+    import importlib
+    real_ab = importlib.import_module("addon.core.apple_bite")
+
+    class _MockAttrData:
+        def __init__(self, arr: np.ndarray):
+            self.arr = arr
+
+        def foreach_get(self, _k: str, dst: np.ndarray):
+            dst[:] = self.arr.ravel()
+
+        def foreach_set(self, _k: str, src: np.ndarray):
+            self.arr = np.asarray(src).copy()
+
+    class _MockAttr:
+        def __init__(self, name: str, data_type: str, domain: str, arr: np.ndarray):
+            self.name = name
+            self.data_type = data_type
+            self.domain = domain
+            self.data = _MockAttrData(arr)
+
+    class _MockAttrMgr(dict):
+        def new(self, name: str, type: str, domain: str):
+            a = _MockAttr(name, type, domain, np.zeros(0, dtype=bool))
+            self[name] = a
+            return a
+
+        def remove(self, attr):
+            self.pop(attr.name, None)
+
+    # Build a synthetic 200,000-quad strip mesh (400,000 tris, 800,000 loops) with 1 orig/cut border + 1 sharp crease
+    nx_hp, ny_hp = 500, 400  # 200,000 quads
+    np_hp = nx_hp * ny_hp
+    nl_hp = np_hp * 4
+    # Horizontal edges: nx_hp * (ny_hp + 1), Vertical edges: (nx_hp + 1) * ny_hp
+    ne_h = nx_hp * (ny_hp + 1)
+    ne_v = (nx_hp + 1) * ny_hp
+    ne_hp = ne_h + ne_v
+    iy_g, ix_g = np.meshgrid(np.arange(ny_hp, dtype=np.int32), np.arange(nx_hp, dtype=np.int32), indexing="ij")
+    v00 = iy_g * (nx_hp + 1) + ix_g
+    v10 = v00 + 1
+    v11 = v00 + (nx_hp + 1) + 1
+    v01 = v00 + (nx_hp + 1)
+    lv_hp = np.stack([v00, v10, v11, v01], axis=-1).ravel()
+    eh_bot = iy_g * nx_hp + ix_g
+    eh_top = (iy_g + 1) * nx_hp + ix_g
+    ev_left = ne_h + iy_g * (nx_hp + 1) + ix_g
+    ev_right = ev_left + 1
+    le_hp = np.stack([eh_bot, ev_right, eh_top, ev_left], axis=-1).ravel()
+
+    orig_hp = np.where(ix_g.ravel() < 250, 1.0, 0.0).astype(np.float32)  # Border along ix=250 (400 edges!)
+    nrm_hp = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (nl_hp, 1))
+    # Add a sharp split-normal crease along ix=100 (400 edges!)
+    left_crease_loops = np.repeat(ix_g.ravel() < 100, 4)
+    nrm_hp[left_crease_loops] = (0.0, 1.0, 0.0)
+
+    class _HpForeach(_ForeachSeq):
+        def foreach_set(self, attr: str, src: np.ndarray):
+            self._attrs[attr] = np.asarray(src).copy()
+
+    hp_mesh = types.SimpleNamespace(
+        polygons=_HpForeach(
+            np_hp,
+            {
+                "loop_start": np.arange(0, nl_hp, 4, dtype=np.int32),
+                "loop_total": np.full(np_hp, 4, dtype=np.int32),
+                "normal": np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (np_hp, 1)).ravel(),
+            },
+        ),
+        loops=_HpForeach(nl_hp, {"edge_index": le_hp, "vertex_index": lv_hp}),
+        edges=_HpForeach(ne_hp, {}),
+        attributes=_MockAttrMgr(),
+        materials=[],
+        custom_normals_set=None,
+    )
+    hp_mesh.normals_split_custom_set = lambda arr: setattr(hp_mesh, "custom_normals_set", arr)
+    hp_mesh.attributes["fdt_orig"] = _MockAttr("fdt_orig", "FLOAT", "FACE", orig_hp)
+    hp_mesh.attributes["fdt_nrm"] = _MockAttr("fdt_nrm", "FLOAT_VECTOR", "CORNER", nrm_hp.ravel())
+    hp_obj = types.SimpleNamespace(name="Monkey_400K_Mock", data=hp_mesh)
+
+    t_hp0 = time.perf_counter()
+    real_ab._postprocess_highpoly_numpy(hp_obj, None)
+    hp_ms = (time.perf_counter() - t_hp0) * 1000.0
+
+    fs_cnt = int(np.sum(hp_mesh.attributes["freestyle_edge"].data.arr))
+    sh_cnt = int(np.sum(hp_mesh.attributes["sharp_edge"].data.arr))
+    assert fs_cnt == ny_hp, f"Expected exactly {ny_hp} cut border freestyle edges, got {fs_cnt}"
+    assert sh_cnt == ny_hp * 2, f"Expected exactly {ny_hp * 2} sharp edges (border + crease), got {sh_cnt}"
+    assert "fdt_nrm" not in hp_mesh.attributes, "Temp fdt_nrm attribute should be removed after restore"
+    assert hp_mesh.custom_normals_set is not None and hp_mesh.custom_normals_set.shape == (nl_hp, 3)
+    assert hp_ms < 500.0, f"Vectorized high-poly postprocess too slow: {hp_ms:.1f} ms"
+    print(
+        f"[PASS] v2.1 Vectorized High-Poly Apply Postprocess (200K quads / 400K tris):\n"
+        f"       elapsed={hp_ms:.1f} ms (vs ~4,500+ ms pure-Python BMesh!) | "
+        f"freestyle_edges={fs_cnt}, sharp_edges={sh_cnt}"
+    )
 
     # Cleanup
     rust_bridge.destroy_all_sessions()
