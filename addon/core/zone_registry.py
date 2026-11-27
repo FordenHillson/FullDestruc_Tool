@@ -131,33 +131,63 @@ def _scene_of(scene=None) -> bpy.types.Scene | None:
     return scene if scene is not None else getattr(bpy.context, "scene", None)
 
 
-def load_zones(scene=None) -> list[ZoneDef]:
-    """Load the Scene registry, restoring missing built-ins and applying renames."""
+_DEFAULT_ZONES_TUPLE: tuple[ZoneDef, ...] = tuple(default_zones())
+_DEFAULT_BY_KEY: dict[str, ZoneDef] = {z.key: z for z in _DEFAULT_ZONES_TUPLE}
+_DEFAULT_BY_TOKEN: dict[str, ZoneDef] = {z.token.casefold(): z for z in _DEFAULT_ZONES_TUPLE}
+
+# Cache: scene_key -> (raw_json_or_none, zones_tuple, by_key, by_token_lower)
+_ZONE_CACHE: dict[int, tuple[str | None, tuple[ZoneDef, ...], dict[str, ZoneDef], dict[str, ZoneDef]]] = {}
+
+
+def _scene_cache_key(sc) -> int:
+    if sc is None:
+        return 0
+    try:
+        return int(sc.as_pointer())
+    except Exception:
+        return id(sc)
+
+
+def invalidate_zone_cache(scene=None) -> None:
+    if scene is None:
+        _ZONE_CACHE.clear()
+    else:
+        _ZONE_CACHE.pop(_scene_cache_key(scene), None)
+
+
+def _get_cached_zones(scene=None) -> tuple[tuple[ZoneDef, ...], dict[str, ZoneDef], dict[str, ZoneDef]]:
     sc = _scene_of(scene)
-    defaults = {z.key: z for z in default_zones()}
+    raw = sc.get(REGISTRY_PROP) if sc is not None else None
+    if not raw:
+        return _DEFAULT_ZONES_TUPLE, _DEFAULT_BY_KEY, _DEFAULT_BY_TOKEN
+
+    skey = _scene_cache_key(sc)
+    cached = _ZONE_CACHE.get(skey)
+    if cached is not None and cached[0] == raw:
+        return cached[1], cached[2], cached[3]
+
+    defaults = _DEFAULT_BY_KEY
     saved: dict[str, ZoneDef] = {}
     custom: list[ZoneDef] = []
-    raw = sc.get(REGISTRY_PROP) if sc is not None else None
-    if raw:
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    zdef = ZoneDef.from_dict(item)
-                    if zdef is None:
-                        continue
-                    if zdef.builtin:
-                        if zdef.key in defaults:
-                            saved[zdef.key] = zdef
-                    else:
-                        custom.append(zdef)
-        except Exception:
-            pass
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                zdef = ZoneDef.from_dict(item)
+                if zdef is None:
+                    continue
+                if zdef.builtin:
+                    if zdef.key in defaults:
+                        saved[zdef.key] = zdef
+                else:
+                    custom.append(zdef)
+    except Exception:
+        pass
 
     # Built-ins always come first; saved entries may rename their token/color.
-    zones: list[ZoneDef] = []
+    zones_list: list[ZoneDef] = []
     seen_tokens: set[str] = set()
     for letter in BUILTIN_ZONES:
         zdef = saved.get(letter, defaults[letter])
@@ -167,16 +197,27 @@ def load_zones(scene=None) -> list[ZoneDef]:
         if token != zdef.token:
             zdef = replace(zdef, token=token)
         seen_tokens.add(token.casefold())
-        zones.append(zdef)
+        zones_list.append(zdef)
 
-    seen_keys = {z.key for z in zones}
+    seen_keys = {z.key for z in zones_list}
     for zdef in custom:
         if zdef.key in seen_keys or zdef.token.casefold() in seen_tokens:
             continue
         seen_keys.add(zdef.key)
         seen_tokens.add(zdef.token.casefold())
-        zones.append(zdef)
-    return zones
+        zones_list.append(zdef)
+
+    zones_tuple = tuple(zones_list)
+    by_key = {z.key: z for z in zones_tuple}
+    by_token = {z.token.casefold(): z for z in zones_tuple}
+    _ZONE_CACHE[skey] = (raw, zones_tuple, by_key, by_token)
+    return zones_tuple, by_key, by_token
+
+
+def load_zones(scene=None) -> list[ZoneDef]:
+    """Load the Scene registry, restoring missing built-ins and applying renames."""
+    zones_tuple, _, _ = _get_cached_zones(scene)
+    return list(zones_tuple)
 
 
 def save_zones(zones: list[ZoneDef], scene=None) -> None:
@@ -184,6 +225,7 @@ def save_zones(zones: list[ZoneDef], scene=None) -> None:
     if sc is None:
         return
     sc[REGISTRY_PROP] = json.dumps([z.to_dict() for z in zones], ensure_ascii=False)
+    invalidate_zone_cache(sc)
     tag_redraw()
 
 
@@ -202,11 +244,12 @@ def tag_redraw() -> None:
 
 def find_zone(key, scene=None) -> ZoneDef | None:
     key = normalize_key(key)
-    for zdef in load_zones(scene):
-        if zdef.key == key:
-            return zdef
-    if len(key) == 1 and key in BUILTIN_ZONES:
-        return next((z for z in default_zones() if z.key == key), None)
+    _, by_key, _ = _get_cached_zones(scene)
+    found = by_key.get(key)
+    if found is not None:
+        return found
+    if len(key) == 1:
+        return _DEFAULT_BY_KEY.get(key)
     return None
 
 
@@ -214,24 +257,28 @@ def find_zone_by_token(token, scene=None) -> ZoneDef | None:
     value = normalize_token(token).casefold()
     if not value:
         return None
-    return next((z for z in load_zones(scene) if z.token.casefold() == value), None)
+    _, _, by_token = _get_cached_zones(scene)
+    return by_token.get(value)
 
 
 def resolve_zone(key, scene=None) -> ZoneDef:
     """Resolve a stored key; legacy tokens fall back to their base, then to A."""
-    found = find_zone(key, scene)
+    norm = normalize_key(key)
+    zones, by_key, by_token = _get_cached_zones(scene)
+    found = by_key.get(norm)
     if found is not None:
         return found
-    zones = load_zones(scene)
-    legacy = find_zone_by_token(key, scene)
-    if legacy is not None:
-        return legacy
+    tok_key = normalize_token(key).casefold()
+    if tok_key:
+        legacy = by_token.get(tok_key)
+        if legacy is not None:
+            return legacy
     # Only structured tokens carry a reliable base letter; arbitrary text falls back to A.
     base = _structured_base(key)
     if base is not None:
-        for zdef in zones:
-            if zdef.key == base:
-                return zdef
+        base_def = by_key.get(base)
+        if base_def is not None:
+            return base_def
     return zones[0]
 
 

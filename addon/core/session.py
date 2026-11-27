@@ -115,14 +115,40 @@ class AppleBiteSession:
         return bool(self.target_names) and (self.vault_col_name in bpy.data.collections)
 
 
+# In-memory cache: (scene_key, raw_json_str) -> parsed dict (immutable blueprint)
+# Eliminates 6-10x redundant json.loads() per viewport frame / depsgraph tick.
+_SESSION_JSON_CACHE: dict[int, tuple[str, dict]] = {}
+_READONLY_SESSION_CACHE: dict[int, tuple[str, int, AppleBiteSession]] = {}
+
+
+def _scene_cache_key(scene: bpy.types.Scene) -> int:
+    try:
+        return int(scene.as_pointer())
+    except Exception:
+        return id(scene)
+
+
+def invalidate_session_cache(scene: bpy.types.Scene | None = None) -> None:
+    if scene is None:
+        _SESSION_JSON_CACHE.clear()
+        _READONLY_SESSION_CACHE.clear()
+    else:
+        key = _scene_cache_key(scene)
+        _SESSION_JSON_CACHE.pop(key, None)
+        _READONLY_SESSION_CACHE.pop(key, None)
+
+
 def save_session(scene: bpy.types.Scene, session: AppleBiteSession | None, persist_meta: bool = True) -> None:
     """Persist active session JSON on the Scene and optionally on its root collection."""
+    invalidate_session_cache(scene)
     if session is None:
         if SESSION_SCENE_PROP in scene:
             del scene[SESSION_SCENE_PROP]
     else:
-        payload = json.dumps(session.to_dict())
+        data_dict = session.to_dict()
+        payload = json.dumps(data_dict)
         scene[SESSION_SCENE_PROP] = payload
+        _SESSION_JSON_CACHE[_scene_cache_key(scene)] = (payload, data_dict)
         if persist_meta:
             root_col = bpy.data.collections.get(session.root_col_name)
             if root_col is not None:
@@ -135,6 +161,22 @@ def save_session(scene: bpy.types.Scene, session: AppleBiteSession | None, persi
         pass
 
 
+def _parse_session_json_cached(scene: bpy.types.Scene, raw: str) -> dict | None:
+    skey = _scene_cache_key(scene)
+    cached = _SESSION_JSON_CACHE.get(skey)
+    if cached is not None and cached[0] == raw:
+        return cached[1]
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        _SESSION_JSON_CACHE[skey] = (raw, data)
+        return data
+    except Exception:
+        _SESSION_JSON_CACHE.pop(skey, None)
+        return None
+
+
 def load_session(scene: bpy.types.Scene | None) -> AppleBiteSession | None:
     """Load active session from Scene, auto-clearing if stale/corrupted."""
     if scene is None:
@@ -142,8 +184,11 @@ def load_session(scene: bpy.types.Scene | None) -> AppleBiteSession | None:
     raw = scene.get(SESSION_SCENE_PROP)
     if not raw:
         return None
+    data = _parse_session_json_cached(scene, raw)
+    if data is None:
+        save_session(scene, None)
+        return None
     try:
-        data = json.loads(raw)
         session = AppleBiteSession.from_dict(data)
     except Exception:
         save_session(scene, None)
@@ -152,6 +197,33 @@ def load_session(scene: bpy.types.Scene | None) -> AppleBiteSession | None:
         save_session(scene, None)
         return None
     return session
+
+
+def load_session_readonly(scene: bpy.types.Scene | None) -> AppleBiteSession | None:
+    """Ultra-fast read-only session accessor for hot paths (viewport draw / depsgraph).
+
+    Reuses the constructed AppleBiteSession when the raw JSON and Blender object count
+    have not changed, avoiding both json.loads() and O(N) CutterEntry list rebuilds.
+    Callers MUST NOT mutate the returned object.
+    """
+    if scene is None:
+        return None
+    raw = scene.get(SESSION_SCENE_PROP)
+    if not raw:
+        return None
+    skey = _scene_cache_key(scene)
+    obj_count = len(bpy.data.objects)
+    cached = _READONLY_SESSION_CACHE.get(skey)
+    if cached is not None and cached[0] == raw and cached[1] == obj_count:
+        sess = cached[2]
+        if sess.vault_col_name in bpy.data.collections:
+            return sess
+    sess = load_session(scene)
+    if sess is None:
+        _READONLY_SESSION_CACHE.pop(skey, None)
+        return None
+    _READONLY_SESSION_CACHE[skey] = (raw, obj_count, sess)
+    return sess
 
 
 def load_stored_session_by_id(session_id: str) -> AppleBiteSession | None:

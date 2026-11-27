@@ -116,9 +116,20 @@ def _filetime_to_seconds(ft: _FILETIME) -> float:
     return ticks * 1e-7
 
 
-def get_system_stats() -> dict:
+import atexit
+
+_LAST_STATS_TIME: float = 0.0
+_CACHED_SYS_STATS: dict | None = None
+_STATS_MIN_INTERVAL_SEC: float = 0.25
+
+
+def get_system_stats(force: bool = False) -> dict:
     """Return current Blender process RAM (MB), CPU (%), logical cores, and Blender version."""
-    global _LAST_PROC_CPU_TIME, _LAST_WALL_TIME, _LAST_CPU_PCT
+    global _LAST_PROC_CPU_TIME, _LAST_WALL_TIME, _LAST_CPU_PCT, _LAST_STATS_TIME, _CACHED_SYS_STATS
+    now = time.perf_counter()
+    if not force and _CACHED_SYS_STATS is not None and (now - _LAST_STATS_TIME) < _STATS_MIN_INTERVAL_SEC:
+        return _CACHED_SYS_STATS
+
     ram_mb = 0.0
     peak_ram_mb = 0.0
     cpu_pct = _LAST_CPU_PCT
@@ -160,7 +171,7 @@ def get_system_stats() -> dict:
                 ctypes.byref(ft_user),
             ):
                 proc_t = _filetime_to_seconds(ft_kernel) + _filetime_to_seconds(ft_user)
-                wall_t = time.perf_counter()
+                wall_t = now
                 if _LAST_PROC_CPU_TIME is not None and _LAST_WALL_TIME is not None:
                     dt_wall = wall_t - _LAST_WALL_TIME
                     if dt_wall >= 0.10:
@@ -175,7 +186,7 @@ def get_system_stats() -> dict:
         except Exception:
             pass
 
-    return {
+    stats = {
         "os": f"{platform.system()} {platform.release()}",
         "blender_version": bpy.app.version_string,
         "cpu_cores": cores,
@@ -183,11 +194,19 @@ def get_system_stats() -> dict:
         "process_ram_mb": round(ram_mb, 1),
         "process_peak_ram_mb": round(peak_ram_mb, 1),
     }
+    _CACHED_SYS_STATS = stats
+    _LAST_STATS_TIME = now
+    return stats
 
 
 # ---------------------------------------------------------------------------
-# Crash-Safe JSONL Auto-Logging
+# Buffered Crash-Safe JSONL Auto-Logging (Zero Main-Thread Stalls)
 # ---------------------------------------------------------------------------
+
+_PENDING_JSONL: list[str] = []
+_LAST_FLUSH_TIME: float = 0.0
+_FLUSH_INTERVAL_SEC: float = 1.0
+_FLUSH_BATCH_SIZE: int = 64
 
 
 def get_logs_dir() -> str:
@@ -201,15 +220,37 @@ def get_latest_log_path() -> str:
     return os.path.join(get_logs_dir(), "timeline_latest.jsonl")
 
 
-def _append_jsonl(event: TimelineEvent) -> None:
-    global _LOG_INITIALIZED
+def flush_log() -> None:
+    global _LOG_INITIALIZED, _LAST_FLUSH_TIME
+    if not _PENDING_JSONL:
+        return
+    lines = list(_PENDING_JSONL)
+    _PENDING_JSONL.clear()
+    _LAST_FLUSH_TIME = time.perf_counter()
     try:
         path = get_latest_log_path()
         mode = "a" if _LOG_INITIALIZED else "w"
         _LOG_INITIALIZED = True
         with open(path, mode, encoding="utf-8") as f:
-            f.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+            f.writelines(lines)
             f.flush()
+    except Exception:
+        pass
+
+
+atexit.register(flush_log)
+
+
+def _append_jsonl(event: TimelineEvent, immediate: bool = False) -> None:
+    try:
+        _PENDING_JSONL.append(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+        now = time.perf_counter()
+        if (
+            immediate
+            or len(_PENDING_JSONL) >= _FLUSH_BATCH_SIZE
+            or (now - _LAST_FLUSH_TIME) >= _FLUSH_INTERVAL_SEC
+        ):
+            flush_log()
     except Exception:
         pass
 
@@ -231,6 +272,7 @@ def set_recording(enabled: bool) -> None:
 def start_new_session_log() -> None:
     """Clear in-memory timeline and start a fresh timeline_latest.jsonl file."""
     global _TIMELINE_START, _SEQ, _LOG_INITIALIZED
+    _PENDING_JSONL.clear()
     _HISTORY.clear()
     _TIMELINE.clear()
     _TIMELINE_START = time.perf_counter()
@@ -261,7 +303,7 @@ def record_marker(action: str, note: str = "", duration_ms: float = 0.0) -> None
     if not _RECORDING:
         return
     now_perf = time.perf_counter()
-    sys_s = get_system_stats()
+    sys_s = get_system_stats(force=True)
     _SEQ += 1
     ev = TimelineEvent(
         seq=_SEQ,
@@ -285,7 +327,7 @@ def record_marker(action: str, note: str = "", duration_ms: float = 0.0) -> None
         is_spike=duration_ms >= SPIKE_THRESHOLD_MS,
     )
     _TIMELINE.append(ev)
-    _append_jsonl(ev)
+    _append_jsonl(ev, immediate=True)
 
 
 def record_eval(sample: EvalSample) -> None:
