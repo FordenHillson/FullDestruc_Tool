@@ -547,60 +547,171 @@ class FDT_OT_viewport_zone_quick(bpy.types.Operator):
 
 
 # ---------------------------------------------------------------------------
-# Custom 2D Gizmos (Glass Capsule Backdrop + Clickable Rounded Pills)
+# Custom 2D Pill Gizmo (Hit-Test + Native Tooltips) + Clean POST_PIXEL Renderer
 # ---------------------------------------------------------------------------
 
+_DOCK_DRAW_HANDLE = None
+_HOVERED_SLOT_BY_REGION: dict[int, str | None] = {}
 
-class FDT_GT_dock_backdrop(bpy.types.Gizmo):
-    """Non-interactive translucent dark glass capsule drawn behind dock pills."""
 
-    bl_idname = "FDT_GT_dock_backdrop"
+def _region_key(region) -> int:
+    if region is None:
+        return 0
+    try:
+        return int(region.as_pointer())
+    except Exception:
+        return id(region)
 
-    def setup(self):
-        self._capsule_rect = (0.0, 0.0, 0.0, 0.0)
-        self._divider_xs: tuple[float, ...] = ()
-        self._ui_scale = 1.0
 
-    def test_select(self, context, location):
-        return -1
+def _pill_colors(
+    style: str,
+    accent: tuple[float, float, float, float],
+    hover: bool,
+) -> tuple[
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+    tuple[float, float, float, float],
+]:
+    """Return ``(fill, rim, icon_col, txt_col)`` for a dock pill."""
+    acc = accent
+    if style == "hero_green":
+        fill = COL_EMERALD_HOVER if hover else COL_EMERALD
+        rim = (0.75, 1.0, 0.86, 0.95) if hover else (0.35, 0.92, 0.62, 0.78)
+        return fill, rim, COL_TEXT, COL_TEXT
+    if style == "hero_amber":
+        fill = (1.0, 0.72, 0.18, 0.98) if hover else (0.94, 0.58, 0.10, 0.96)
+        rim = (1.0, 0.95, 0.75, 0.98) if hover else (1.0, 0.78, 0.34, 0.72)
+        return fill, rim, COL_TEXT_DARK, COL_TEXT_DARK
+    if style == "alert_red":
+        fill = (0.96, 0.32, 0.34, 0.98) if hover else (0.82, 0.20, 0.22, 0.94)
+        rim = (1.0, 0.80, 0.80, 0.98) if hover else (0.98, 0.45, 0.47, 0.82)
+        return fill, rim, COL_TEXT, COL_TEXT
+    if style == "zone":
+        fill = (acc[0] * 0.34, acc[1] * 0.34, acc[2] * 0.34, 0.94) if hover else (0.14, 0.16, 0.22, 0.92)
+        rim = (acc[0], acc[1], acc[2], 0.98 if hover else 0.75)
+        return fill, rim, acc, COL_TEXT
+    if style == "muted":
+        return (0.13, 0.14, 0.18, 0.70), (acc[0], acc[1], acc[2], 0.45), (acc[0], acc[1], acc[2], 0.65), COL_TEXT_DIM
+    if style == "status":
+        return (0.12, 0.15, 0.20, 0.82), (acc[0], acc[1], acc[2], 0.48), acc, COL_TEXT
+    if style == "subtle":
+        fill = (acc[0] * 0.28, acc[1] * 0.28, acc[2] * 0.28, 0.92) if hover else (0.13, 0.15, 0.20, 0.72)
+        rim = (acc[0], acc[1], acc[2], 0.88) if hover else (1.0, 1.0, 1.0, 0.12)
+        icon_col = acc if hover else (acc[0], acc[1], acc[2], 0.88)
+        return fill, rim, icon_col, COL_TEXT
+    # 'normal'
+    fill = COL_PILL_HOVER if hover else COL_PILL_BG
+    rim = (acc[0], acc[1], acc[2], 0.94 if hover else 0.48)
+    return fill, rim, acc, COL_TEXT
 
-    def draw(self, context):
-        x0, y0, x1, y1 = self._capsule_rect
-        if x1 <= x0 or y1 <= y0:
-            return
-        s = self._ui_scale
-        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-        gpu.state.blend_set("ALPHA")
-        try:
-            _draw_rounded_rect(shader, self._capsule_rect, 14.0 * s, COL_GLASS_BG, COL_GLASS_RIM, rim_width=1.2)
-            if self._divider_xs:
-                pad = 9.0 * s
-                lines: list[tuple[float, float]] = []
-                for dx in self._divider_xs:
-                    lines.extend([(dx, y0 + pad), (dx, y1 - pad)])
-                gpu.state.line_width_set(1.0)
-                b = batch_for_shader(shader, "LINES", {"pos": lines})
-                shader.bind()
-                shader.uniform_float("color", COL_DIVIDER)
-                b.draw(shader)
-        finally:
+
+def _compute_context_dock_layout(context) -> tuple[DockLayout | None, dict]:
+    """Compute the current region's DockLayout, or ``(None, {})`` when hidden."""
+    if _any_modal_overlay_active():
+        return None, {}
+    mode, state = _resolve_dock_mode(context)
+    region = getattr(context, "region", None)
+    if mode is None or region is None:
+        return None, {}
+
+    prefs = getattr(context, "preferences", None)
+    sys_prefs = getattr(prefs, "system", None) if prefs is not None else None
+    ui_scale = float(getattr(sys_prefs, "ui_scale", 1.0) or 1.0)
+
+    layout = compute_dock_layout(
+        float(region.width),
+        mode,
+        zone_token=str(state.get("zone_token", "A")),
+        zone_color=state.get("zone_color", COL_AMBER),
+        active_cutters=int(state.get("active_cutters", 0)),
+        total_cutters=int(state.get("total_cutters", 0)),
+        view_mode=str(state.get("view_mode", "ALL")),
+        has_cut_material=bool(state.get("has_cut_material", True)),
+        has_output_enabled=bool(state.get("has_output_enabled", True)),
+        rebar_estimate=int(state.get("rebar_estimate", 0)),
+        rebar_stale=bool(state.get("rebar_stale", False)),
+        ui_scale=ui_scale,
+    )
+    return layout, state
+
+
+def _draw_dock_post_pixel() -> None:
+    """Render the entire Viewport Dock in clean 2D POST_PIXEL space (strict back-to-front order)."""
+    context = bpy.context
+    layout, _state = _compute_context_dock_layout(context)
+    if layout is None:
+        return
+
+    s = layout.ui_scale
+    hovered_slot = _HOVERED_SLOT_BY_REGION.get(_region_key(context.region))
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+
+    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("NONE")
+    gpu.state.face_culling_set("NONE")
+    try:
+        # 1. Translucent dark glass capsule backdrop
+        cx0, cy0, cx1, cy1 = layout.capsule_rect
+        _draw_rounded_rect(shader, layout.capsule_rect, 14.0 * s, COL_GLASS_BG, COL_GLASS_RIM, rim_width=1.2)
+
+        # 2. Vertical group dividers
+        if layout.divider_xs:
+            pad = 9.0 * s
+            div_lines: list[tuple[float, float]] = []
+            for dx in layout.divider_xs:
+                div_lines.extend([(dx, cy0 + pad), (dx, cy1 - pad)])
             gpu.state.line_width_set(1.0)
-            gpu.state.blend_set("NONE")
+            b_div = batch_for_shader(shader, "LINES", {"pos": div_lines})
+            shader.bind()
+            shader.uniform_float("color", COL_DIVIDER)
+            b_div.draw(shader)
+
+        # 3. Rounded pills + crisp vector icons
+        text_queue: list[tuple[DockButtonSpec, tuple[float, float, float, float]]] = []
+        for spec in layout.buttons:
+            is_hover = spec.enabled and (spec.slot_id == hovered_slot)
+            fill, rim, icon_col, txt_col = _pill_colors(spec.style, spec.accent, is_hover)
+            _draw_rounded_rect(shader, spec.rect, 9.0 * s, fill, rim, rim_width=1.6 if is_hover else 1.1)
+
+            x0, y0, x1, y1 = spec.rect
+            cy = (y0 + y1) * 0.5
+            icon_r = 5.5 * s
+            if spec.icon:
+                ix = (x0 + 13.0 * s) if spec.label else ((x0 + x1) * 0.5)
+                _draw_dock_icon(shader, spec.icon, ix, cy, icon_r * (1.0 if spec.label else 1.05), icon_col)
+            if spec.label:
+                text_queue.append((spec, txt_col))
+    finally:
+        gpu.state.line_width_set(1.0)
+        gpu.state.blend_set("NONE")
+
+    # 4. Crisp BLF labels strictly on top of all fills
+    font_id = 0
+    fsize = max(10, int(round(12.0 * s)))
+    blf.size(font_id, fsize)
+    for spec, txt_col in text_queue:
+        x0, y0, x1, y1 = spec.rect
+        cy = (y0 + y1) * 0.5
+        blf.color(font_id, *txt_col)
+        tw, th = blf.dimensions(font_id, spec.label)
+        left_pad = (23.0 * s) if spec.icon else 0.0
+        avail_x0 = x0 + left_pad
+        tx = avail_x0 + max(0.0, (x1 - avail_x0 - tw) * 0.5) - (2.0 * s if spec.icon else 0.0)
+        ty = cy - th * 0.36
+        blf.position(font_id, tx, ty, 0)
+        blf.draw(font_id, spec.label)
 
 
 class FDT_GT_dock_pill(bpy.types.Gizmo):
-    """Interactive 2D rounded-pill gizmo with exact rect hit-test and native tooltip."""
+    """Invisible 2D rounded-pill hit-test gizmo (visuals rendered cleanly in POST_PIXEL)."""
 
     bl_idname = "FDT_GT_dock_pill"
 
     def setup(self):
+        self._slot_id = ""
         self._rect = (0.0, 0.0, 0.0, 0.0)
-        self._label = ""
-        self._icon = ""
-        self._accent = COL_SLATE
-        self._style = "normal"
         self._enabled_flag = True
-        self._ui_scale = 1.0
 
     def test_select(self, context, location):
         if not self._enabled_flag:
@@ -612,84 +723,9 @@ class FDT_GT_dock_pill(bpy.types.Gizmo):
         return -1
 
     def draw(self, context):
-        x0, y0, x1, y1 = self._rect
-        if x1 <= x0 or y1 <= y0:
-            return
-        s = self._ui_scale
-        hover = bool(self.is_highlight) and self._enabled_flag
-        acc = self._accent
-        style = self._style
-
-        if style == "hero_green":
-            fill = COL_EMERALD_HOVER if hover else COL_EMERALD
-            rim = (0.75, 1.0, 0.86, 0.95) if hover else (0.35, 0.92, 0.62, 0.70)
-            icon_col = COL_TEXT
-            txt_col = COL_TEXT
-        elif style == "hero_amber":
-            fill = (1.0, 0.70, 0.16, 0.98) if hover else (0.90, 0.56, 0.08, 0.94)
-            rim = (1.0, 0.94, 0.72, 0.95) if hover else (1.0, 0.76, 0.30, 0.65)
-            icon_col = COL_TEXT_DARK
-            txt_col = COL_TEXT_DARK
-        elif style == "alert_red":
-            fill = (0.96, 0.30, 0.32, 0.98) if hover else (0.78, 0.18, 0.20, 0.90)
-            rim = (1.0, 0.78, 0.78, 0.95) if hover else (0.98, 0.42, 0.44, 0.75)
-            icon_col = COL_TEXT
-            txt_col = COL_TEXT
-        elif style == "zone":
-            fill = (acc[0] * 0.34, acc[1] * 0.34, acc[2] * 0.34, 0.94) if hover else (0.14, 0.16, 0.22, 0.86)
-            rim = (acc[0], acc[1], acc[2], 0.98 if hover else 0.72)
-            icon_col = acc
-            txt_col = COL_TEXT
-        elif style == "muted":
-            fill = (0.13, 0.14, 0.18, 0.65)
-            rim = (acc[0], acc[1], acc[2], 0.45)
-            icon_col = (acc[0], acc[1], acc[2], 0.65)
-            txt_col = COL_TEXT_DIM
-        elif style == "status":
-            fill = (0.12, 0.15, 0.20, 0.75)
-            rim = (acc[0], acc[1], acc[2], 0.42)
-            icon_col = acc
-            txt_col = COL_TEXT
-        elif style == "subtle":
-            fill = (acc[0] * 0.28, acc[1] * 0.28, acc[2] * 0.28, 0.90) if hover else (0.12, 0.14, 0.18, 0.55)
-            rim = (acc[0], acc[1], acc[2], 0.85) if hover else (1.0, 1.0, 1.0, 0.08)
-            icon_col = acc if hover else (acc[0], acc[1], acc[2], 0.85)
-            txt_col = COL_TEXT
-        else:  # 'normal'
-            fill = COL_PILL_HOVER if hover else COL_PILL_BG
-            rim = (acc[0], acc[1], acc[2], 0.92 if hover else 0.42)
-            icon_col = acc
-            txt_col = COL_TEXT
-
-        shader = gpu.shader.from_builtin("UNIFORM_COLOR")
-        gpu.state.blend_set("ALPHA")
-        try:
-            _draw_rounded_rect(shader, self._rect, 9.0 * s, fill, rim, rim_width=1.6 if hover else 1.1)
-            cy = (y0 + y1) * 0.5
-            icon_r = 5.5 * s
-            if self._label:
-                ix = x0 + 13.0 * s
-                if self._icon:
-                    _draw_dock_icon(shader, self._icon, ix, cy, icon_r, icon_col)
-            else:
-                if self._icon:
-                    _draw_dock_icon(shader, self._icon, (x0 + x1) * 0.5, cy, icon_r * 1.05, icon_col)
-        finally:
-            gpu.state.line_width_set(1.0)
-            gpu.state.blend_set("NONE")
-
-        if self._label:
-            font_id = 0
-            fsize = max(10, int(round(12.0 * s)))
-            blf.size(font_id, fsize)
-            blf.color(font_id, *txt_col)
-            tw, th = blf.dimensions(font_id, self._label)
-            left_pad = (23.0 * s) if self._icon else 0.0
-            avail_x0 = x0 + left_pad
-            tx = avail_x0 + max(0.0, (x1 - avail_x0 - tw) * 0.5) - (2.0 * s if self._icon else 0.0)
-            ty = cy - th * 0.36
-            blf.position(font_id, tx, ty, 0)
-            blf.draw(font_id, self._label)
+        # All visual drawing is handled in `_draw_dock_post_pixel` to avoid
+        # Blender 5.2 Gizmo-pass stipple/depth artifacts and guarantee draw order.
+        pass
 
 
 # Fixed slot registry -> (slot_id, operator_id)
@@ -727,12 +763,12 @@ class FDT_GGT_viewport_dock(bpy.types.GizmoGroup):
         return mode is not None
 
     def setup(self, context):
-        self._backdrop = self.gizmos.new(FDT_GT_dock_backdrop.bl_idname)
         self._pills: dict[str, FDT_GT_dock_pill] = {}
         self._op_props: dict[str, object] = {}
 
         for slot_id, op_id in _DOCK_SLOTS:
             gz = self.gizmos.new(FDT_GT_dock_pill.bl_idname)
+            gz._slot_id = slot_id
             gz.hide = True
             if op_id:
                 try:
@@ -742,36 +778,13 @@ class FDT_GGT_viewport_dock(bpy.types.GizmoGroup):
             self._pills[slot_id] = gz
 
     def draw_prepare(self, context):
-        mode, state = _resolve_dock_mode(context)
-        if mode is None or context.region is None:
-            self._backdrop.hide = True
+        layout, state = _compute_context_dock_layout(context)
+        rkey = _region_key(getattr(context, "region", None))
+        if layout is None:
+            _HOVERED_SLOT_BY_REGION.pop(rkey, None)
             for gz in self._pills.values():
                 gz.hide = True
             return
-
-        prefs = getattr(context, "preferences", None)
-        sys_prefs = getattr(prefs, "system", None) if prefs is not None else None
-        ui_scale = float(getattr(sys_prefs, "ui_scale", 1.0) or 1.0)
-
-        layout = compute_dock_layout(
-            float(context.region.width),
-            mode,
-            zone_token=str(state.get("zone_token", "A")),
-            zone_color=state.get("zone_color", COL_AMBER),
-            active_cutters=int(state.get("active_cutters", 0)),
-            total_cutters=int(state.get("total_cutters", 0)),
-            view_mode=str(state.get("view_mode", "ALL")),
-            has_cut_material=bool(state.get("has_cut_material", True)),
-            has_output_enabled=bool(state.get("has_output_enabled", True)),
-            rebar_estimate=int(state.get("rebar_estimate", 0)),
-            rebar_stale=bool(state.get("rebar_stale", False)),
-            ui_scale=ui_scale,
-        )
-
-        self._backdrop.hide = False
-        self._backdrop._capsule_rect = layout.capsule_rect
-        self._backdrop._divider_xs = layout.divider_xs
-        self._backdrop._ui_scale = layout.ui_scale
 
         # Sync rebar sid onto Edit operator properties when active
         rebar_entry = state.get("rebar_entry")
@@ -783,6 +796,7 @@ class FDT_GGT_viewport_dock(bpy.types.GizmoGroup):
                 except Exception:
                     pass
 
+        hovered_slot: str | None = None
         active_specs = {b.slot_id: b for b in layout.buttons}
         for slot_id, gz in self._pills.items():
             spec = active_specs.get(slot_id)
@@ -791,27 +805,40 @@ class FDT_GGT_viewport_dock(bpy.types.GizmoGroup):
                 continue
             gz.hide = False
             gz._rect = spec.rect
-            gz._label = spec.label
-            gz._icon = spec.icon
-            gz._accent = spec.accent
-            gz._style = spec.style
             gz._enabled_flag = spec.enabled
-            gz._ui_scale = layout.ui_scale
+            if spec.enabled and bool(gz.is_highlight):
+                hovered_slot = slot_id
+        _HOVERED_SLOT_BY_REGION[rkey] = hovered_slot
 
 
 CLASSES = (
     FDT_OT_viewport_zone_quick,
-    FDT_GT_dock_backdrop,
     FDT_GT_dock_pill,
     FDT_GGT_viewport_dock,
 )
 
 
 def register():
+    global _DOCK_DRAW_HANDLE
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    if _DOCK_DRAW_HANDLE is None:
+        try:
+            _DOCK_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+                _draw_dock_post_pixel, (), "WINDOW", "POST_PIXEL"
+            )
+        except Exception:
+            _DOCK_DRAW_HANDLE = None
 
 
 def unregister():
+    global _DOCK_DRAW_HANDLE
+    if _DOCK_DRAW_HANDLE is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_DOCK_DRAW_HANDLE, "WINDOW")
+        except Exception:
+            pass
+        _DOCK_DRAW_HANDLE = None
+    _HOVERED_SLOT_BY_REGION.clear()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
