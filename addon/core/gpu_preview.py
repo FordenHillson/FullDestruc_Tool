@@ -20,7 +20,7 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 import numpy as np
 
-from . import rust_bridge
+from . import gpu_imposter, rust_bridge
 from .session import AppleBiteSession
 
 _BASIC_SHADER = None
@@ -1289,6 +1289,71 @@ def _draw_submesh_list(
             batch.draw(basic_shader)
 
 
+def _draw_submesh_list_capture(
+    cap_basic,
+    cap_multi,
+    mvp,
+    fallback_tex,
+    mat_infos: list[dict],
+    sub_list: list[tuple[int, bool, object]],
+) -> None:
+    """Draw a submesh batch list into the Imposter MRT G-Buffer (Color + WorldPos/Shade)."""
+    bound: str | None = None
+    last_mat_key: tuple[str, int] | None = None
+    for mat_id, is_multi, batch in sub_list:
+        desc = mat_infos[mat_id] if (0 <= mat_id < len(mat_infos)) else None
+        if is_multi and cap_multi is not None and desc is not None and desc.get("kind") == "MULTIMAT":
+            if bound != "MULTI":
+                cap_multi.bind()
+                cap_multi.uniform_float("ModelViewProjectionMatrix", mvp)
+                bound = "MULTI"
+                last_mat_key = None
+            mkey = ("MULTI", mat_id)
+            if last_mat_key != mkey:
+                bcr_texs = desc["bcr_texs"]
+                cap_multi.uniform_sampler("bcr1_tex", bcr_texs[0] or fallback_tex)
+                cap_multi.uniform_sampler("bcr2_tex", bcr_texs[1] or fallback_tex)
+                cap_multi.uniform_sampler("bcr3_tex", bcr_texs[2] or fallback_tex)
+                cap_multi.uniform_sampler("bcr4_tex", bcr_texs[3] or fallback_tex)
+                cap_multi.uniform_sampler("mask_tex", desc["mask_tex"] or fallback_tex)
+                cap_multi.uniform_sampler("mcr_tex", desc["mcr_tex"] or fallback_tex)
+                cap_multi.uniform_block("u_mm", desc["ubo"])
+                last_mat_key = mkey
+            batch.draw(cap_multi)
+        elif cap_basic is not None:
+            if bound != "BASIC":
+                cap_basic.bind()
+                cap_basic.uniform_float("ModelViewProjectionMatrix", mvp)
+                bound = "BASIC"
+                last_mat_key = None
+            mkey = ("BASIC", mat_id)
+            if last_mat_key != mkey:
+                if desc is not None and desc.get("kind") == "BASIC":
+                    gtex = desc["gtex"]
+                    bcol = desc["base_col"]
+                    uv_xf = desc["uv_xform"]
+                    has_tex = bool(desc["use_tex"] and gtex is not None)
+                    dec_srgb = bool(desc["dec_srgb"])
+                else:
+                    gtex = None
+                    bcol = (0.76, 0.77, 0.80, 1.0)
+                    uv_xf = (1.0, 1.0, 0.0, 0.0)
+                    has_tex = False
+                    dec_srgb = False
+
+                tex_to_bind = gtex if has_tex else fallback_tex
+                if tex_to_bind is not None:
+                    cap_basic.uniform_sampler("base_tex", tex_to_bind)
+                cap_basic.uniform_float("base_color", bcol)
+                cap_basic.uniform_float("uv_transform", uv_xf)
+                cap_basic.uniform_float(
+                    "params",
+                    (1.0 if has_tex else 0.0, 1.0 if dec_srgb else 0.0, 0.0, 0.0),
+                )
+                last_mat_key = mkey
+            batch.draw(cap_basic)
+
+
 _BBOX_EDGES = (
     (0, 1), (1, 2), (2, 3), (3, 0),
     (4, 5), (5, 6), (6, 7), (7, 4),
@@ -1333,6 +1398,7 @@ def _get_line_color_shader():
 def invalidate_cutter_wire_cache(mesh_ptr: int | None = None) -> None:
     """Clear cached local cutter wireframes (all or for a specific edited mesh pointer)."""
     _UNSEL_WIRE_CACHE.clear()
+    gpu_imposter.invalidate_cutter_cache(mesh_ptr)
     if mesh_ptr is None:
         _CUTTER_LOCAL_EDGE_CACHE.clear()
         _CUTTER_LOCAL_BATCH_CACHE.clear()
@@ -1920,74 +1986,102 @@ def _draw_callback() -> None:
         gpu.state.depth_mask_set(True)
         gpu.state.blend_set("NONE")
 
-        draw_rem = _DISPLAY_MODE != "PIECES"
-        draw_pieces = _DISPLAY_MODE not in ("MAIN", "MAIN_WIRE")
-        sel_zones = get_selected_cutter_zones() if _DISPLAY_MODE == "PIECES" else set()
+        imposter_drawn = False
+        if gpu_imposter.is_active():
+            def _capture_scene_to_gbuf(cap_basic, cap_multi) -> None:
+                for state in _GPU_STATE.values():
+                    mat_infos = state["materials"]
+                    _draw_submesh_list_capture(
+                        cap_basic, cap_multi, mvp, fallback_tex, mat_infos, state["rem_flat"]
+                    )
+                    for _z_col, p_subs in state["piece_buckets"].values():
+                        if p_subs:
+                            _draw_submesh_list_capture(
+                                cap_basic, cap_multi, mvp, fallback_tex, mat_infos, p_subs
+                            )
+                    for _z_col, owned_subs in state.get("piece_owned_chunks", {}).values():
+                        if owned_subs:
+                            _draw_submesh_list_capture(
+                                cap_basic, cap_multi, mvp, fallback_tex, mat_infos, owned_subs
+                            )
 
-        for state in _GPU_STATE.values():
-            mat_infos = state["materials"]
+            imposter_drawn = gpu_imposter.draw_imposter_frame(
+                mvp,
+                _DISPLAY_MODE,
+                _SHOW_GRID,
+                _GRID_SIZE,
+                _capture_scene_to_gbuf,
+            )
 
-            if draw_rem:
-                _draw_submesh_list(
-                    basic_shader,
-                    multi_shader,
-                    mvp,
-                    fallback_tex,
-                    mat_infos,
-                    state["rem_flat"],
-                    zone_tint=(0.0, 0.0, 0.0, 0.0),
-                    grid_strength=0.0,
-                )
+        if not imposter_drawn:
+            draw_rem = _DISPLAY_MODE != "PIECES"
+            draw_pieces = _DISPLAY_MODE not in ("MAIN", "MAIN_WIRE")
+            sel_zones = get_selected_cutter_zones() if _DISPLAY_MODE == "PIECES" else set()
 
-            if draw_pieces:
-                for (p_zone, _bidx), (z_col, p_subs) in state["piece_buckets"].items():
-                    if not p_subs:
-                        continue
-                    if sel_zones and p_zone not in sel_zones:
-                        continue
-                    if _SHOW_GRID:
-                        zt = (z_col[0], z_col[1], z_col[2], 0.22)
-                        gs = 0.65
-                    else:
-                        zt = (0.0, 0.0, 0.0, 0.0)
-                        gs = 0.0
+            for state in _GPU_STATE.values():
+                mat_infos = state["materials"]
+
+                if draw_rem:
                     _draw_submesh_list(
                         basic_shader,
                         multi_shader,
                         mvp,
                         fallback_tex,
                         mat_infos,
-                        p_subs,
-                        zone_tint=zt,
-                        grid_strength=gs,
+                        state["rem_flat"],
+                        zone_tint=(0.0, 0.0, 0.0, 0.0),
+                        grid_strength=0.0,
                     )
 
-                for p_zone, (z_col, owned_subs) in state.get("piece_owned_chunks", {}).items():
-                    if not owned_subs:
-                        continue
-                    if sel_zones and p_zone not in sel_zones:
-                        continue
-                    if _SHOW_GRID:
-                        zt = (z_col[0], z_col[1], z_col[2], 0.22)
-                        gs = 0.65
-                    else:
-                        zt = (0.0, 0.0, 0.0, 0.0)
-                        gs = 0.0
-                    _draw_submesh_list(
-                        basic_shader,
-                        multi_shader,
-                        mvp,
-                        fallback_tex,
-                        mat_infos,
-                        owned_subs,
-                        zone_tint=zt,
-                        grid_strength=gs,
-                    )
+                if draw_pieces:
+                    for (p_zone, _bidx), (z_col, p_subs) in state["piece_buckets"].items():
+                        if not p_subs:
+                            continue
+                        if sel_zones and p_zone not in sel_zones:
+                            continue
+                        if _SHOW_GRID:
+                            zt = (z_col[0], z_col[1], z_col[2], 0.22)
+                            gs = 0.65
+                        else:
+                            zt = (0.0, 0.0, 0.0, 0.0)
+                            gs = 0.0
+                        _draw_submesh_list(
+                            basic_shader,
+                            multi_shader,
+                            mvp,
+                            fallback_tex,
+                            mat_infos,
+                            p_subs,
+                            zone_tint=zt,
+                            grid_strength=gs,
+                        )
 
-        if _DISPLAY_MODE == "MAIN_WIRE":
-            _draw_piece_wireframes()
+                    for p_zone, (z_col, owned_subs) in state.get("piece_owned_chunks", {}).items():
+                        if not owned_subs:
+                            continue
+                        if sel_zones and p_zone not in sel_zones:
+                            continue
+                        if _SHOW_GRID:
+                            zt = (z_col[0], z_col[1], z_col[2], 0.22)
+                            gs = 0.65
+                        else:
+                            zt = (0.0, 0.0, 0.0, 0.0)
+                            gs = 0.0
+                        _draw_submesh_list(
+                            basic_shader,
+                            multi_shader,
+                            mvp,
+                            fallback_tex,
+                            mat_infos,
+                            owned_subs,
+                            zone_tint=zt,
+                            grid_strength=gs,
+                        )
 
-        # Pass 3: Dual-pass X-Ray Cutter Wireframes (batched O(1) draw calls for 500 boxes!)
+            if _DISPLAY_MODE == "MAIN_WIRE":
+                _draw_piece_wireframes()
+
+        # Pass 3: Dual-pass X-Ray Cutter Wireframes (depth-occluded against either VBO or Imposter gl_FragDepth!)
         _draw_session_cutters_xray()
     except Exception as exc:
         print(f"[FullDestruc_Tool] Textured GPU Preview draw error: {exc}")
@@ -1999,6 +2093,16 @@ def _draw_callback() -> None:
 
 def is_active() -> bool:
     return _ACTIVE
+
+
+def has_target_gpu_state() -> bool:
+    """Return True once at least one target's base VBOs have been uploaded to VRAM."""
+    return bool(_GPU_STATE)
+
+
+def tag_redraw() -> None:
+    """Request an immediate 3D Viewport redraw (used by Imposter Drag at 144+ FPS)."""
+    _tag_all_view3d_redraw()
 
 
 def set_display_options(
@@ -2519,6 +2623,7 @@ def apply_target_gpu_delta(
     for bkey in dirty_buckets:
         _rebuild_piece_bucket(state, bkey, mat_infos, basic_shader, multi_shader)
 
+    gpu_imposter.invalidate_gbuffer()
     _tag_all_view3d_redraw()
 
 
@@ -2573,6 +2678,7 @@ def update_target_gpu_batches(
         _rebuild_piece_bucket(state, bkey, mat_infos, basic_shader, multi_shader)
 
     _GPU_STATE[target_name] = state
+    gpu_imposter.invalidate_gbuffer()
     _tag_all_view3d_redraw()
 
 
@@ -2582,6 +2688,7 @@ def end_drag_preview() -> None:
     was_active = _ACTIVE
     _ACTIVE = False
     _CUTTERS_COL_NAME = ""
+    gpu_imposter.release()
     _GPU_STATE.clear()
     _MAT_CACHE.clear()
     _CUTTER_LOCAL_EDGE_CACHE.clear()
@@ -2615,6 +2722,7 @@ def unregister() -> None:
     global _DRAW_HANDLE, _BASIC_SHADER, _BASIC_SHADER_FAILED, _MULTI_SHADER, _MULTI_SHADER_FAILED
     global _LINE_SHADER, _LINE_COLOR_SHADER, _FALLBACK_TEX
     end_drag_preview()
+    gpu_imposter.shutdown_shaders()
     if _DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_DRAW_HANDLE, "WINDOW")

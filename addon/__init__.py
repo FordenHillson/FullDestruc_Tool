@@ -27,6 +27,7 @@ _RELOAD_ORDER = (
     "core.perf_score",
     "core.profiler",
     "core.rust_bridge",
+    "core.gpu_imposter",
     "core.gpu_preview",
     "core.live_sync",
     "core.draw_engine",

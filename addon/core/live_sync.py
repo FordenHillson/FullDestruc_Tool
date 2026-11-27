@@ -23,7 +23,7 @@ import bmesh
 import numpy as np
 from bpy.app.handlers import persistent
 
-from . import gpu_preview, profiler, rust_bridge
+from . import gpu_imposter, gpu_preview, profiler, rust_bridge
 from .session import load_session, load_session_readonly
 
 _IS_SYNCING: bool = False
@@ -41,10 +41,27 @@ _POLL_INTERVAL_SEC: float = 0.016  # ~60 Hz polling while jobs are in-flight
 _LAST_SUBMITTED_JOB_IDS: dict[str, int] = {}
 _LAST_SEEN_JOB_IDS: dict[str, int] = {}
 
+# On-Demand Single-View G-Buffer Imposter Drag state (0 ms Rust during drag -> ~180 ms settle)
+_IMPOSTER_SETTLE_DELAY_SEC: float = 0.18
+_IMPOSTER_SETTLE_DEADLINE: float = 0.0
+_IMPOSTER_SETTLE_SCHEDULED: bool = False
+_IMPOSTER_PENDING_DIRTY: set[str] | None = None
+_IMPOSTER_SETTLE_IN_FLIGHT: bool = False
+
 
 def is_gpu_poll_active() -> bool:
     """Return True while the 60 Hz async GPU poll loop is actively receiving drag frames."""
     return _GPU_POLL_ACTIVE
+
+
+def _cancel_imposter_settle() -> None:
+    global _IMPOSTER_SETTLE_DEADLINE, _IMPOSTER_SETTLE_SCHEDULED
+    global _IMPOSTER_PENDING_DIRTY, _IMPOSTER_SETTLE_IN_FLIGHT
+    _IMPOSTER_SETTLE_DEADLINE = 0.0
+    _IMPOSTER_SETTLE_SCHEDULED = False
+    _IMPOSTER_PENDING_DIRTY = None
+    _IMPOSTER_SETTLE_IN_FLIGHT = False
+    gpu_imposter.deactivate_imposter_drag()
 
 
 @contextmanager
@@ -54,6 +71,7 @@ def suspend():
     prev = _IS_SYNCING
     _IS_SYNCING = True
     _GPU_POLL_ACTIVE = False
+    _cancel_imposter_settle()
     gpu_preview.end_drag_preview()
     try:
         yield
@@ -153,6 +171,7 @@ def reset_sync_cache(session_id: str | None = None) -> None:
     _GPU_POLL_ACTIVE = False
     _LAST_ADOPT_SIG = None
     _LAST_EDIT_CUTTER_NAME = ""
+    _cancel_imposter_settle()
     gpu_preview.end_drag_preview()
     if session_id is None:
         _LAST_CUTTER_STATES.clear()
@@ -406,12 +425,156 @@ def _gpu_poll_timer() -> float | None:
         if all_caught_up:
             # Sleep cleanly (0% idle CPU) while Textured GPU Preview stays displayed on screen!
             _GPU_POLL_ACTIVE = False
+            global _IMPOSTER_SETTLE_IN_FLIGHT
+            if _IMPOSTER_SETTLE_IN_FLIGHT and _IMPOSTER_SETTLE_DEADLINE <= 0.0:
+                _IMPOSTER_SETTLE_IN_FLIGHT = False
+                gpu_imposter.deactivate_imposter_drag()
+                gpu_preview.tag_redraw()
             return None
         return _POLL_INTERVAL_SEC
     except Exception as exc:
         print(f"[FullDestruc_Tool] Textured GPU preview poll error: {exc}")
         _GPU_POLL_ACTIVE = False
         return None
+
+
+def _imposter_settle_timer() -> float | None:
+    """Fires ~180 ms after cutter drag stops to run 1 background Rust Delta commit."""
+    global _IMPOSTER_SETTLE_SCHEDULED, _IMPOSTER_SETTLE_DEADLINE
+    global _IMPOSTER_PENDING_DIRTY, _IMPOSTER_SETTLE_IN_FLIGHT
+
+    if not _IMPOSTER_SETTLE_SCHEDULED:
+        return None
+    if _IS_SYNCING:
+        return 0.05
+
+    now = time.perf_counter()
+    remaining = _IMPOSTER_SETTLE_DEADLINE - now
+    if remaining > 0.005:
+        return max(remaining, 0.02)
+
+    _IMPOSTER_SETTLE_SCHEDULED = False
+    _IMPOSTER_SETTLE_DEADLINE = 0.0
+    dirty = _IMPOSTER_PENDING_DIRTY
+    _IMPOSTER_PENDING_DIRTY = None
+
+    scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        gpu_imposter.deactivate_imposter_drag()
+        return None
+    settings = getattr(scene, "fdt_settings", None)
+    if (
+        settings is None
+        or getattr(settings, "boolean_solver", "") != "RUST"
+        or not bool(getattr(settings, "gpu_fast_drag", True))
+    ):
+        gpu_imposter.deactivate_imposter_drag()
+        return None
+    session = load_session_readonly(scene)
+    if session is None:
+        gpu_imposter.deactivate_imposter_drag()
+        return None
+
+    try:
+        _IMPOSTER_SETTLE_IN_FLIGHT = True
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        start_gpu_async_update(scene, depsgraph, dirty_cutter_names=dirty)
+        # If no async job was needed (already caught up), hand off immediately
+        if not _GPU_POLL_ACTIVE:
+            _IMPOSTER_SETTLE_IN_FLIGHT = False
+            gpu_imposter.deactivate_imposter_drag()
+            gpu_preview.tag_redraw()
+    except Exception as exc:
+        print(f"[FullDestruc_Tool] Imposter settle sync error: {exc}")
+        _IMPOSTER_SETTLE_IN_FLIGHT = False
+        gpu_imposter.deactivate_imposter_drag()
+    return None
+
+
+def _try_handle_imposter_drag(
+    scene: bpy.types.Scene,
+    session,
+    settings,
+    active_cutters: list[tuple[bpy.types.Object, str]],
+    dirty_cutter_names: set[str],
+    order_changed: bool,
+) -> bool:
+    """Attempt 0-ms-Rust Imposter Drag update. Returns True if handled by Imposter."""
+    global _IMPOSTER_SETTLE_DEADLINE, _IMPOSTER_SETTLE_SCHEDULED
+    global _IMPOSTER_PENDING_DIRTY, _IMPOSTER_SETTLE_IN_FLIGHT
+
+    if order_changed or not gpu_preview.is_active() or not gpu_preview.has_target_gpu_state():
+        return False
+
+    mode = str(getattr(settings, "imposter_drag_mode", "AUTO") or "AUTO").upper()
+    if mode == "OFF":
+        return False
+    threshold = int(getattr(settings, "imposter_poly_threshold", 100_000) or 100_000)
+    targets = session.get_target_objects()
+    total_polys = sum(
+        len(t.data.polygons) for t in targets if t.type == "MESH" and t.data is not None
+    )
+    if not gpu_imposter.should_activate_imposter(mode, threshold, total_polys, len(active_cutters)):
+        return False
+
+    t0 = time.perf_counter()
+    from . import apple_bite
+
+    rough_names = {e.name for e in session.cutters if bool(getattr(e, "rough", False))}
+    sel_zones = (
+        gpu_preview.get_selected_cutter_zones()
+        if str(getattr(settings, "preview_display_mode", "ALL") or "ALL").upper() == "PIECES"
+        else set()
+    )
+    ok = gpu_imposter.activate_imposter_drag(
+        active_cutters,
+        apple_bite.get_zone_color,
+        rough_names=rough_names,
+        selected_zones=sel_zones,
+    )
+    if not ok:
+        return False
+
+    gpu_preview.tag_redraw()
+    upd_ms = (time.perf_counter() - t0) * 1000.0
+
+    # Accumulate dirty cutters for the single settle Rust commit ~180 ms after mouse release
+    if _IMPOSTER_PENDING_DIRTY is None:
+        _IMPOSTER_PENDING_DIRTY = set(dirty_cutter_names) if dirty_cutter_names else None
+    elif dirty_cutter_names:
+        _IMPOSTER_PENDING_DIRTY.update(dirty_cutter_names)
+
+    _IMPOSTER_SETTLE_IN_FLIGHT = False
+    _IMPOSTER_SETTLE_DEADLINE = time.perf_counter() + _IMPOSTER_SETTLE_DELAY_SEC
+    if not _IMPOSTER_SETTLE_SCHEDULED:
+        _IMPOSTER_SETTLE_SCHEDULED = True
+        bpy.app.timers.register(_imposter_settle_timer, first_interval=_IMPOSTER_SETTLE_DELAY_SEC)
+
+    if targets:
+        t0_obj = targets[0]
+        profiler.record_eval(
+            profiler.EvalSample(
+                timestamp=time.perf_counter(),
+                session_id=session.session_id,
+                target_name=t0_obj.name,
+                solver="GPU_IMPOSTER",
+                target_verts=len(t0_obj.data.vertices) if t0_obj.data is not None else 0,
+                target_polys=total_polys,
+                num_cutters=len(active_cutters),
+                cutter_total_polys=0,
+                out_rem_verts=0,
+                out_rem_polys=0,
+                out_pieces_verts=0,
+                out_pieces_polys=len(dirty_cutter_names),
+                target_uploaded=False,
+                upload_ms=0.0,
+                extract_ms=0.0,
+                rust_ms=0.0,
+                writeback_ms=upd_ms,
+                total_ms=upd_ms,
+            )
+        )
+    return True
 
 
 def _trailing_sync_timer() -> float | None:
@@ -703,6 +866,9 @@ def _on_depsgraph_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph)
         _LAST_CUTTER_ORDER[session.session_id] = cur_order
         if order_changed or (dirty_cutter_names and (len(dirty_cutter_names) > 1 or active_name not in dirty_cutter_names)):
             gpu_preview.mark_cutter_wireframes_dirty()
+        if _try_handle_imposter_drag(scene, session, settings, active_cutters, dirty_cutter_names, order_changed):
+            return
+        _cancel_imposter_settle()
         start_gpu_async_update(scene, depsgraph, dirty_cutter_names=dirty_cutter_names)
         return
 
@@ -744,6 +910,7 @@ def unregister() -> None:
     _GPU_POLL_ACTIVE = False
     _LAST_ADOPT_SIG = None
     _LAST_EDIT_CUTTER_NAME = ""
+    _cancel_imposter_settle()
     gpu_preview.unregister()
     handlers = bpy.app.handlers.depsgraph_update_post
     for h in list(handlers):
