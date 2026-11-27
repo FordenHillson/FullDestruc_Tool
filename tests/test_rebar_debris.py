@@ -352,6 +352,7 @@ def test_e13_main_panel_has_tool_rail_on_the_left() -> None:
             self.popovers = []
             self.scale_x = 1.0
             self.scale_y = 1.0
+            self.ui_units_x = 0.0
             self.enabled = True
             self.alert = False
 

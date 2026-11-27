@@ -110,7 +110,7 @@ def _draw_basics(box, context, settings) -> None:
     target_row = basic.row(align=True)
     if settings.target_material is None:
         target_row.alert = True
-    target_row.prop(settings, "target_material", text="Mat", icon=REBAR_ICONS["target"])
+    target_row.prop(settings, "target_material", text="", icon=REBAR_ICONS["target"])
     pick = target_row.operator(
         "fdt.rebar_pick_material",
         text="",

@@ -318,10 +318,11 @@ class FDT_PT_main_panel(bpy.types.Panel):
         settings = scene.fdt_settings
         session = load_session(scene)
 
-        # Zen UV-style left vertical tool rail with colored flat icons
-        body = layout.split(factor=0.16)
+        # Zen UV-style left vertical tool rail with tight fixed width (zero wasted gutter)
+        body = layout.row(align=False)
         rail = body.column(align=True)
-        detail = body.column()
+        rail.ui_units_x = 1.35
+        detail = body.column(align=False)
 
         for tool_id, custom_ico, fallback_ico in _TOOL_TABS:
             btn_row = rail.row(align=True)
@@ -409,7 +410,7 @@ class FDT_PT_main_panel(bpy.types.Panel):
             )
         else:
             row = layout.row()
-            row.scale_y = 1.55
+            row.scale_y = 1.5
             row.enabled = mode != "NONE"
             btn_ico = (
                 icons.icon_kw("reedit_cyan", "LOOP_BACK")
@@ -438,8 +439,7 @@ class FDT_PT_main_panel(bpy.types.Panel):
         )
         if show_applied_tools or has_mesh:
             settings = context.scene.fdt_settings
-            layout.separator(factor=0.6)
-            draw_cut_material_row(layout, settings, text="Mat")
+            draw_cut_material_row(layout, settings, text="")
             tools = layout.row(align=True)
             if show_applied_tools:
                 sub_am = tools.row(align=True)
@@ -473,7 +473,9 @@ class FDT_PT_main_panel(bpy.types.Panel):
 
         # 1. Clean 1-Row Zone Strip: [● Color Dot] [Zone Dropdown] [⊞ Zones Popover]
         z_row = layout.row(align=True)
-        z_row.label(text="", **icons.get_zone_dot_icon_kw(settings.active_zone, context.scene))
+        z_dot = z_row.row(align=True)
+        z_dot.ui_units_x = 1.1
+        z_dot.label(text="", **icons.get_zone_dot_icon_kw(settings.active_zone, context.scene))
         z_row.prop(settings, "active_zone", text="")
         z_row.popover(
             panel=FDT_PT_popover_zones.bl_idname,
@@ -539,7 +541,7 @@ class FDT_PT_main_panel(bpy.types.Panel):
         )
 
         # 4. 1-Row Cut Material + Eyedropper + Output Popover
-        mat_row = draw_cut_material_row(layout, settings, text="Mat")
+        mat_row = draw_cut_material_row(layout, settings, text="")
         mat_row.popover(
             panel=FDT_PT_popover_output.bl_idname,
             text="",
