@@ -745,19 +745,92 @@ def enter_session(
     return True, f"เริ่มตัด {len(valid_targets)} ชิ้นแล้ว — กด '+ วางกล่องตัด' เพื่อเริ่มได้เลย", session
 
 
+_REEDIT_KEEP_VISIBLE_TYPES = frozenset({"CAMERA", "LIGHT", "LIGHT_PROBE"})
+
+
+def _collect_session_objects(session: AppleBiteSession) -> set[bpy.types.Object]:
+    """Return every Blender object belonging to any collection of `session`."""
+    cols = session.get_collections()
+    objs: set[bpy.types.Object] = set()
+    root_col = cols.get("root")
+    if root_col is not None:
+        objs.update(root_col.all_objects)
+    for key in ("cutters", "results", "pieces", "vault", "final"):
+        col = cols.get(key)
+        if col is not None:
+            objs.update(col.all_objects)
+    return objs
+
+
+def _isolate_reedit_session_objects(
+    context: bpy.types.Context,
+    session: AppleBiteSession,
+) -> list[str]:
+    """Hide all currently visible non-session objects so Re-edit focuses solely on this session."""
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        return list(session.reedit_hidden_names)
+    session_objs = _collect_session_objects(session)
+    recorded = list(session.reedit_hidden_names)
+    recorded_set = set(recorded)
+
+    for obj in list(view_layer.objects):
+        if obj in session_objs:
+            continue
+        if obj.type in _REEDIT_KEEP_VISIBLE_TYPES:
+            continue
+        if obj.hide_viewport:
+            continue
+        try:
+            if obj.hide_get():
+                continue
+            obj.hide_set(True)
+            if obj.name not in recorded_set:
+                recorded.append(obj.name)
+                recorded_set.add(obj.name)
+        except Exception:
+            pass
+
+    session.reedit_hidden_names = recorded
+    return recorded
+
+
+def _restore_reedit_hidden_objects(session: AppleBiteSession | None) -> int:
+    """Restore visibility of all non-session objects temporarily hidden when entering Re-edit."""
+    if session is None or not session.reedit_hidden_names:
+        return 0
+    restored = 0
+    for name in list(session.reedit_hidden_names):
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            continue
+        try:
+            obj.hide_set(False)
+            restored += 1
+        except Exception:
+            pass
+    session.reedit_hidden_names.clear()
+    return restored
+
+
 def resume_session(
     context: bpy.types.Context,
     session_id: str,
 ) -> tuple[bool, str, AppleBiteSession | None]:
     """Re-open an exited or already-applied Apple Bite session for further editing.
 
-    Temporarily hides FDT_Final_<id> (if present) and unhides FDT_Bite_<id>,
-    while keeping FDT_Vault_<id> strictly hidden & protected.
+    Temporarily hides FDT_Final_<id> (if present) and all other non-session objects
+    so the user sees ONLY the re-edited object(s), while keeping FDT_Vault_<id>
+    strictly hidden & protected.
     """
     scene = context.scene
     sess = load_stored_session_by_id(session_id)
     if sess is None:
         return False, f"ไม่พบข้อมูลงานตัด '{session_id}'", None
+
+    prev_active = load_session(scene)
+    if prev_active is not None and prev_active.session_id != sess.session_id:
+        _restore_reedit_hidden_objects(prev_active)
 
     cols = sess.get_collections()
     # Exclude & hide baked Final collection so user ONLY sees live working cuts (zero overlap!)
@@ -772,6 +845,9 @@ def resume_session(
             set_collection_excluded(context.view_layer, cols[key], False)
     if cols["vault"] is not None:
         set_collection_hidden(context.view_layer, cols["vault"], True)
+
+    # Isolate view to ONLY this re-edited session (hide all other visible scene objects)
+    _isolate_reedit_session_objects(context, sess)
 
     save_session(scene, sess)
     rebuild_session(context)
@@ -2602,6 +2678,9 @@ def apply_session(
                     if baked is not None:
                         baked_objects.append(baked)
 
+    # Restore any non-session objects temporarily hidden when entering Re-edit mode
+    _restore_reedit_hidden_objects(session)
+
     # Persist metadata on root_col BEFORE clearing active scene flag so Re-edit works later!
     save_session(scene, session, persist_meta=True)
 
@@ -2644,6 +2723,8 @@ def exit_session(context: bpy.types.Context) -> tuple[bool, str]:
     cols = session.get_collections()
     if cols["vault"] is not None:
         set_collection_hidden(context.view_layer, cols["vault"], True)
+
+    _restore_reedit_hidden_objects(session)
 
     save_session(scene, session, persist_meta=True)
     save_session(scene, None)
@@ -2726,6 +2807,8 @@ def cancel_session(context: bpy.types.Context) -> tuple[bool, str]:
     restored = restore_originals_from_vault(scene, cols["vault"])
     keep_set = set(restored)
 
+    _restore_reedit_hidden_objects(session)
+
     _cleanup_session_collections_and_strays(
         [session.session_id],
         {session.session_id: session},
@@ -2780,6 +2863,10 @@ def reset_to_original(
 
     all_sessions = load_all_stored_sessions(scene)
 
+    # Restore any non-session objects temporarily hidden while re-editing any session in this family
+    for fid in family_ids:
+        _restore_reedit_hidden_objects(all_sessions.get(fid))
+
     # 1. Restore true root original(s) from root vault(s) back to the main scene collection
     restored: list[bpy.types.Object] = []
     restored_set: set[bpy.types.Object] = set()
@@ -2805,6 +2892,7 @@ def reset_to_original(
         live_sync.reset_sync_cache(fid)
     active_sess = load_session(scene)
     if active_sess is not None and active_sess.session_id in family_ids:
+        _restore_reedit_hidden_objects(active_sess)
         save_session(scene, None)
 
     context.view_layer.update()

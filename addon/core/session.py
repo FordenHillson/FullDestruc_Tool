@@ -31,6 +31,7 @@ class AppleBiteSession:
     final_col_name: str = ""
     target_names: list[str] = field(default_factory=list)
     cutters: list[CutterEntry] = field(default_factory=list)
+    reedit_hidden_names: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -46,6 +47,7 @@ class AppleBiteSession:
                 {"name": c.name, "zone": c.zone, "muted": bool(c.muted), "rough": bool(c.rough)}
                 for c in self.cutters
             ],
+            "reedit_hidden_names": list(self.reedit_hidden_names),
         }
 
     @classmethod
@@ -71,6 +73,7 @@ class AppleBiteSession:
             final_col_name=data.get("final_col_name") or f"FDT_Final_{sid}",
             target_names=list(data.get("target_names", [])),
             cutters=cutters,
+            reedit_hidden_names=list(data.get("reedit_hidden_names", [])),
         )
 
     def get_collections(self) -> dict[str, bpy.types.Collection | None]:
@@ -105,6 +108,7 @@ class AppleBiteSession:
     def prune_missing(self) -> None:
         self.target_names = [n for n in self.target_names if n in bpy.data.objects]
         self.cutters = [c for c in self.cutters if c.name in bpy.data.objects]
+        self.reedit_hidden_names = [n for n in self.reedit_hidden_names if n in bpy.data.objects]
 
     def is_valid(self) -> bool:
         self.prune_missing()
