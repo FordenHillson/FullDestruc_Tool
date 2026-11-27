@@ -993,8 +993,29 @@ class FDT_OT_view_mode_wheel_menu(bpy.types.Operator):
         if _active_view_wheel is not None:
             _active_view_wheel._cleanup(context)
 
-        self._cx = float(self.cx)
-        self._cy = float(self.cy)
+        cx = float(self.cx)
+        cy = float(self.cy)
+        if cx <= 0.0 and cy <= 0.0:
+            cx = float(getattr(event, "mouse_region_x", 0.0))
+            cy = float(getattr(event, "mouse_region_y", 0.0))
+
+        # Keep the entire wheel visible inside the 3D Viewport (e.g. when invoked from the bottom dock)
+        region = getattr(context, "region", None)
+        if region is not None:
+            pad = VIEW_WHEEL_OUTER + 18.0
+            rw = float(region.width)
+            rh = float(region.height)
+            if rw > pad * 2.0:
+                cx = max(pad, min(rw - pad, cx))
+            else:
+                cx = rw * 0.5
+            if rh > pad * 2.0:
+                cy = max(pad, min(rh - pad, cy))
+            else:
+                cy = rh * 0.5
+
+        self._cx = cx
+        self._cy = cy
         self._hovered_main = None
         self._hovered_hole = None
         _active_view_wheel = self
