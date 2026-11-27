@@ -94,6 +94,7 @@ struct CompletedLegacyFrame {
 }
 
 struct WorkerShared {
+    pending_targets: HashMap<(u64, u32), (HybridMesh, DMat4)>,
     pending: HashMap<(u64, u32), PendingJob>,
     in_flight: HashSet<(u64, u32)>,
     completed_delta_meta: HashMap<(u64, u32), CompletedMeta>,
@@ -112,6 +113,7 @@ fn get_worker() -> &'static AsyncWorker {
     WORKER.get_or_init(|| {
         let worker = AsyncWorker {
             state: Mutex::new(WorkerShared {
+                pending_targets: HashMap::new(),
                 pending: HashMap::new(),
                 in_flight: HashSet::new(),
                 completed_delta_meta: HashMap::new(),
@@ -128,31 +130,80 @@ fn get_worker() -> &'static AsyncWorker {
     })
 }
 
+fn wait_for_target_idle(handle: u64, target_id: u32) {
+    let key = (handle, target_id);
+    if let Some(worker) = WORKER.get() {
+        let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        while st.pending_targets.contains_key(&key)
+            || st.pending.contains_key(&key)
+            || st.in_flight.contains(&key)
+        {
+            st = worker.done_cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+enum WorkerTask {
+    SetTarget {
+        base_mesh: HybridMesh,
+        world_mat: DMat4,
+    },
+    Job(PendingJob),
+}
+
 fn worker_thread_loop() {
     let worker = get_worker();
     loop {
-        let (key, job) = {
+        let (key, task) = {
             let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-            while st.pending.is_empty() {
+            while st.pending_targets.is_empty() && st.pending.is_empty() {
                 st = worker.work_cvar.wait(st).unwrap_or_else(|e| e.into_inner());
             }
-            let first_key = *st.pending.keys().next().unwrap();
-            let job = st.pending.remove(&first_key).unwrap();
-            st.in_flight.insert(first_key);
-            (first_key, job)
+            if let Some(&first_key) = st.pending_targets.keys().next() {
+                let (base_mesh, world_mat) = st.pending_targets.remove(&first_key).unwrap();
+                st.in_flight.insert(first_key);
+                (first_key, WorkerTask::SetTarget { base_mesh, world_mat })
+            } else {
+                let first_key = *st.pending.keys().next().unwrap();
+                let job = st.pending.remove(&first_key).unwrap();
+                st.in_flight.insert(first_key);
+                (first_key, WorkerTask::Job(job))
+            }
         };
 
         let (handle, target_id) = key;
         let t0 = Instant::now();
 
-        match job {
-            PendingJob::Delta {
+        match task {
+            WorkerTask::SetTarget {
+                base_mesh,
+                world_mat,
+            } => {
+                let built = catch_unwind(|| {
+                    let mut tc = IslandTargetState::new(base_mesh, world_mat);
+                    tc.prewarm_base_gpu();
+                    Arc::new(Mutex::new(tc))
+                });
+                if let Ok(state_arc) = built {
+                    with_sessions(|map| {
+                        if let Some(sess) = map.get_mut(&handle) {
+                            sess.targets.insert(target_id, state_arc);
+                        }
+                    });
+                }
+                let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.completed_delta_meta.remove(&key);
+                st.completed_legacy.remove(&key);
+                st.in_flight.remove(&key);
+                worker.done_cvar.notify_all();
+            }
+            WorkerTask::Job(PendingJob::Delta {
                 job_id,
                 updated_cutters,
                 ordered_active_ids,
                 cut_mat_idx,
                 uv_scale,
-            } => {
+            }) => {
                 let res = catch_unwind(|| {
                     let target_arc = get_target_arc(handle, target_id)?;
                     let mut tc = target_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -181,12 +232,12 @@ fn worker_thread_loop() {
                 st.in_flight.remove(&key);
                 worker.done_cvar.notify_all();
             }
-            PendingJob::FullLegacy {
+            WorkerTask::Job(PendingJob::FullLegacy {
                 job_id,
                 raw_cutters,
                 cut_mat_idx,
                 uv_scale,
-            } => {
+            }) => {
                 let res = catch_unwind(|| {
                     let target_arc = get_target_arc(handle, target_id)?;
                     let mut tc = target_arc.lock().unwrap_or_else(|e| e.into_inner());
@@ -225,7 +276,7 @@ fn worker_thread_loop() {
 }
 
 // ---------------------------------------------------------------------------
-// C-ABI Structs (v1.x + v2.0 Delta)
+// C-ABI Structs (v1.x + v2.0/v2.1 Delta)
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
@@ -305,6 +356,12 @@ pub struct FdtGpuChunkDelta {
 }
 
 #[repr(C)]
+pub struct FdtGpuChunkOwner {
+    pub chunk_id: u32,
+    pub owner_cutter_id: u32,
+}
+
+#[repr(C)]
 pub struct FdtGpuPieceDelta {
     pub cutter_id: u32,
     pub mesh: FdtGpuMeshData,
@@ -325,6 +382,9 @@ pub struct FdtGpuDeltaOutput {
     pub removed_piece_ids: *mut u32,
     pub num_ordered_pieces: u32,
     pub ordered_piece_ids: *mut u32,
+    /// v210: whole base chunks whose owner changed (`0` = Remaining, `> 0` = Piece of cutter_id).
+    pub num_chunk_owners: u32,
+    pub chunk_owners: *mut FdtGpuChunkOwner,
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +740,21 @@ fn pack_delta_output(
         std::ptr::null_mut()
     };
 
+    let chunk_owners: Vec<FdtGpuChunkOwner> = snap
+        .chunk_owners
+        .into_iter()
+        .map(|(chunk_id, owner_cutter_id)| FdtGpuChunkOwner {
+            chunk_id,
+            owner_cutter_id,
+        })
+        .collect();
+    let num_chunk_owners = chunk_owners.len() as u32;
+    let chunk_owners_ptr = if num_chunk_owners > 0 {
+        Box::into_raw(chunk_owners.into_boxed_slice()) as *mut FdtGpuChunkOwner
+    } else {
+        std::ptr::null_mut()
+    };
+
     Box::into_raw(Box::new(FdtGpuDeltaOutput {
         job_id,
         compute_ms,
@@ -694,16 +769,18 @@ fn pack_delta_output(
         removed_piece_ids: removed_piece_ids_ptr,
         num_ordered_pieces,
         ordered_piece_ids: ordered_piece_ids_ptr,
+        num_chunk_owners,
+        chunk_owners: chunk_owners_ptr,
     }))
 }
 
 // ---------------------------------------------------------------------------
-// Exported C-ABI Functions (v2.0.0)
+// Exported C-ABI Functions (v2.1.0)
 // ---------------------------------------------------------------------------
 
 #[no_mangle]
 pub extern "C" fn fdt_engine_version() -> u32 {
-    200 // v2.0.0 (Spatial Chunks + Spatial Islands + Incremental Delta GPU Pipeline)
+    210 // v2.1.0 (Chunk-Level Interior Ownership + Zero-BVH-Rebuild + Async Target Upload)
 }
 
 #[no_mangle]
@@ -728,6 +805,7 @@ pub extern "C" fn fdt_session_destroy(handle: u64) -> i32 {
     catch_unwind(|| {
         if let Some(worker) = WORKER.get() {
             let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.pending_targets.retain(|&(h, _), _| h != handle);
             st.pending.retain(|&(h, _), _| h != handle);
             st.completed_delta_meta.retain(|&(h, _), _| h != handle);
             st.completed_legacy.retain(|&(h, _), _| h != handle);
@@ -754,9 +832,14 @@ pub unsafe extern "C" fn fdt_session_set_target(
         let state = Arc::new(Mutex::new(IslandTargetState::new(base_mesh, world_mat)));
         if let Some(worker) = WORKER.get() {
             let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.pending.remove(&(handle, target_id));
-            st.completed_delta_meta.remove(&(handle, target_id));
-            st.completed_legacy.remove(&(handle, target_id));
+            let key = (handle, target_id);
+            st.pending_targets.remove(&key);
+            st.pending.remove(&key);
+            st.completed_delta_meta.remove(&key);
+            st.completed_legacy.remove(&key);
+            while st.in_flight.contains(&key) {
+                st = worker.done_cvar.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
         }
         with_sessions(|map| {
             if let Some(sess) = map.get_mut(&handle) {
@@ -766,6 +849,38 @@ pub unsafe extern "C" fn fdt_session_set_target(
                 -1
             }
         })
+    })
+    .unwrap_or(-99)
+}
+
+/// v210 Non-blocking async target upload: copies raw mesh arrays on Main Thread,
+/// then builds the SpatialChunks + Dipole BVH + pre-warmed base GPU buffers on
+/// the background worker thread so Blender NEVER freezes ("Not Responding") on
+/// 4M-triangle targets!
+#[no_mangle]
+pub unsafe extern "C" fn fdt_session_set_target_async(
+    handle: u64,
+    target_id: u32,
+    input: *const FdtMeshInput,
+) -> i32 {
+    catch_unwind(|| {
+        if input.is_null() {
+            return -2;
+        }
+        let exists = with_sessions(|map| map.contains_key(&handle));
+        if !exists {
+            return -1;
+        }
+        let (base_mesh, world_mat) = read_mesh_input(&*input);
+        let worker = get_worker();
+        let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+        let key = (handle, target_id);
+        st.pending_targets.insert(key, (base_mesh, world_mat));
+        st.pending.remove(&key);
+        st.completed_delta_meta.remove(&key);
+        st.completed_legacy.remove(&key);
+        worker.work_cvar.notify_one();
+        0
     })
     .unwrap_or(-99)
 }
@@ -794,6 +909,8 @@ pub unsafe extern "C" fn fdt_session_eval_cutters(
             .iter()
             .map(|c| read_mesh_input(c))
             .collect();
+
+        wait_for_target_idle(handle, target_id);
 
         let target_arc = match get_target_arc(handle, target_id) {
             Some(a) => a,
@@ -1005,6 +1122,13 @@ pub unsafe extern "C" fn fdt_gpu_delta_free(ptr: *mut FdtGpuDeltaOutput) {
                 n,
             ));
         }
+        if !boxed.chunk_owners.is_null() {
+            let n = boxed.num_chunk_owners as usize;
+            let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                boxed.chunk_owners,
+                n,
+            ));
+        }
     });
 }
 
@@ -1081,13 +1205,7 @@ pub extern "C" fn fdt_session_fetch_cached_eval(
     include_edges: u8,
 ) -> *mut FdtEvalOutput {
     catch_unwind(|| {
-        let key = (handle, target_id);
-        if let Some(worker) = WORKER.get() {
-            let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-            while st.pending.contains_key(&key) || st.in_flight.contains(&key) {
-                st = worker.done_cvar.wait(st).unwrap_or_else(|e| e.into_inner());
-            }
-        }
+        wait_for_target_idle(handle, target_id);
 
         let gen_edges = include_edges != 0;
         let target_arc = match get_target_arc(handle, target_id) {
@@ -1366,6 +1484,181 @@ mod async_tests {
 
         // Second poll with same job_id returns NULL
         assert!(fdt_session_poll_gpu_delta(h, 1, jid1).is_null());
+
+        assert_eq!(fdt_session_destroy(h), 0);
+    }
+
+    #[test]
+    fn test_v210_async_target_and_chunk_owners() {
+        assert_eq!(fdt_engine_version(), 210);
+        let h = fdt_session_create();
+        assert!(h > 0);
+
+        // Build a 60x60x6 = 21,600-quad (43,200-tri) 2m x 2m x 2m subdivided cube (many spatial chunks!)
+        let n = 60usize;
+        let stride = n + 1;
+        let mut verts = Vec::with_capacity(6 * stride * stride * 3);
+        let mut loops = Vec::with_capacity(6 * n * n * 4);
+        let mut starts = Vec::with_capacity(6 * n * n + 1);
+        starts.push(0u32);
+        let mut mats = Vec::with_capacity(6 * n * n);
+        let mut uvs = Vec::with_capacity(6 * n * n * 8);
+        let inv_n = 1.0f32 / (n as f32);
+
+        for side in 0..6usize {
+            let base_v = (verts.len() / 3) as u32;
+            for iy in 0..=n {
+                let tv = (iy as f32) * inv_n;
+                for ix in 0..=n {
+                    let tu = (ix as f32) * inv_n;
+                    let u = -1.0 + 2.0 * tu;
+                    let v = -1.0 + 2.0 * tv;
+                    let (x, y, z) = match side {
+                        0 => (u, v, 1.0),
+                        1 => (u, -v, -1.0),
+                        2 => (u, -1.0, v),
+                        3 => (-u, 1.0, v),
+                        4 => (1.0, u, v),
+                        _ => (-1.0, -u, v),
+                    };
+                    verts.extend_from_slice(&[x, y, z]);
+                }
+            }
+            for iy in 0..n {
+                for ix in 0..n {
+                    let i00 = base_v + (iy * stride + ix) as u32;
+                    let i10 = base_v + (iy * stride + ix + 1) as u32;
+                    let i11 = base_v + ((iy + 1) * stride + ix + 1) as u32;
+                    let i01 = base_v + ((iy + 1) * stride + ix) as u32;
+                    loops.extend_from_slice(&[i00, i10, i11, i01]);
+                    starts.push(loops.len() as u32);
+                    mats.push(0);
+                    uvs.extend_from_slice(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
+                }
+            }
+        }
+        let ident = [
+            1.0f32, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let t_inp = FdtMeshInput {
+            num_verts: (verts.len() / 3) as u32,
+            verts_xyz: verts.as_ptr(),
+            num_loops: loops.len() as u32,
+            loop_verts: loops.as_ptr(),
+            num_polys: mats.len() as u32,
+            poly_starts: starts.as_ptr(),
+            mat_ids: mats.as_ptr(),
+            num_uv_layers: 1,
+            uv_data: uvs.as_ptr(),
+            world_matrix: ident.as_ptr(),
+            loop_normals: std::ptr::null(),
+        };
+
+        // 1. Async target upload returns immediately
+        unsafe {
+            assert_eq!(fdt_session_set_target_async(h, 1, &t_inp), 0);
+        }
+
+        // 2. Submit a large cutter covering the ENTIRE +X half (x in [0.0, 2.0]) -> multiple strictly-interior chunks!
+        let (cv, cl, cs, cm, cuv, cmat) = box_input_at(1.0, 0.0, 0.0, 1.0, 1.5, 1.5);
+        let c_inp = FdtMeshInput {
+            num_verts: 8,
+            verts_xyz: cv.as_ptr(),
+            num_loops: 24,
+            loop_verts: cl.as_ptr(),
+            num_polys: 6,
+            poly_starts: cs.as_ptr(),
+            mat_ids: cm.as_ptr(),
+            num_uv_layers: 0,
+            uv_data: cuv.as_ptr(),
+            world_matrix: cmat.as_ptr(),
+            loop_normals: std::ptr::null(),
+        };
+        let cid = 42u32;
+        let jid1 = unsafe {
+            fdt_session_submit_async_delta(h, 1, &cid, &c_inp, 1, &cid, 1, 1, 0.5)
+        };
+        assert!(jid1 > 0);
+
+        // Wait for worker completion via fetch_cached_eval, verify full assembly has BOTH halves!
+        let ev_ptr = fdt_session_fetch_cached_eval(h, 1, 0);
+        assert!(!ev_ptr.is_null());
+        unsafe {
+            let ev = &*ev_ptr;
+            assert_eq!(ev.status, 0);
+            assert_eq!(ev.num_pieces, 1);
+            let p0 = &*ev.pieces.add(0);
+            // Total base quads = 21,600 -> half is ~10,800 quads each (piece + remaining)!
+            assert!(
+                p0.num_polys >= 9_000,
+                "Full assembled piece must include owned interior chunks! got {} polys",
+                p0.num_polys
+            );
+            assert!(
+                ev.remaining.num_polys >= 9_000,
+                "Full assembled remaining must include outside chunks! got {} polys",
+                ev.remaining.num_polys
+            );
+            fdt_eval_free(ev_ptr);
+        }
+
+        // Poll delta: must report chunk_owners flipping interior chunks to owner_cutter_id == 42!
+        let d1 = fdt_session_poll_gpu_delta(h, 1, 0);
+        assert!(!d1.is_null());
+        unsafe {
+            let delta = &*d1;
+            assert_eq!(delta.job_id, jid1);
+            assert!(
+                delta.num_chunk_owners > 0 && !delta.chunk_owners.is_null(),
+                "Expected interior chunks to flip via chunk_owners (0-copy GPU ownership)!"
+            );
+            let owners = std::slice::from_raw_parts(delta.chunk_owners, delta.num_chunk_owners as usize);
+            let owned_by_42 = owners.iter().filter(|o| o.owner_cutter_id == 42).count();
+            assert!(
+                owned_by_42 > 0,
+                "Expected at least 1 interior chunk owned by cutter 42, got 0"
+            );
+            fdt_gpu_delta_free(d1);
+        }
+
+        // Move cutter away (outside target at x = 10.0) -> chunk_owners must release all back to 0!
+        let (cv2, cl2, cs2, cm2, cuv2, cmat2) = box_input_at(10.0, 0.0, 0.0, 1.0, 1.5, 1.5);
+        let c_inp2 = FdtMeshInput {
+            num_verts: 8,
+            verts_xyz: cv2.as_ptr(),
+            num_loops: 24,
+            loop_verts: cl2.as_ptr(),
+            num_polys: 6,
+            poly_starts: cs2.as_ptr(),
+            mat_ids: cm2.as_ptr(),
+            num_uv_layers: 0,
+            uv_data: cuv2.as_ptr(),
+            world_matrix: cmat2.as_ptr(),
+            loop_normals: std::ptr::null(),
+        };
+        let jid2 = unsafe {
+            fdt_session_submit_async_delta(h, 1, &cid, &c_inp2, 1, &cid, 1, 1, 0.5)
+        };
+        let ev2 = fdt_session_fetch_cached_eval(h, 1, 0);
+        assert!(!ev2.is_null());
+        unsafe {
+            assert_eq!((*ev2).remaining.num_polys, 21_600);
+            assert_eq!((*(*ev2).pieces.add(0)).num_polys, 0);
+            fdt_eval_free(ev2);
+        }
+        let d2 = fdt_session_poll_gpu_delta(h, 1, jid1);
+        assert!(!d2.is_null());
+        unsafe {
+            let delta = &*d2;
+            assert_eq!(delta.job_id, jid2);
+            let owners = std::slice::from_raw_parts(delta.chunk_owners, delta.num_chunk_owners as usize);
+            let released = owners.iter().filter(|o| o.owner_cutter_id == 0).count();
+            assert!(released > 0, "Expected interior chunks released back to Remaining (0)");
+            fdt_gpu_delta_free(d2);
+        }
 
         assert_eq!(fdt_session_destroy(h), 0);
     }

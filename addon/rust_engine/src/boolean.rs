@@ -3,14 +3,16 @@
 
 use crate::box_uv::apply_cut_face_box_uv_from;
 use crate::bvh::Bvh;
-use crate::classify::{check_coplanar_surface, classify_point, Location};
+use crate::classify::{
+    check_coplanar_surface, classify_point, classify_point_convex, extract_convex_planes, Location,
+};
 use crate::mesh::{Aabb, CachedMeshGeo, HybridMesh, TriRef};
 use crate::predicates::{tri_tri_intersect, TriTriHit};
 use crate::retriangulate::{split_triangle, triangulate_cutter_poly_regions, OrientedCutSeg};
 use glam::{DMat4, DVec3};
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const PAIR_EPS: f64 = 1e-6;
 const WELD_EPS: f64 = 1e-6;
@@ -151,17 +153,84 @@ pub fn split_mesh_local_with_exclusions(
     winding_geo: Option<&CachedMeshGeo>,
     excluded_volumes: &[ExcludedVolume<'_>],
 ) -> (HybridMesh, HybridMesh) {
+    split_mesh_core(
+        target_geo,
+        None,
+        cutter,
+        None,
+        target_world,
+        cut_mat_idx,
+        uv_scale,
+        winding_geo,
+        excluded_volumes,
+    )
+}
+
+/// Zero-BVH-rebuild boundary split for single-cutter islands on ultra-high-poly (1M–4M+ tri) meshes.
+///
+/// Reuses `base_geo.bvh` AND precomputed `(cutter_tris, cutter_bvh)` directly — ZERO `extract_subset`,
+/// ZERO local BVH rebuild, and ONLY classifies `subset_polys` (boundary chunks, never interior chunks!).
+#[allow(clippy::too_many_arguments)]
+pub fn split_base_subset_single_cutter(
+    base_geo: &CachedMeshGeo,
+    subset_polys: &[u32],
+    cutter: &HybridMesh,
+    cutter_tris: &[TriRef],
+    cutter_bvh: &Bvh,
+    target_world: &DMat4,
+    cut_mat_idx: i32,
+    uv_scale: f32,
+) -> (HybridMesh, HybridMesh) {
+    split_mesh_core(
+        base_geo,
+        Some(subset_polys),
+        cutter,
+        Some((cutter_tris, cutter_bvh)),
+        target_world,
+        cut_mat_idx,
+        uv_scale,
+        Some(base_geo),
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn split_mesh_core(
+    target_geo: &CachedMeshGeo,
+    subset_polys: Option<&[u32]>,
+    cutter: &HybridMesh,
+    precomputed_cutter: Option<(&[TriRef], &Bvh)>,
+    target_world: &DMat4,
+    cut_mat_idx: i32,
+    uv_scale: f32,
+    winding_geo: Option<&CachedMeshGeo>,
+    excluded_volumes: &[ExcludedVolume<'_>],
+) -> (HybridMesh, HybridMesh) {
     let target = &target_geo.mesh;
     let num_uv_layers = target.num_uv_layers();
 
     if target.is_empty() || cutter.is_empty() || target_geo.tris.is_empty() {
-        return (target.clone(), HybridMesh::new(num_uv_layers));
+        return (
+            if subset_polys.is_some() {
+                HybridMesh::new(num_uv_layers)
+            } else {
+                target.clone()
+            },
+            HybridMesh::new(num_uv_layers),
+        );
     }
 
     let target_aabb = target_geo.aabb;
     let cutter_aabb = cutter.mesh_aabb();
     if !target_aabb.expanded(PAIR_EPS).overlaps(&cutter_aabb) {
-        return (target.clone(), HybridMesh::new(num_uv_layers));
+        return (
+            if let Some(sp) = subset_polys {
+                target.extract_subset(sp)
+            } else {
+                target.clone()
+            },
+            HybridMesh::new(num_uv_layers),
+        );
     }
 
     // Winding reference for cut-cap inside/outside tests (full base mesh when splitting a local subset!)
@@ -171,56 +240,122 @@ pub fn split_mesh_local_with_exclusions(
     let w_tris = &w_geo.tris;
     let w_bvh = &w_geo.bvh;
 
-    // 1. Build cutter triangle BVH (cutters are small, typically 6-200 polys)
-    let cutter_tris = cutter.extract_triangles();
-    if cutter_tris.is_empty() {
-        return (target.clone(), HybridMesh::new(num_uv_layers));
-    }
-    let cutter_tri_aabbs: Vec<Aabb> = cutter_tris
-        .iter()
-        .map(|t| tri_aabb(&cutter.positions, t))
-        .collect();
-    let cutter_bvh = Bvh::build_with_dipoles(&cutter_tri_aabbs, &cutter.positions, &cutter_tris);
+    // 1. Use precomputed cutter BVH when provided (0 ms!), otherwise build on the fly
+    let owned_cutter_tris: Vec<TriRef>;
+    let owned_cutter_bvh: Bvh;
+    let (cutter_tris, cutter_bvh): (&[TriRef], &Bvh) = if let Some(pre) = precomputed_cutter {
+        if pre.0.is_empty() {
+            return (
+                if let Some(sp) = subset_polys {
+                    target.extract_subset(sp)
+                } else {
+                    target.clone()
+                },
+                HybridMesh::new(num_uv_layers),
+            );
+        }
+        pre
+    } else {
+        owned_cutter_tris = cutter.extract_triangles();
+        if owned_cutter_tris.is_empty() {
+            return (
+                if let Some(sp) = subset_polys {
+                    target.extract_subset(sp)
+                } else {
+                    target.clone()
+                },
+                HybridMesh::new(num_uv_layers),
+            );
+        }
+        let cutter_tri_aabbs: Vec<Aabb> = owned_cutter_tris
+            .iter()
+            .map(|t| tri_aabb(&cutter.positions, t))
+            .collect();
+        owned_cutter_bvh =
+            Bvh::build_with_dipoles(&cutter_tri_aabbs, &cutter.positions, &owned_cutter_tris);
+        (&owned_cutter_tris, &owned_cutter_bvh)
+    };
 
     let target_tris = &target_geo.tris;
     let target_bvh = &target_geo.bvh;
 
-    // 2. Dual-BVH broadphase to find candidate intersecting triangle pairs
-    let mut candidate_pairs = Vec::new();
-    target_bvh.query_bvh_pairs(&cutter_bvh, PAIR_EPS, &mut candidate_pairs);
-
-    // 3. Narrowphase exact triangle-triangle intersections in parallel
-    let hits: Vec<(u32, u32, TriTriHit)> = candidate_pairs
-        .par_iter()
-        .filter_map(|&(ta_idx, tb_idx)| {
-            let ta = target_tris[ta_idx as usize];
-            let tb = cutter_tris[tb_idx as usize];
-            let a_pts = [
-                target.positions[ta.v[0] as usize],
-                target.positions[ta.v[1] as usize],
-                target.positions[ta.v[2] as usize],
-            ];
-            let b_pts = [
-                cutter.positions[tb.v[0] as usize],
-                cutter.positions[tb.v[1] as usize],
-                cutter.positions[tb.v[2] as usize],
-            ];
-            let hit = tri_tri_intersect(a_pts, b_pts);
-            match hit {
-                TriTriHit::None => None,
-                other => Some((ta_idx, tb_idx, other)),
-            }
-        })
-        .collect();
+    // 2. Broadphase to find candidate intersecting triangle pairs.
+    // For low/medium-poly cutters (boxes, sculpted, draw, rough <= 2048 tris), query each
+    // cutter triangle's tight AABB + supporting plane directly against `target_bvh` in parallel!
+    // This eliminates BVH leaf inflation (e.g. a 12-tri box's 2 leaves spanning 2M interior tris!).
+    let hits: Vec<(u32, u32, TriTriHit)> = if cutter_tris.len() <= 2048 {
+        (0..cutter_tris.len())
+            .into_par_iter()
+            .flat_map_iter(|tb_idx| {
+                let tb = cutter_tris[tb_idx];
+                let b_pts = [
+                    cutter.positions[tb.v[0] as usize],
+                    cutter.positions[tb.v[1] as usize],
+                    cutter.positions[tb.v[2] as usize],
+                ];
+                let mut local_ta: Vec<u32> = Vec::new();
+                target_bvh.query_tri_plane(b_pts[0], b_pts[1], b_pts[2], PAIR_EPS, &mut local_ta);
+                let mut local_hits: Vec<(u32, u32, TriTriHit)> = Vec::new();
+                for ta_idx in local_ta {
+                    let ta = target_tris[ta_idx as usize];
+                    if let Some(sp) = subset_polys {
+                        if sp.binary_search(&ta.poly_idx).is_err() {
+                            continue;
+                        }
+                    }
+                    let a_pts = [
+                        target.positions[ta.v[0] as usize],
+                        target.positions[ta.v[1] as usize],
+                        target.positions[ta.v[2] as usize],
+                    ];
+                    match tri_tri_intersect(a_pts, b_pts) {
+                        TriTriHit::None => {}
+                        other => local_hits.push((ta_idx, tb_idx as u32, other)),
+                    }
+                }
+                local_hits
+            })
+            .collect()
+    } else {
+        let mut candidate_pairs = Vec::new();
+        target_bvh.query_bvh_pairs(cutter_bvh, PAIR_EPS, &mut candidate_pairs);
+        candidate_pairs
+            .par_iter()
+            .filter_map(|&(ta_idx, tb_idx)| {
+                let ta = target_tris[ta_idx as usize];
+                if let Some(sp) = subset_polys {
+                    if sp.binary_search(&ta.poly_idx).is_err() {
+                        return None;
+                    }
+                }
+                let tb = cutter_tris[tb_idx as usize];
+                let a_pts = [
+                    target.positions[ta.v[0] as usize],
+                    target.positions[ta.v[1] as usize],
+                    target.positions[ta.v[2] as usize],
+                ];
+                let b_pts = [
+                    cutter.positions[tb.v[0] as usize],
+                    cutter.positions[tb.v[1] as usize],
+                    cutter.positions[tb.v[2] as usize],
+                ];
+                let hit = tri_tri_intersect(a_pts, b_pts);
+                match hit {
+                    TriTriHit::None => None,
+                    other => Some((ta_idx, tb_idx, other)),
+                }
+            })
+            .collect()
+    };
 
     // Group cut segments per target triangle and per WHOLE cutter polygon (tagged with target normal!)
     let mut segs_per_target_tri: HashMap<u32, Vec<[[f64; 3]; 2]>> = HashMap::new();
     let mut segs_per_cutter_poly: HashMap<u32, Vec<OrientedCutSeg>> = HashMap::new();
-    let mut touched_target_polys: Vec<bool> = vec![false; target.num_polys()];
+    let mut touched_poly_set: HashSet<u32> = HashSet::with_capacity(hits.len().min(65536));
 
     for (ta_idx, tb_idx, hit) in hits {
         let ta = target_tris[ta_idx as usize];
-        let poly_a = ta.poly_idx as usize;
+        let poly_a = ta.poly_idx;
         let poly_b = cutter_tris[tb_idx as usize].poly_idx;
         let a_pts = [
             target.positions[ta.v[0] as usize],
@@ -230,7 +365,7 @@ pub fn split_mesh_local_with_exclusions(
         let (_, ta_norm) = tri_centroid_and_normal(&a_pts);
         match hit {
             TriTriHit::Segment(seg) => {
-                touched_target_polys[poly_a] = true;
+                touched_poly_set.insert(poly_a);
                 segs_per_target_tri.entry(ta_idx).or_default().push(seg);
                 segs_per_cutter_poly
                     .entry(poly_b)
@@ -244,7 +379,7 @@ pub fn split_mesh_local_with_exclusions(
                 segs_on_a,
                 segs_on_b,
             } => {
-                touched_target_polys[poly_a] = true;
+                touched_poly_set.insert(poly_a);
                 if !segs_on_a.is_empty() {
                     segs_per_target_tri
                         .entry(ta_idx)
@@ -266,51 +401,141 @@ pub fn split_mesh_local_with_exclusions(
     }
 
     // 4. Classify UNTOUCHED target polygons in parallel (keeping exact original Quads/N-gons!)
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum PolyDest {
         Remaining,
         Piece,
         Split,
     }
 
-    let poly_dests: Vec<PolyDest> = (0..target.num_polys())
-        .into_par_iter()
-        .map(|poly_idx| {
-            if touched_target_polys[poly_idx] {
-                return PolyDest::Split;
+    let convex_planes = extract_convex_planes(&cutter.positions, cutter_tris);
+
+    let classify_poly = |poly_idx: usize| -> PolyDest {
+        if touched_poly_set.contains(&(poly_idx as u32)) {
+            return PolyDest::Split;
+        }
+        let paabb = target_geo.poly_aabbs[poly_idx];
+        if !paabb.expanded(PAIR_EPS).overlaps(&cutter_aabb) {
+            return PolyDest::Remaining;
+        }
+        let c = target.poly_centroid(poly_idx);
+        let loc = if let Some(ref planes) = convex_planes {
+            // Ultra-fast 6-dot-product convex classification (~125x faster than FWN for Box Cutters!)
+            let mut near_plane = false;
+            let mut outside = false;
+            for pl in planes {
+                let s = pl.n[0] * c[0] + pl.n[1] * c[1] + pl.n[2] * c[2] - pl.d;
+                if s > 1e-6 {
+                    outside = true;
+                    break;
+                }
+                if s >= -1e-6 {
+                    near_plane = true;
+                }
             }
-            let paabb = target_geo.poly_aabbs[poly_idx];
-            if !paabb.expanded(PAIR_EPS).overlaps(&cutter_aabb) {
-                return PolyDest::Remaining;
+            if outside {
+                Location::Outside
+            } else if !near_plane {
+                Location::Inside
+            } else {
+                let n = target.poly_normal(poly_idx);
+                classify_point_convex(c, n, planes)
             }
-            let c = target.poly_centroid(poly_idx);
+        } else {
             let n = target.poly_normal(poly_idx);
-            match classify_point(
+            classify_point(
                 c,
                 n,
                 &cutter_aabb,
                 &cutter.positions,
-                &cutter_tris,
-                &cutter_bvh,
-            ) {
-                Location::Inside | Location::CoplanarSame => PolyDest::Piece,
-                Location::Outside | Location::CoplanarOpposite => PolyDest::Remaining,
-            }
-        })
-        .collect();
+                cutter_tris,
+                cutter_bvh,
+            )
+        };
+        match loc {
+            Location::Inside | Location::CoplanarSame => PolyDest::Piece,
+            Location::Outside | Location::CoplanarOpposite => PolyDest::Remaining,
+        }
+    };
 
     let mut remaining = HybridMesh::new(num_uv_layers);
     let mut piece = HybridMesh::new(num_uv_layers);
+    let mut rem_seam_verts: Vec<u32> = Vec::new();
+    let mut piece_seam_verts: Vec<u32> = Vec::new();
 
-    // Copy untouched polygons with shared vertex indices (O(1), zero HashMap hashing!)
-    let mut rem_remap = vec![u32::MAX; target.positions.len()];
-    let mut piece_remap = vec![u32::MAX; target.positions.len()];
-
-    for (poly_idx, &dest) in poly_dests.iter().enumerate() {
-        match dest {
-            PolyDest::Remaining => remaining.push_poly_from_shared(target, poly_idx, &mut rem_remap),
-            PolyDest::Piece => piece.push_poly_from_shared(target, poly_idx, &mut piece_remap),
-            PolyDest::Split => {}
+    if let Some(sp) = subset_polys {
+        let poly_dests: Vec<PolyDest> = sp
+            .par_iter()
+            .map(|&pi| classify_poly(pi as usize))
+            .collect();
+        let est_v = (sp.len()).min(target.positions.len());
+        let ((rem_built, rem_seams), (piece_built, piece_seams)) = rayon::join(
+            || {
+                let mut m = HybridMesh::new(num_uv_layers);
+                let mut remap: HashMap<u32, u32> = HashMap::with_capacity(est_v);
+                for (&pi, &dest) in sp.iter().zip(poly_dests.iter()) {
+                    if dest == PolyDest::Remaining {
+                        m.push_poly_from_shared_map(target, pi as usize, &mut remap);
+                    }
+                }
+                let mut seams = Vec::new();
+                for &pi in &touched_poly_set {
+                    for &orig_vi in target.poly_verts(pi as usize) {
+                        if let Some(&rv) = remap.get(&orig_vi) {
+                            seams.push(rv);
+                        }
+                    }
+                }
+                (m, seams)
+            },
+            || {
+                let mut m = HybridMesh::new(num_uv_layers);
+                let mut remap: HashMap<u32, u32> = HashMap::with_capacity(est_v);
+                for (&pi, &dest) in sp.iter().zip(poly_dests.iter()) {
+                    if dest == PolyDest::Piece {
+                        m.push_poly_from_shared_map(target, pi as usize, &mut remap);
+                    }
+                }
+                let mut seams = Vec::new();
+                for &pi in &touched_poly_set {
+                    for &orig_vi in target.poly_verts(pi as usize) {
+                        if let Some(&pv) = remap.get(&orig_vi) {
+                            seams.push(pv);
+                        }
+                    }
+                }
+                (m, seams)
+            },
+        );
+        remaining = rem_built;
+        piece = piece_built;
+        rem_seam_verts = rem_seams;
+        piece_seam_verts = piece_seams;
+    } else {
+        let poly_dests: Vec<PolyDest> = (0..target.num_polys())
+            .into_par_iter()
+            .map(classify_poly)
+            .collect();
+        let mut rem_remap = vec![u32::MAX; target.positions.len()];
+        let mut piece_remap = vec![u32::MAX; target.positions.len()];
+        for (poly_idx, &dest) in poly_dests.iter().enumerate() {
+            match dest {
+                PolyDest::Remaining => remaining.push_poly_from_shared(target, poly_idx, &mut rem_remap),
+                PolyDest::Piece => piece.push_poly_from_shared(target, poly_idx, &mut piece_remap),
+                PolyDest::Split => {}
+            }
+        }
+        for &pi in &touched_poly_set {
+            for &orig_vi in target.poly_verts(pi as usize) {
+                let rv = rem_remap[orig_vi as usize];
+                if rv != u32::MAX {
+                    rem_seam_verts.push(rv);
+                }
+                let pv = piece_remap[orig_vi as usize];
+                if pv != u32::MAX {
+                    piece_seam_verts.push(pv);
+                }
+            }
         }
     }
 
@@ -319,38 +544,18 @@ pub fn split_mesh_local_with_exclusions(
     let piece_fixed_verts = piece.positions.len();
     let piece_fixed_polys = piece.num_polys();
 
-    // Collect boundary vertices of touched polygons that already exist in remaining/piece
-    // so newly split triangles weld cleanly onto untouched neighbors.
-    let mut rem_seam_verts: Vec<u32> = Vec::new();
-    let mut piece_seam_verts: Vec<u32> = Vec::new();
-    for (poly_idx, &touched) in touched_target_polys.iter().enumerate() {
-        if !touched {
-            continue;
-        }
-        for &orig_vi in target.poly_verts(poly_idx) {
-            let rv = rem_remap[orig_vi as usize];
-            if rv != u32::MAX {
-                rem_seam_verts.push(rv);
-            }
-            let pv = piece_remap[orig_vi as usize];
-            if pv != u32::MAX {
-                piece_seam_verts.push(pv);
-            }
+    // 5. Split & classify TOUCHED target triangles in parallel using O(1) `poly_tri_starts`
+    //    (NEVER scans 4,000,000 triangles!)
+    let mut touched_polys_sorted: Vec<u32> = touched_poly_set.into_iter().collect();
+    touched_polys_sorted.sort_unstable();
+    let mut touched_target_tri_indices: Vec<usize> = Vec::with_capacity(touched_polys_sorted.len() * 2);
+    for &pi in &touched_polys_sorted {
+        let ts = target_geo.poly_tri_starts[pi as usize] as usize;
+        let te = target_geo.poly_tri_starts[pi as usize + 1] as usize;
+        for ti in ts..te {
+            touched_target_tri_indices.push(ti);
         }
     }
-
-    // 5. Split & classify TOUCHED target triangles in parallel (preserving interpolated UVs & Mat IDs)
-    let touched_target_tri_indices: Vec<usize> = target_tris
-        .iter()
-        .enumerate()
-        .filter_map(|(ti, t)| {
-            if touched_target_polys[t.poly_idx as usize] {
-                Some(ti)
-            } else {
-                None
-            }
-        })
-        .collect();
 
     struct ClassifiedTargetTri {
         pts: [[f64; 3]; 3],
@@ -405,14 +610,18 @@ pub fn split_mesh_local_with_exclusions(
             let mut out = Vec::with_capacity(sub_tris.len());
             for st in sub_tris {
                 let (c, n) = tri_centroid_and_normal(&st.pts);
-                let loc = classify_point(
-                    c,
-                    n,
-                    &cutter_aabb,
-                    &cutter.positions,
-                    &cutter_tris,
-                    &cutter_bvh,
-                );
+                let loc = if let Some(ref planes) = convex_planes {
+                    classify_point_convex(c, n, planes)
+                } else {
+                    classify_point(
+                        c,
+                        n,
+                        &cutter_aabb,
+                        &cutter.positions,
+                        cutter_tris,
+                        cutter_bvh,
+                    )
+                };
                 let to_piece = matches!(loc, Location::Inside | Location::CoplanarSame);
                 out.push(ClassifiedTargetTri {
                     pts: st.pts,
@@ -680,12 +889,17 @@ pub fn split_mesh_local_with_exclusions(
     }
 
     // 7. Apply world-space Box UV to ONLY newly added cut cap faces (O(caps) instead of O(1M)),
-    //    then partially weld new cut vertices
-    apply_cut_face_box_uv_from(&mut remaining, rem_cap_start, target_world, uv_scale);
-    apply_cut_face_box_uv_from(&mut piece, piece_cap_start, target_world, uv_scale);
-
-    remaining.weld_partial(rem_fixed_verts, rem_fixed_polys, &rem_seam_verts, WELD_EPS);
-    piece.weld_partial(piece_fixed_verts, piece_fixed_polys, &piece_seam_verts, WELD_EPS);
+    //    then partially weld new cut vertices in parallel
+    rayon::join(
+        || {
+            apply_cut_face_box_uv_from(&mut remaining, rem_cap_start, target_world, uv_scale);
+            remaining.weld_partial(rem_fixed_verts, rem_fixed_polys, &rem_seam_verts, WELD_EPS);
+        },
+        || {
+            apply_cut_face_box_uv_from(&mut piece, piece_cap_start, target_world, uv_scale);
+            piece.weld_partial(piece_fixed_verts, piece_fixed_polys, &piece_seam_verts, WELD_EPS);
+        },
+    );
 
     (remaining, piece)
 }

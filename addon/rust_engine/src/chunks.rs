@@ -44,11 +44,12 @@ impl SpatialChunks {
             };
         }
 
-        // Target ~256-384 chunks for 1M polys (~2.5K-4K polys/chunk), or 1 chunk for small meshes.
+        // Target ~256-384 chunks for 1M polys and ~1024-1472 chunks for 2M+ polys (4M+ tris)
+        // so boundary shells stay thin while interior chunks flip ownership in 0 ms / 0 bytes!
         let max_per_chunk: usize = if np <= 2048 {
             np
         } else {
-            (np / 256).clamp(1024, 4096)
+            (np / 1024).clamp(512, 2048)
         };
 
         let centers: Vec<[f64; 3]> = if np >= 4096 {

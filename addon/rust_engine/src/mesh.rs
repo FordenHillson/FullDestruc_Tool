@@ -345,6 +345,51 @@ impl HybridMesh {
         self.is_cut_face.push(src.is_cut_face[poly_idx]);
     }
 
+    /// Copy an untouched polygon from `src` using a sparse `HashMap` vertex remap (O(K) instead of O(V)).
+    #[inline]
+    pub fn push_poly_from_shared_map(
+        &mut self,
+        src: &HybridMesh,
+        poly_idx: usize,
+        remap: &mut HashMap<u32, u32>,
+    ) {
+        let range = src.poly_loop_range(poly_idx);
+        let n = range.len();
+        if n < 3 {
+            return;
+        }
+        for li in range.clone() {
+            let old_vi = src.loop_verts[li];
+            let new_vi = *remap.entry(old_vi).or_insert_with(|| {
+                let idx = self.positions.len() as u32;
+                self.positions.push(src.positions[old_vi as usize]);
+                idx
+            });
+            self.loop_verts.push(new_vi);
+        }
+        for (layer_idx, dst_layer) in self.uv_layers.iter_mut().enumerate() {
+            if let Some(src_layer) = src.uv_layers.get(layer_idx) {
+                dst_layer.extend_from_slice(&src_layer[range.clone()]);
+            } else {
+                for _ in 0..n {
+                    dst_layer.push([0.0, 0.0]);
+                }
+            }
+        }
+        if src.loop_normals.len() == src.loop_verts.len() {
+            self.loop_normals.extend_from_slice(&src.loop_normals[range.clone()]);
+        } else {
+            let pn = src.poly_normal(poly_idx);
+            let nf = [pn[0] as f32, pn[1] as f32, pn[2] as f32];
+            for _ in 0..n {
+                self.loop_normals.push(nf);
+            }
+        }
+        self.poly_starts.push(self.loop_verts.len() as u32);
+        self.mat_ids.push(src.mat_ids[poly_idx]);
+        self.is_cut_face.push(src.is_cut_face[poly_idx]);
+    }
+
     /// Triangulate a single polygon into `(v0, v1, v2, l0, l1, l2)` tuples.
     /// Uses 2D ear-clipping for N-gons (N > 3) so concave polygons stay accurate.
     pub fn triangulate_poly(&self, poly_idx: usize) -> SmallVec<[([u32; 3], [usize; 3]); 2]> {
@@ -991,8 +1036,28 @@ pub struct CachedMeshGeo {
     pub aabb: Aabb,
     pub poly_aabbs: Vec<Aabb>,
     pub tris: Vec<TriRef>,
+    /// `poly_tri_starts[pi]..poly_tri_starts[pi+1]` gives the exact `tris` slice for polygon `pi` in O(1).
+    pub poly_tri_starts: Vec<u32>,
     pub tri_aabbs: Vec<Aabb>,
     pub bvh: Bvh,
+}
+
+fn build_poly_tri_starts(num_polys: usize, tris: &[TriRef]) -> Vec<u32> {
+    let mut starts = vec![0u32; num_polys + 1];
+    let mut cur_p = 0usize;
+    for (ti, t) in tris.iter().enumerate() {
+        let pi = t.poly_idx as usize;
+        while cur_p < pi {
+            cur_p += 1;
+            starts[cur_p] = ti as u32;
+        }
+    }
+    let total = tris.len() as u32;
+    while cur_p < num_polys {
+        cur_p += 1;
+        starts[cur_p] = total;
+    }
+    starts
 }
 
 impl CachedMeshGeo {
@@ -1024,6 +1089,7 @@ impl CachedMeshGeo {
         };
 
         let tris = mesh.extract_triangles();
+        let poly_tri_starts = build_poly_tri_starts(np, &tris);
         let tri_aabbs: Vec<Aabb> = if tris.len() >= 4096 {
             tris.par_iter()
                 .map(|t| {
@@ -1049,6 +1115,7 @@ impl CachedMeshGeo {
             aabb,
             poly_aabbs,
             tris,
+            poly_tri_starts,
             tri_aabbs,
             bvh,
         }
@@ -1064,6 +1131,7 @@ impl CachedMeshGeo {
             aabb.expand_aabb(pa);
         }
         let tris = mesh.extract_triangles();
+        let poly_tri_starts = build_poly_tri_starts(np, &tris);
         let tri_aabbs: Vec<Aabb> = tris
             .iter()
             .map(|t| {
@@ -1079,6 +1147,7 @@ impl CachedMeshGeo {
             aabb,
             poly_aabbs,
             tris,
+            poly_tri_starts,
             tri_aabbs,
             bvh,
         }

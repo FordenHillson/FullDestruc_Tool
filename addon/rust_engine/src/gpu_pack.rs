@@ -74,6 +74,7 @@ impl GpuPackedMesh {
             None
         };
         let normal_mat = world_mat.inverse().transpose();
+        let is_identity = world_mat.abs_diff_eq(DMat4::IDENTITY, 1e-9);
 
         let pack_one = |buckets: &mut HashMap<i32, GpuSubMesh>, poly_idx: usize| {
             let mat_id = mesh.mat_ids[poly_idx];
@@ -90,43 +91,73 @@ impl GpuPackedMesh {
                 uv1_xy: Vec::new(),
             });
             for (vs, ls) in tris {
-                let p0 = world_mat.transform_point3(DVec3::from_array(mesh.positions[vs[0] as usize]));
-                let p1 = world_mat.transform_point3(DVec3::from_array(mesh.positions[vs[1] as usize]));
-                let p2 = world_mat.transform_point3(DVec3::from_array(mesh.positions[vs[2] as usize]));
+                let (p0, p1, p2) = if is_identity {
+                    (
+                        mesh.positions[vs[0] as usize],
+                        mesh.positions[vs[1] as usize],
+                        mesh.positions[vs[2] as usize],
+                    )
+                } else {
+                    (
+                        world_mat
+                            .transform_point3(DVec3::from_array(mesh.positions[vs[0] as usize]))
+                            .to_array(),
+                        world_mat
+                            .transform_point3(DVec3::from_array(mesh.positions[vs[1] as usize]))
+                            .to_array(),
+                        world_mat
+                            .transform_point3(DVec3::from_array(mesh.positions[vs[2] as usize]))
+                            .to_array(),
+                    )
+                };
                 entry.pos_xyz.extend_from_slice(&[
-                    p0.x as f32, p0.y as f32, p0.z as f32,
-                    p1.x as f32, p1.y as f32, p1.z as f32,
-                    p2.x as f32, p2.y as f32, p2.z as f32,
+                    p0[0] as f32, p0[1] as f32, p0[2] as f32,
+                    p1[0] as f32, p1[1] as f32, p1[2] as f32,
+                    p2[0] as f32, p2[1] as f32, p2[2] as f32,
                 ]);
                 if let Some(nrms) = loop_nrms {
-                    let wn0 = normal_mat
-                        .transform_vector3(DVec3::new(
-                            nrms[ls[0]][0] as f64,
-                            nrms[ls[0]][1] as f64,
-                            nrms[ls[0]][2] as f64,
-                        ))
-                        .normalize_or_zero();
-                    let wn1 = normal_mat
-                        .transform_vector3(DVec3::new(
-                            nrms[ls[1]][0] as f64,
-                            nrms[ls[1]][1] as f64,
-                            nrms[ls[1]][2] as f64,
-                        ))
-                        .normalize_or_zero();
-                    let wn2 = normal_mat
-                        .transform_vector3(DVec3::new(
-                            nrms[ls[2]][0] as f64,
-                            nrms[ls[2]][1] as f64,
-                            nrms[ls[2]][2] as f64,
-                        ))
-                        .normalize_or_zero();
-                    entry.nor_xyz.extend_from_slice(&[
-                        wn0.x as f32, wn0.y as f32, wn0.z as f32,
-                        wn1.x as f32, wn1.y as f32, wn1.z as f32,
-                        wn2.x as f32, wn2.y as f32, wn2.z as f32,
-                    ]);
+                    if is_identity {
+                        let n0 = nrms[ls[0]];
+                        let n1 = nrms[ls[1]];
+                        let n2 = nrms[ls[2]];
+                        entry.nor_xyz.extend_from_slice(&[
+                            n0[0], n0[1], n0[2],
+                            n1[0], n1[1], n1[2],
+                            n2[0], n2[1], n2[2],
+                        ]);
+                    } else {
+                        let wn0 = normal_mat
+                            .transform_vector3(DVec3::new(
+                                nrms[ls[0]][0] as f64,
+                                nrms[ls[0]][1] as f64,
+                                nrms[ls[0]][2] as f64,
+                            ))
+                            .normalize_or_zero();
+                        let wn1 = normal_mat
+                            .transform_vector3(DVec3::new(
+                                nrms[ls[1]][0] as f64,
+                                nrms[ls[1]][1] as f64,
+                                nrms[ls[1]][2] as f64,
+                            ))
+                            .normalize_or_zero();
+                        let wn2 = normal_mat
+                            .transform_vector3(DVec3::new(
+                                nrms[ls[2]][0] as f64,
+                                nrms[ls[2]][1] as f64,
+                                nrms[ls[2]][2] as f64,
+                            ))
+                            .normalize_or_zero();
+                        entry.nor_xyz.extend_from_slice(&[
+                            wn0.x as f32, wn0.y as f32, wn0.z as f32,
+                            wn1.x as f32, wn1.y as f32, wn1.z as f32,
+                            wn2.x as f32, wn2.y as f32, wn2.z as f32,
+                        ]);
+                    }
                 } else {
-                    let n = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+                    let v0 = DVec3::from_array(p0);
+                    let v1 = DVec3::from_array(p1);
+                    let v2 = DVec3::from_array(p2);
+                    let n = (v1 - v0).cross(v2 - v0).normalize_or_zero();
                     let nx = n.x as f32;
                     let ny = n.y as f32;
                     let nz = n.z as f32;

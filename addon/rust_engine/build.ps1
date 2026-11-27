@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BinDir = Join-Path (Split-Path -Parent $ScriptDir) "bin"
 
-Write-Host "[FDT Rust Engine v2.0] Building high-scale release DLL (Spatial Chunks + Islands)..." -ForegroundColor Cyan
+Write-Host "[FDT Rust Engine v2.1] Building high-scale release DLL (4M-Tri Chunk Ownership + Async Target)..." -ForegroundColor Cyan
 Push-Location $ScriptDir
 try {
     cargo build --release
