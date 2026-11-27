@@ -29,6 +29,7 @@ from .session import (
     find_session_id_for_object,
     load_all_stored_sessions,
     load_session,
+    load_session_readonly,
     load_stored_session_by_id,
     save_session,
 )
@@ -998,7 +999,7 @@ def sync_rust_session_live(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgrap
 
 def submit_rust_session_async(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph | None) -> dict[str, int]:
     """Non-blocking async job submission for Zero-Switch Textured GPU Mode (< 0.3 ms on main thread)."""
-    session = load_session(scene)
+    session = load_session_readonly(scene)
     if session is None:
         return {}
     active_cutters = session.get_valid_cutters(include_muted=False)
@@ -1016,6 +1017,36 @@ def submit_rust_session_async(scene: bpy.types.Scene, depsgraph: bpy.types.Depsg
             depsgraph=depsgraph,
             cut_material=cut_mat,
             uv_scale=uv_scale,
+        )
+        job_map[orig.name] = jid
+    return job_map
+
+
+def submit_rust_session_async_delta(
+    scene: bpy.types.Scene,
+    depsgraph: bpy.types.Depsgraph | None,
+    dirty_cutter_names: set[str] | None = None,
+) -> dict[str, int]:
+    """v200 Non-blocking Delta async job submission: uploads ONLY dirty cutters (< 0.2 ms for 500 boxes)."""
+    session = load_session_readonly(scene)
+    if session is None:
+        return {}
+    active_cutters = session.get_valid_cutters(include_muted=False)
+    cutter_objs = [c_obj for c_obj, _ in active_cutters]
+    targets = session.get_target_objects()
+    cut_mat = _get_cut_material(scene)
+    uv_scale = _uv_scale_for_scene(scene)
+
+    job_map: dict[str, int] = {}
+    for orig in targets:
+        jid = rust_bridge.submit_target_async_delta(
+            session_id=session.session_id,
+            target_obj=orig,
+            cutter_objs=cutter_objs,
+            depsgraph=depsgraph,
+            cut_material=cut_mat,
+            uv_scale=uv_scale,
+            dirty_cutter_names=dirty_cutter_names,
         )
         job_map[orig.name] = jid
     return job_map
@@ -1098,6 +1129,7 @@ def rebuild_session(
     context: bpy.types.Context,
     solver_override: str | None = None,
     for_apply: bool = False,
+    dirty_cutter_names: set[str] | None = None,
 ) -> bool:
     """Rebuild all non-destructive Results and Pieces (uses Rust Engine when selected, else Blender modifiers)."""
     scene = context.scene
@@ -1115,8 +1147,11 @@ def rebuild_session(
     settings = _get_settings(scene)
     solver = solver_override or (settings.boolean_solver if settings else "RUST")
 
-    # Style all cutters (including muted) and update per-cutter rough modifier
+    # Style cutters and update per-cutter rough modifier (O(K) when dirty_cutter_names is supplied!)
+    style_subset = dirty_cutter_names if (dirty_cutter_names is not None and not for_apply) else None
     for entry in session.cutters:
+        if style_subset is not None and entry.name not in style_subset:
+            continue
         c_obj = bpy.data.objects.get(entry.name)
         if c_obj is None or c_obj.type != "MESH":
             continue
@@ -1127,7 +1162,7 @@ def rebuild_session(
         apply_cutter_visuals(c_obj, zone, muted=entry.muted)
         _ensure_rough_modifier(c_obj, scene, is_rough=is_rough, preview_mode=not for_apply)
 
-    # Fast path: Rust Boolean Engine (O(N) single-pass split + prefix cache)
+    # Fast path: Rust Boolean Engine (v2.0 Spatial Islands + Chunked Delta GPU)
     if solver == "RUST" and rust_bridge.is_available():
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
@@ -1142,8 +1177,8 @@ def rebuild_session(
             if vault_col is not None:
                 set_collection_hidden(context.view_layer, vault_col, True)
             save_session(scene, session)
-            live_sync.record_current_cutter_states(scene)
-            live_sync.start_gpu_async_update(scene, depsgraph)
+            live_sync.record_current_cutter_states(scene, only_names=style_subset)
+            live_sync.start_gpu_async_update(scene, depsgraph, dirty_cutter_names=style_subset)
             return True
 
         # Direct real-mesh sync (Apply, 0 cutters, or GPU Fast Drag turned OFF)
@@ -1272,7 +1307,7 @@ def add_box_cutter(
     session.cutters.insert(0, CutterEntry(name=cutter.name, zone=zone_id, muted=False, rough=default_rough))
     save_session(scene, session)
     with profiler.action_scope("ADD_BOX", cutter.name):
-        rebuild_session(context)
+        rebuild_session(context, dirty_cutter_names={cutter.name})
     safe_select_objects(context, [cutter], active=cutter)
     return True, f"วางกล่องตัด '{cutter.name}' (โซน {zone_registry.zone_token(zone_id, scene)}) แล้ว — กด G/R/S ขยับได้เลย", cutter
 
@@ -1334,7 +1369,7 @@ def add_mesh_data_cutter(
     session.cutters.insert(0, CutterEntry(name=cutter.name, zone=zone_id, muted=False, rough=default_rough))
     save_session(scene, session)
     with profiler.action_scope("ADD_DRAW_CUTTER", cutter.name):
-        rebuild_session(context)
+        rebuild_session(context, dirty_cutter_names={cutter.name})
     safe_select_objects(context, [cutter], active=cutter)
     return True, f"สร้างตัวตัดจากเส้นวาด '{cutter.name}' (โซน {zone_registry.zone_token(zone_id, scene)}) แล้ว", cutter
 
@@ -1784,7 +1819,7 @@ def add_adjacent_box_cutter(
 
     session.cutters.insert(0, CutterEntry(name=cutter.name, zone=zone_id, muted=False, rough=default_rough))
     save_session(scene, session)
-    rebuild_session(context)
+    rebuild_session(context, dirty_cutter_names={cutter.name})
     safe_select_objects(context, [cutter], active=cutter)
     return True, f"วางกล่องใหม่ชิดขอบ ({direction}) โซน {zone_registry.zone_token(zone_id, scene)} เรียบร้อย (เหลื่อมกัน {safe_overlap*100:.1f} ซม.)", cutter
 
@@ -1849,7 +1884,7 @@ def duplicate_selected_cutters(
 
     save_session(scene, session)
     with profiler.action_scope("DUPLICATE_CUTTER", f"n={len(created)}"):
-        rebuild_session(context)
+        rebuild_session(context, dirty_cutter_names={c.name for c in created})
     safe_select_objects(context, created, active=created[-1])
     if len(created) == 1:
         msg = f"Duplicate กล่องตัด '{created[0].name}' แล้ว — ขยับตำแหน่งได้เลย"
@@ -1865,15 +1900,15 @@ def adopt_duplicated_cutters(scene: bpy.types.Scene | None) -> list[bpy.types.Ob
     """
     if scene is None:
         return []
-    session = load_session(scene)
-    if session is None:
+    session_ro = load_session_readonly(scene)
+    if session_ro is None:
         return []
-    cols = session.get_collections()
+    cols = session_ro.get_collections()
     cutters_col = cols.get("cutters")
     if cutters_col is None:
         return []
 
-    known_names = {c.name for c in session.cutters}
+    known_names = {c.name for c in session_ro.cutters}
     candidates: list[bpy.types.Object] = []
     seen: set[bpy.types.Object] = set()
 
@@ -1888,12 +1923,16 @@ def adopt_duplicated_cutters(scene: bpy.types.Scene | None) -> list[bpy.types.Ob
     for obj in list(scene.objects):
         if obj is None or obj.type != "MESH" or obj.name in known_names or obj in seen:
             continue
-        if bool(obj.get(CUTTER_PROP, False)) and str(obj.get(OBJ_SESSION_ID_PROP, "")) == session.session_id:
+        if bool(obj.get(CUTTER_PROP, False)) and str(obj.get(OBJ_SESSION_ID_PROP, "")) == session_ro.session_id:
             if not is_protected_object(obj) and RESULT_SOURCE_PROP not in obj:
                 seen.add(obj)
                 candidates.append(obj)
 
     if not candidates:
+        return []
+
+    session = load_session(scene)
+    if session is None:
         return []
 
     adopted: list[bpy.types.Object] = []
@@ -2620,6 +2659,11 @@ def apply_session(
             from . import cap_fill
 
             active_cutter_objs = [c_obj for c_obj, _ in session.get_valid_cutters(include_muted=False)]
+            _planes_cache: dict[tuple, list] = {}
+            _bboxes_cache: dict[tuple, list] = {}
+
+            def _mw_cache_key(mw) -> tuple:
+                return tuple(round(float(mw[r][c]), 5) for r in range(4) for c in range(4))
 
             def _bake_one(
                 src_obj: bpy.types.Object,
@@ -2646,16 +2690,28 @@ def apply_session(
                 new_obj.matrix_world = src_obj.matrix_world.copy()
                 new_obj[OBJ_SESSION_ID_PROP] = session.session_id
                 final_col.objects.link(new_obj)
-                planes = (
-                    cap_fill.extract_cutter_planes_local(active_cutter_objs, new_obj.matrix_world, depsgraph)
-                    if (auto_fill_caps or line_backfaces) and active_cutter_objs
-                    else None
-                )
-                cutter_bboxes = (
-                    cap_fill.extract_cutter_bboxes_local(active_cutter_objs, new_obj.matrix_world, depsgraph)
-                    if line_backfaces and active_cutter_objs
-                    else None
-                )
+
+                mw_key = _mw_cache_key(new_obj.matrix_world) if active_cutter_objs else ()
+                if (auto_fill_caps or line_backfaces) and active_cutter_objs:
+                    planes = _planes_cache.get(mw_key)
+                    if planes is None:
+                        planes = cap_fill.extract_cutter_planes_local(
+                            active_cutter_objs, new_obj.matrix_world, depsgraph
+                        )
+                        _planes_cache[mw_key] = planes
+                else:
+                    planes = None
+
+                if line_backfaces and active_cutter_objs:
+                    cutter_bboxes = _bboxes_cache.get(mw_key)
+                    if cutter_bboxes is None:
+                        cutter_bboxes = cap_fill.extract_cutter_bboxes_local(
+                            active_cutter_objs, new_obj.matrix_world, depsgraph
+                        )
+                        _bboxes_cache[mw_key] = cutter_bboxes
+                else:
+                    cutter_bboxes = None
+
                 total_auto_filled_tris += _postprocess_baked_mesh(
                     new_obj,
                     cut_mat,
