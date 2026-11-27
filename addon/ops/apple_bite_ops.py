@@ -14,7 +14,7 @@ from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 
 from ..core import apple_bite, zone_registry
-from ..core.session import has_active_session, load_session
+from ..core.session import has_active_session, load_session, load_session_readonly
 
 # Track viewport draw handles cleanly so unregister never leaks
 _hud_draw_handle = None
@@ -22,6 +22,7 @@ _wire_draw_handle = None
 _interactive_active = False
 _zone_grid_shader = None
 _zone_grid_shader_failed = False
+_wire_uniform_shader = None
 _zone_grid_cache_sig = None
 _zone_grid_cache_entries: list[tuple[object, str, str]] = []  # (batch, zone, cutter_name)
 _zone_grid_deps_rev: int = 0
@@ -349,12 +350,13 @@ def _draw_zone_grid_overlay(context, session, selected_cutters: set[str]) -> Non
 
 def _draw_zone_wireframes():
     """Draw tri-planar Zone Grid overlay + focus-aware zone-colored wireframes for cutters."""
+    global _wire_uniform_shader
     from ..core import gpu_preview
 
     context = bpy.context
     if context.scene is None:
         return
-    session = load_session(context.scene)
+    session = load_session_readonly(context.scene)
     if session is None or not session.cutters:
         return
 
@@ -376,37 +378,19 @@ def _draw_zone_wireframes():
         and getattr(space, "type", "") == "VIEW_3D"
         and getattr(getattr(space, "shading", None), "show_xray", False)
     )
-    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    if _wire_uniform_shader is None:
+        _wire_uniform_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    shader = _wire_uniform_shader
     gpu.state.blend_set("ALPHA")
     gpu.state.depth_mask_set(False)
 
     unselected_entries = [e for e in session.cutters if e.name not in selected_cutters]
     selected_entries = [e for e in session.cutters if e.name in selected_cutters]
 
+    shader.bind()
     for entry in unselected_entries + selected_entries:
         obj = bpy.data.objects.get(entry.name)
         if obj is None or obj.type != "MESH" or obj.hide_viewport or obj.hide_get():
-            continue
-        mesh = obj.data
-        mw = obj.matrix_world
-        coords = []
-        if obj.mode == "EDIT":
-            try:
-                bm = bmesh.from_edit_mesh(mesh)
-                for e in bm.edges:
-                    if e.is_valid:
-                        coords.append(mw @ e.verts[0].co)
-                        coords.append(mw @ e.verts[1].co)
-            except Exception:
-                coords = []
-        else:
-            if len(mesh.edges) == 0:
-                continue
-            verts = mesh.vertices
-            for edge in mesh.edges:
-                coords.append(mw @ verts[edge.vertices[0]].co)
-                coords.append(mw @ verts[edge.vertices[1]].co)
-        if not coords:
             continue
 
         is_sel = entry.name in selected_cutters
@@ -427,10 +411,33 @@ def _draw_zone_wireframes():
 
         gpu.state.depth_test_set("NONE" if (obj.mode == "EDIT" or obj.show_in_front or use_xray) else "LESS_EQUAL")
         gpu.state.line_width_set(line_w)
-        batch = batch_for_shader(shader, "LINES", {"pos": coords})
-        shader.bind()
         shader.uniform_float("color", color)
-        batch.draw(shader)
+
+        if obj.mode == "EDIT":
+            mesh = obj.data
+            mw = obj.matrix_world
+            coords = []
+            try:
+                bm = bmesh.from_edit_mesh(mesh)
+                for e in bm.edges:
+                    if e.is_valid:
+                        coords.append(mw @ e.verts[0].co)
+                        coords.append(mw @ e.verts[1].co)
+            except Exception:
+                coords = []
+            if coords:
+                batch = batch_for_shader(shader, "LINES", {"pos": coords})
+                batch.draw(shader)
+        else:
+            batch = gpu_preview._get_cutter_local_batch(obj, shader)
+            if batch is None:
+                continue
+            gpu.matrix.push()
+            try:
+                gpu.matrix.multiply_matrix(obj.matrix_world)
+                batch.draw(shader)
+            finally:
+                gpu.matrix.pop()
 
     gpu.state.line_width_set(1.0)
     gpu.state.depth_mask_set(True)
@@ -440,7 +447,7 @@ def _draw_zone_wireframes():
 
 def _draw_hud_callback():
     context = bpy.context
-    session = load_session(context.scene)
+    session = load_session_readonly(context.scene)
     if session is None or not _interactive_active:
         return
 

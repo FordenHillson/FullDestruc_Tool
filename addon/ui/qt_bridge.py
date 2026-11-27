@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import bpy
 
 PYSIDE_AVAILABLE = False
@@ -14,6 +16,8 @@ except Exception:
 
 _qt_window = None
 _timer_running = False
+_last_refresh_time: float = 0.0
+_REFRESH_INTERVAL_SEC: float = 0.10  # 10 Hz UI sync (events still processed at 33 Hz)
 
 
 def _ensure_qapp():
@@ -26,17 +30,23 @@ def _ensure_qapp():
 
 
 def _qt_event_pump():
-    global _timer_running, _qt_window
+    global _timer_running, _qt_window, _last_refresh_time
     if not PYSIDE_AVAILABLE or _qt_window is None or not _qt_window.isVisible():
         _timer_running = False
         return None
     app = QtWidgets.QApplication.instance()
     if app is not None:
         app.processEvents()
-    try:
-        _qt_window.refresh_from_blender()
-    except Exception:
-        pass
+    now = time.perf_counter()
+    if (now - _last_refresh_time) >= _REFRESH_INTERVAL_SEC:
+        try:
+            from ..core import live_sync
+
+            if not live_sync.is_gpu_poll_active():
+                _last_refresh_time = now
+                _qt_window.refresh_from_blender()
+        except Exception:
+            pass
     return 0.03
 
 

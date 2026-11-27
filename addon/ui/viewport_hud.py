@@ -18,7 +18,7 @@ from gpu_extras.batch import batch_for_shader
 
 from ..core import apple_bite, rebar_state, zone_registry
 from ..core.apple_bite import CUTTER_PROP
-from ..core.session import load_session
+from ..core.session import load_session_readonly
 
 # Unified Semantic Palette (RGBA)
 COL_GLASS_BG = (0.075, 0.086, 0.114, 0.88)
@@ -246,6 +246,33 @@ def _rounded_rect_poly(x0: float, y0: float, x1: float, y1: float, radius: float
     return pts
 
 
+def _build_rounded_rect_cmds(
+    shader,
+    rect: tuple[float, float, float, float],
+    radius: float,
+    fill_col: tuple[float, float, float, float],
+    rim_col: tuple[float, float, float, float] | None = None,
+    rim_width: float = 1.2,
+) -> list[tuple[object, tuple[float, float, float, float], float]]:
+    x0, y0, x1, y1 = rect
+    ring = _rounded_rect_poly(x0, y0, x1, y1, radius)
+    if len(ring) < 3:
+        return []
+    cx = (x0 + x1) * 0.5
+    cy = (y0 + y1) * 0.5
+    tris: list[tuple[float, float]] = []
+    n = len(ring)
+    for i in range(n):
+        tris.extend([(cx, cy), ring[i], ring[(i + 1) % n]])
+
+    cmds: list[tuple[object, tuple[float, float, float, float], float]] = [
+        (batch_for_shader(shader, "TRIS", {"pos": tris}), fill_col, 1.0)
+    ]
+    if rim_col is not None and rim_col[3] > 0.01:
+        cmds.append((batch_for_shader(shader, "LINE_LOOP", {"pos": ring}), rim_col, float(rim_width)))
+    return cmds
+
+
 def _draw_rounded_rect(
     shader,
     rect: tuple[float, float, float, float],
@@ -254,48 +281,27 @@ def _draw_rounded_rect(
     rim_col: tuple[float, float, float, float] | None = None,
     rim_width: float = 1.2,
 ) -> None:
-    x0, y0, x1, y1 = rect
-    ring = _rounded_rect_poly(x0, y0, x1, y1, radius)
-    if len(ring) < 3:
-        return
-    cx = (x0 + x1) * 0.5
-    cy = (y0 + y1) * 0.5
-    tris: list[tuple[float, float]] = []
-    n = len(ring)
-    for i in range(n):
-        tris.extend([(cx, cy), ring[i], ring[(i + 1) % n]])
-
-    batch = batch_for_shader(shader, "TRIS", {"pos": tris})
-    shader.bind()
-    shader.uniform_float("color", fill_col)
-    batch.draw(shader)
-
-    if rim_col is not None and rim_col[3] > 0.01:
-        gpu.state.line_width_set(rim_width)
-        b_rim = batch_for_shader(shader, "LINE_LOOP", {"pos": ring})
+    for batch, col, lw in _build_rounded_rect_cmds(shader, rect, radius, fill_col, rim_col, rim_width):
+        gpu.state.line_width_set(lw)
         shader.bind()
-        shader.uniform_float("color", rim_col)
-        b_rim.draw(shader)
+        shader.uniform_float("color", col)
+        batch.draw(shader)
 
 
-def _draw_dock_icon(
+def _build_dock_icon_cmds(
     shader,
     icon_name: str,
     cx: float,
     cy: float,
     s: float,
     color: tuple[float, float, float, float],
-) -> None:
+) -> list[tuple[object, tuple[float, float, float, float], float]]:
     if icon_name == "zone_dot":
         pts = _rounded_rect_poly(cx - s, cy - s, cx + s, cy + s, s, segs=5)
         tris = []
         for i in range(len(pts)):
             tris.extend([(cx, cy), pts[i], pts[(i + 1) % len(pts)]])
-        b = batch_for_shader(shader, "TRIS", {"pos": tris})
-        shader.bind()
-        shader.uniform_float("color", color)
-        b.draw(shader)
-        return
+        return [(batch_for_shader(shader, "TRIS", {"pos": tris}), color, 1.0)]
 
     lines: list[tuple[float, float]] = []
     if icon_name == "check":
@@ -379,12 +385,23 @@ def _draw_dock_icon(
         ]
 
     if not lines:
-        return
-    gpu.state.line_width_set(2.2)
-    b = batch_for_shader(shader, "LINES", {"pos": lines})
-    shader.bind()
-    shader.uniform_float("color", color)
-    b.draw(shader)
+        return []
+    return [(batch_for_shader(shader, "LINES", {"pos": lines}), color, 2.2)]
+
+
+def _draw_dock_icon(
+    shader,
+    icon_name: str,
+    cx: float,
+    cy: float,
+    s: float,
+    color: tuple[float, float, float, float],
+) -> None:
+    for batch, col, lw in _build_dock_icon_cmds(shader, icon_name, cx, cy, s, color):
+        gpu.state.line_width_set(lw)
+        shader.bind()
+        shader.uniform_float("color", col)
+        batch.draw(shader)
 
 
 # ---------------------------------------------------------------------------
@@ -392,41 +409,42 @@ def _draw_dock_icon(
 # ---------------------------------------------------------------------------
 
 
+_MODAL_MODS_CACHE: dict[str, object] = {}
+_CUTTER_COUNT_CACHE: tuple[int, int, int, int] = (0, -1, 0, 0)  # (sess_id_ptr, n_objs, total_c, active_c)
+
+
+def _get_optional_mod(key: str, loader):
+    if key in _MODAL_MODS_CACHE:
+        return _MODAL_MODS_CACHE[key]
+    try:
+        mod = loader()
+    except Exception:
+        mod = None
+    _MODAL_MODS_CACHE[key] = mod
+    return mod
+
+
 def _any_modal_overlay_active() -> bool:
     """Return True if a modal viewport HUD/wheel/overlay is active (auto-hide dock)."""
-    try:
-        from ..ops import apple_bite_ops
+    ab_ops = _get_optional_mod("ab_ops", lambda: __import__(f"{__package__.rsplit('.', 1)[0]}.ops.apple_bite_ops", fromlist=["_interactive_active"]))
+    if ab_ops is not None and bool(getattr(ab_ops, "_interactive_active", False)):
+        return True
 
-        if bool(getattr(apple_bite_ops, "_interactive_active", False)):
+    wm = _get_optional_mod("wheel_menu", lambda: __import__(f"{__package__}.wheel_menu", fromlist=["_active_wheel"]))
+    if wm is not None:
+        if getattr(wm, "_active_wheel", None) is not None or getattr(wm, "_active_view_wheel", None) is not None:
             return True
-    except Exception:
-        pass
-    try:
-        from . import wheel_menu
 
-        if getattr(wheel_menu, "_active_wheel", None) is not None:
+    cg = _get_optional_mod("cutter_gizmo", lambda: __import__(f"{__package__}.cutter_gizmo", fromlist=["_active_axis_picker"]))
+    if cg is not None:
+        if getattr(cg, "_active_axis_picker", None) is not None or getattr(cg, "_active_layer_picker", None) is not None:
             return True
-        if getattr(wheel_menu, "_active_view_wheel", None) is not None:
-            return True
-    except Exception:
-        pass
-    try:
-        from . import cutter_gizmo
 
-        if getattr(cutter_gizmo, "_active_axis_picker", None) is not None:
-            return True
-        if getattr(cutter_gizmo, "_active_layer_picker", None) is not None:
-            return True
-    except Exception:
-        pass
-    try:
-        from . import draw_overlay
-
-        ov = getattr(draw_overlay, "_active_overlay", None)
+    do = _get_optional_mod("draw_overlay", lambda: __import__(f"{__package__}.draw_overlay", fromlist=["_active_overlay"]))
+    if do is not None:
+        ov = getattr(do, "_active_overlay", None)
         if ov is not None and hasattr(ov, "isVisible") and ov.isVisible():
             return True
-    except Exception:
-        pass
     return False
 
 
@@ -450,6 +468,7 @@ def _resolve_active_rebar(scene) -> tuple[object | None, int]:
 
 def _resolve_dock_mode(context) -> tuple[str | None, dict]:
     """Resolve active dock mode & state using Dual-Active Priority Rule."""
+    global _CUTTER_COUNT_CACHE
     scene = getattr(context, "scene", None)
     if scene is None:
         return None, {}
@@ -457,7 +476,7 @@ def _resolve_dock_mode(context) -> tuple[str | None, dict]:
     if settings is None or not bool(getattr(settings, "show_viewport_dock", True)):
         return None, {}
 
-    session = load_session(scene)
+    session = load_session_readonly(scene)
     rebar_entry, rebar_est = _resolve_active_rebar(scene)
 
     active_tool = str(getattr(settings, "ui_active_tool", "APPLE_BITE") or "APPLE_BITE")
@@ -476,11 +495,22 @@ def _resolve_dock_mode(context) -> tuple[str | None, dict]:
             "rebar_stale": bool(rebar_entry.stale),
         }
 
-    # Apple Bite active session (counts ONLY valid existing cutters — handles manual X delete!)
-    valid_all = session.get_valid_cutters(include_muted=True)
-    valid_active = session.get_valid_cutters(include_muted=False)
-    total_c = len(valid_all)
-    active_c = len(valid_active)
+    # O(1) cached valid cutter count keyed by (id(session), len(bpy.data.objects))
+    objs = bpy.data.objects
+    n_objs = len(objs)
+    sess_ptr = id(session)
+    if _CUTTER_COUNT_CACHE[0] == sess_ptr and _CUTTER_COUNT_CACHE[1] == n_objs:
+        total_c, active_c = _CUTTER_COUNT_CACHE[2], _CUTTER_COUNT_CACHE[3]
+    else:
+        total_c = 0
+        active_c = 0
+        for entry in session.cutters:
+            c_obj = objs.get(entry.name)
+            if c_obj is not None and c_obj.type == "MESH":
+                total_c += 1
+                if not entry.muted:
+                    active_c += 1
+        _CUTTER_COUNT_CACHE = (sess_ptr, n_objs, total_c, active_c)
 
     zone_key = str(getattr(settings, "active_zone", "A") or "A")
     active_obj = getattr(context, "active_object", None)
@@ -551,7 +581,17 @@ class FDT_OT_viewport_zone_quick(bpy.types.Operator):
 # ---------------------------------------------------------------------------
 
 _DOCK_DRAW_HANDLE = None
+_DOCK_SHADER = None
 _HOVERED_SLOT_BY_REGION: dict[int, str | None] = {}
+# rkey -> (cache_key, draw_cmds, text_queue)
+_DOCK_BATCH_CACHE: dict[int, tuple[tuple, list, list]] = {}
+
+
+def _get_dock_shader():
+    global _DOCK_SHADER
+    if _DOCK_SHADER is None:
+        _DOCK_SHADER = gpu.shader.from_builtin("UNIFORM_COLOR")
+    return _DOCK_SHADER
 
 
 def _region_key(region) -> int:
@@ -637,23 +677,30 @@ def _compute_context_dock_layout(context) -> tuple[DockLayout | None, dict]:
 
 
 def _draw_dock_post_pixel() -> None:
-    """Render the entire Viewport Dock in clean 2D POST_PIXEL space (strict back-to-front order)."""
+    """Render the entire Viewport Dock in clean 2D POST_PIXEL space (cached GPU batches, 0 allocs/frame)."""
     context = bpy.context
     layout, _state = _compute_context_dock_layout(context)
     if layout is None:
         return
 
     s = layout.ui_scale
-    hovered_slot = _HOVERED_SLOT_BY_REGION.get(_region_key(context.region))
-    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    rkey = _region_key(context.region)
+    hovered_slot = _HOVERED_SLOT_BY_REGION.get(rkey)
+    shader = _get_dock_shader()
 
-    gpu.state.blend_set("ALPHA")
-    gpu.state.depth_test_set("NONE")
-    gpu.state.face_culling_set("NONE")
-    try:
+    cache_key = (layout, hovered_slot)
+    cached = _DOCK_BATCH_CACHE.get(rkey)
+    if cached is not None and cached[0] == cache_key:
+        draw_cmds, text_queue = cached[1], cached[2]
+    else:
+        draw_cmds: list[tuple[object, tuple[float, float, float, float], float]] = []
+        text_queue: list[tuple[DockButtonSpec, tuple[float, float, float, float]]] = []
+
         # 1. Translucent dark glass capsule backdrop
         cx0, cy0, cx1, cy1 = layout.capsule_rect
-        _draw_rounded_rect(shader, layout.capsule_rect, 14.0 * s, COL_GLASS_BG, COL_GLASS_RIM, rim_width=1.2)
+        draw_cmds.extend(
+            _build_rounded_rect_cmds(shader, layout.capsule_rect, 14.0 * s, COL_GLASS_BG, COL_GLASS_RIM, rim_width=1.2)
+        )
 
         # 2. Vertical group dividers
         if layout.divider_xs:
@@ -661,27 +708,42 @@ def _draw_dock_post_pixel() -> None:
             div_lines: list[tuple[float, float]] = []
             for dx in layout.divider_xs:
                 div_lines.extend([(dx, cy0 + pad), (dx, cy1 - pad)])
-            gpu.state.line_width_set(1.0)
-            b_div = batch_for_shader(shader, "LINES", {"pos": div_lines})
-            shader.bind()
-            shader.uniform_float("color", COL_DIVIDER)
-            b_div.draw(shader)
+            draw_cmds.append((batch_for_shader(shader, "LINES", {"pos": div_lines}), COL_DIVIDER, 1.0))
 
         # 3. Rounded pills + crisp vector icons
-        text_queue: list[tuple[DockButtonSpec, tuple[float, float, float, float]]] = []
         for spec in layout.buttons:
             is_hover = spec.enabled and (spec.slot_id == hovered_slot)
             fill, rim, icon_col, txt_col = _pill_colors(spec.style, spec.accent, is_hover)
-            _draw_rounded_rect(shader, spec.rect, 9.0 * s, fill, rim, rim_width=1.6 if is_hover else 1.1)
-
+            draw_cmds.extend(
+                _build_rounded_rect_cmds(shader, spec.rect, 9.0 * s, fill, rim, rim_width=1.6 if is_hover else 1.1)
+            )
             x0, y0, x1, y1 = spec.rect
             cy = (y0 + y1) * 0.5
             icon_r = 5.5 * s
             if spec.icon:
                 ix = (x0 + 13.0 * s) if spec.label else ((x0 + x1) * 0.5)
-                _draw_dock_icon(shader, spec.icon, ix, cy, icon_r * (1.0 if spec.label else 1.05), icon_col)
+                draw_cmds.extend(
+                    _build_dock_icon_cmds(shader, spec.icon, ix, cy, icon_r * (1.0 if spec.label else 1.05), icon_col)
+                )
             if spec.label:
                 text_queue.append((spec, txt_col))
+
+        if len(_DOCK_BATCH_CACHE) > 8:
+            _DOCK_BATCH_CACHE.clear()
+        _DOCK_BATCH_CACHE[rkey] = (cache_key, draw_cmds, text_queue)
+
+    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("NONE")
+    gpu.state.face_culling_set("NONE")
+    try:
+        shader.bind()
+        last_lw = -1.0
+        for batch, col, lw in draw_cmds:
+            if lw != last_lw:
+                gpu.state.line_width_set(lw)
+                last_lw = lw
+            shader.uniform_float("color", col)
+            batch.draw(shader)
     finally:
         gpu.state.line_width_set(1.0)
         gpu.state.blend_set("NONE")
@@ -832,13 +894,15 @@ def register():
 
 
 def unregister():
-    global _DOCK_DRAW_HANDLE
+    global _DOCK_DRAW_HANDLE, _DOCK_SHADER
     if _DOCK_DRAW_HANDLE is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_DOCK_DRAW_HANDLE, "WINDOW")
         except Exception:
             pass
         _DOCK_DRAW_HANDLE = None
+    _DOCK_SHADER = None
+    _DOCK_BATCH_CACHE.clear()
     _HOVERED_SLOT_BY_REGION.clear()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)

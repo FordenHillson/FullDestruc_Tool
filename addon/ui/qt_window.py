@@ -9,7 +9,7 @@ import bpy
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
 
 from ..core import apple_bite, rebar_state, zone_registry
-from ..core.session import load_session
+from ..core.session import SESSION_SCENE_PROP, load_session, load_session_readonly
 from ..ops import rebar_ops
 from . import icons
 
@@ -1678,10 +1678,36 @@ class FullDestrucWindow(QtWidgets.QWidget):
                     self.chk_viewport_dock.blockSignals(False)
 
             if self._active_tab == "REBAR":
+                self._last_ab_refresh_sig = None
                 self._refresh_rebar_page(context, scene)
                 return
 
-            session = load_session(scene)
+            session = load_session_readonly(scene)
+            active_obj = getattr(context, "active_object", None)
+            active_name = active_obj.name if active_obj is not None else ""
+            raw_sess = scene.get(SESSION_SCENE_PROP, "") if session is not None else ""
+            raw_zones = scene.get(zone_registry.REGISTRY_PROP, "")
+            cut_mat = getattr(settings, "cut_material", None) if settings is not None else None
+            cut_mat_name = cut_mat.name if cut_mat is not None else ""
+            ab_sig = (
+                raw_sess,
+                raw_zones,
+                len(bpy.data.objects),
+                len(bpy.data.materials),
+                active_name,
+                len(getattr(context, "selected_objects", ())),
+                getattr(context, "mode", ""),
+                cut_mat_name,
+                str(getattr(settings, "active_zone", "A")) if settings else "A",
+                bool(getattr(settings, "enable_rough", False)) if settings else False,
+                bool(getattr(settings, "apply_keep_result", True)) if settings else True,
+                bool(getattr(settings, "apply_keep_pieces", True)) if settings else True,
+                str(getattr(settings, "preview_display_mode", "ALL")) if settings else "ALL",
+            )
+            if getattr(self, "_last_ab_refresh_sig", None) == ab_sig:
+                return
+            self._last_ab_refresh_sig = ab_sig
+
             if session is None:
                 self.step1_widget.setVisible(True)
                 self.step2_widget.setVisible(False)
@@ -1706,7 +1732,6 @@ class FullDestrucWindow(QtWidgets.QWidget):
                 if show_reset:
                     self.btn_reset_original.setText("Reset to Original")
 
-                active_obj = context.active_object
                 has_mesh = (active_obj is not None and active_obj.type == "MESH") or any(
                     o.type == "MESH" for o in context.selected_objects
                 )
@@ -1721,11 +1746,16 @@ class FullDestrucWindow(QtWidgets.QWidget):
                 self._last_cutter_sig = ()
                 return
 
-            # Active Apple Bite Session (count ONLY valid existing cutters!)
-            valid_all = session.get_valid_cutters(include_muted=True)
-            valid_active = session.get_valid_cutters(include_muted=False)
-            total_c = len(valid_all)
-            active_c = len(valid_active)
+            # Active Apple Bite Session (single-pass count of valid existing cutters!)
+            objs = bpy.data.objects
+            total_c = 0
+            active_c = 0
+            for entry in session.cutters:
+                c_obj = objs.get(entry.name)
+                if c_obj is not None and c_obj.type == "MESH":
+                    total_c += 1
+                    if not entry.muted:
+                        active_c += 1
             has_cutters = total_c > 0
 
             self.step1_widget.setVisible(False)
