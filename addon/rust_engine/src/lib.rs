@@ -79,10 +79,86 @@ enum PendingJob {
     },
 }
 
-struct CompletedMeta {
+struct PendingDeltaMailbox {
     job_id: u64,
     compute_ms: f32,
     recomputed_islands: u32,
+    updated_chunks: HashMap<u32, GpuPackedMesh>,
+    removed_chunk_ids: HashSet<u32>,
+    chunk_owners: HashMap<u32, u32>,
+    updated_pieces: HashMap<u32, GpuPackedMesh>,
+    removed_piece_ids: HashSet<u32>,
+    ordered_piece_ids: Vec<u32>,
+}
+
+impl PendingDeltaMailbox {
+    fn from_snapshot(
+        job_id: u64,
+        compute_ms: f32,
+        recomputed_islands: u32,
+        snap: DeltaGpuSnapshot,
+    ) -> Self {
+        Self {
+            job_id,
+            compute_ms,
+            recomputed_islands,
+            updated_chunks: snap.updated_chunks.into_iter().collect(),
+            removed_chunk_ids: snap.removed_chunk_ids.into_iter().collect(),
+            chunk_owners: snap.chunk_owners.into_iter().collect(),
+            updated_pieces: snap.updated_pieces.into_iter().collect(),
+            removed_piece_ids: snap.removed_piece_ids.into_iter().collect(),
+            ordered_piece_ids: snap.ordered_piece_ids,
+        }
+    }
+
+    fn merge(
+        &mut self,
+        job_id: u64,
+        compute_ms: f32,
+        recomputed_islands: u32,
+        snap: DeltaGpuSnapshot,
+    ) {
+        self.job_id = job_id;
+        self.compute_ms = compute_ms;
+        self.recomputed_islands = recomputed_islands;
+        for rcid in snap.removed_chunk_ids {
+            self.updated_chunks.remove(&rcid);
+            self.chunk_owners.remove(&rcid);
+            self.removed_chunk_ids.insert(rcid);
+        }
+        for (cid, mesh) in snap.updated_chunks {
+            self.removed_chunk_ids.remove(&cid);
+            self.updated_chunks.insert(cid, mesh);
+        }
+        for (cid, owner) in snap.chunk_owners {
+            self.chunk_owners.insert(cid, owner);
+        }
+        for rpid in snap.removed_piece_ids {
+            self.updated_pieces.remove(&rpid);
+            self.removed_piece_ids.insert(rpid);
+        }
+        for (pid, mesh) in snap.updated_pieces {
+            self.removed_piece_ids.remove(&pid);
+            self.updated_pieces.insert(pid, mesh);
+        }
+        self.ordered_piece_ids = snap.ordered_piece_ids;
+    }
+
+    fn into_snapshot(self) -> (u64, f32, u32, DeltaGpuSnapshot) {
+        (
+            self.job_id,
+            self.compute_ms,
+            self.recomputed_islands,
+            DeltaGpuSnapshot {
+                updated_chunks: self.updated_chunks.into_iter().collect(),
+                removed_chunk_ids: self.removed_chunk_ids.into_iter().collect(),
+                chunk_owners: self.chunk_owners.into_iter().collect(),
+                updated_pieces: self.updated_pieces.into_iter().collect(),
+                removed_piece_ids: self.removed_piece_ids.into_iter().collect(),
+                ordered_piece_ids: self.ordered_piece_ids,
+            },
+        )
+    }
 }
 
 struct CompletedLegacyFrame {
@@ -97,7 +173,7 @@ struct WorkerShared {
     pending_targets: HashMap<(u64, u32), (HybridMesh, DMat4)>,
     pending: HashMap<(u64, u32), PendingJob>,
     in_flight: HashSet<(u64, u32)>,
-    completed_delta_meta: HashMap<(u64, u32), CompletedMeta>,
+    completed_delta: HashMap<(u64, u32), PendingDeltaMailbox>,
     completed_legacy: HashMap<(u64, u32), CompletedLegacyFrame>,
 }
 
@@ -116,7 +192,7 @@ fn get_worker() -> &'static AsyncWorker {
                 pending_targets: HashMap::new(),
                 pending: HashMap::new(),
                 in_flight: HashSet::new(),
-                completed_delta_meta: HashMap::new(),
+                completed_delta: HashMap::new(),
                 completed_legacy: HashMap::new(),
             }),
             work_cvar: Condvar::new(),
@@ -192,7 +268,7 @@ fn worker_thread_loop() {
                     });
                 }
                 let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-                st.completed_delta_meta.remove(&key);
+                st.completed_delta.remove(&key);
                 st.completed_legacy.remove(&key);
                 st.in_flight.remove(&key);
                 worker.done_cvar.notify_all();
@@ -215,19 +291,27 @@ fn worker_thread_loop() {
                     let recomputed =
                         tc.evaluate_active(&ordered_active_ids, cut_mat_idx, uv_scale, true);
                     tc.retain_cutters(&ordered_active_ids);
-                    Some(recomputed as u32)
+                    // Extract delta snapshot right here while holding `tc` so Main Thread polling
+                    // NEVER contends with `target_arc` during continuous 60-144 Hz dragging!
+                    let snap = tc.take_gpu_delta();
+                    Some((recomputed as u32, snap))
                 });
                 let compute_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
                 let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-                if let Ok(Some(recomputed_islands)) = res {
-                    st.completed_delta_meta.insert(
-                        key,
-                        CompletedMeta {
-                            job_id,
-                            compute_ms,
-                            recomputed_islands,
-                        },
-                    );
+                if let Ok(Some((recomputed_islands, snap))) = res {
+                    if let Some(existing) = st.completed_delta.get_mut(&key) {
+                        existing.merge(job_id, compute_ms, recomputed_islands, snap);
+                    } else {
+                        st.completed_delta.insert(
+                            key,
+                            PendingDeltaMailbox::from_snapshot(
+                                job_id,
+                                compute_ms,
+                                recomputed_islands,
+                                snap,
+                            ),
+                        );
+                    }
                 }
                 st.in_flight.remove(&key);
                 worker.done_cvar.notify_all();
@@ -807,7 +891,7 @@ pub extern "C" fn fdt_session_destroy(handle: u64) -> i32 {
             let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
             st.pending_targets.retain(|&(h, _), _| h != handle);
             st.pending.retain(|&(h, _), _| h != handle);
-            st.completed_delta_meta.retain(|&(h, _), _| h != handle);
+            st.completed_delta.retain(|&(h, _), _| h != handle);
             st.completed_legacy.retain(|&(h, _), _| h != handle);
         }
         with_sessions(|map| {
@@ -835,7 +919,7 @@ pub unsafe extern "C" fn fdt_session_set_target(
             let key = (handle, target_id);
             st.pending_targets.remove(&key);
             st.pending.remove(&key);
-            st.completed_delta_meta.remove(&key);
+            st.completed_delta.remove(&key);
             st.completed_legacy.remove(&key);
             while st.in_flight.contains(&key) {
                 st = worker.done_cvar.wait(st).unwrap_or_else(|e| e.into_inner());
@@ -877,7 +961,7 @@ pub unsafe extern "C" fn fdt_session_set_target_async(
         let key = (handle, target_id);
         st.pending_targets.insert(key, (base_mesh, world_mat));
         st.pending.remove(&key);
-        st.completed_delta_meta.remove(&key);
+        st.completed_delta.remove(&key);
         st.completed_legacy.remove(&key);
         worker.work_cvar.notify_one();
         0
@@ -1041,8 +1125,9 @@ pub unsafe extern "C" fn fdt_session_submit_async_delta(
     .unwrap_or(0)
 }
 
-/// v200 Non-blocking Delta GPU Poll (`try_lock` — NEVER blocks Blender's Main Thread!).
-/// Returns NULL if no newer frame is ready or if the worker is mid-compute on the next frame.
+/// v210 Lock-free Delta GPU Poll: pops the latest merged delta snapshot directly from
+/// `completed_delta` without ever contending on `target_arc` — eliminates 1-second poll
+/// starvation during continuous 60-144 Hz mouse dragging!
 #[no_mangle]
 pub extern "C" fn fdt_session_poll_gpu_delta(
     handle: u64,
@@ -1054,26 +1139,20 @@ pub extern "C" fn fdt_session_poll_gpu_delta(
             Some(w) => w,
             None => return std::ptr::null_mut(),
         };
-        let meta = {
-            let st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
-            match st.completed_delta_meta.get(&(handle, target_id)) {
-                Some(m) if m.job_id > last_seen_job_id => (m.job_id, m.compute_ms, m.recomputed_islands),
-                _ => return std::ptr::null_mut(),
+        let mailbox = {
+            let mut st = worker.state.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (handle, target_id);
+            let ready = st
+                .completed_delta
+                .get(&key)
+                .map_or(false, |m| m.job_id > last_seen_job_id);
+            if !ready {
+                return std::ptr::null_mut();
             }
+            st.completed_delta.remove(&key).unwrap()
         };
-
-        let target_arc = match get_target_arc(handle, target_id) {
-            Some(a) => a,
-            None => return std::ptr::null_mut(),
-        };
-
-        // Non-blocking try_lock: if worker is mid-compute on next frame, skip this poll tick cleanly!
-        let mut tc = match target_arc.try_lock() {
-            Ok(g) => g,
-            Err(_) => return std::ptr::null_mut(),
-        };
-        let snap = tc.take_gpu_delta();
-        pack_delta_output(meta.0, meta.1, meta.2, snap)
+        let (job_id, compute_ms, recomputed_islands, snap) = mailbox.into_snapshot();
+        pack_delta_output(job_id, compute_ms, recomputed_islands, snap)
     })
     .unwrap_or(std::ptr::null_mut())
 }
