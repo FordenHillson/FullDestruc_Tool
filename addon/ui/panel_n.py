@@ -109,7 +109,11 @@ class FDT_PT_popover_settings(bpy.types.Panel):
         if settings.boolean_solver == "RUST":
             if rust_bridge.is_available():
                 layout.prop(settings, "gpu_fast_drag", text="GPU Fast Drag (60+ FPS)", icon="SHADING_RENDERED")
-                layout.label(text="Rust v1.5: CDT + GPU Ready", **icons.icon_kw("apply_green", "CHECKMARK"))
+                if settings.gpu_fast_drag:
+                    row_imp = layout.row(align=True)
+                    row_imp.label(text="Imposter:")
+                    row_imp.prop(settings, "imposter_drag_mode", text="")
+                layout.label(text="Rust v2.3: Delta + Imposter Ready", **icons.icon_kw("apply_green", "CHECKMARK"))
             else:
                 layout.label(text="Rust DLL missing — Blender Exact", icon="ERROR")
 

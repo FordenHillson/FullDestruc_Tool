@@ -439,6 +439,23 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         default=True,
         update=_on_live_setting_changed,
     )
+    imposter_drag_mode: EnumProperty(
+        name="Imposter Drag Mode",
+        description="Use On-Demand Single-View G-Buffer Imposter while dragging cutters (0 ms Rust, 144+ FPS on 1M-10M+ tris) and auto-sync Rust ~180ms after mouse release",
+        items=[
+            ("AUTO", "Auto (100K+)", "Automatically activate Imposter Drag on high-poly meshes (>= 100K polys) or >= 50 cutters"),
+            ("ON", "Always On", "Always use G-Buffer Imposter during cutter dragging"),
+            ("OFF", "Off", "Disable Imposter Drag and run Rust Delta directly while dragging"),
+        ],
+        default="AUTO",
+    )
+    imposter_poly_threshold: IntProperty(
+        name="Imposter Auto Threshold",
+        description="Minimum total target polygons to automatically activate Imposter Drag in Auto mode",
+        default=100_000,
+        min=0,
+        max=10_000_000,
+    )
     apply_keep_result: BoolProperty(
         name="Keep Cut Main Mesh",
         description="Keep the main mesh with holes cut out on Apply",

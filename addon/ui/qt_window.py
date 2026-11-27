@@ -547,6 +547,16 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.chk_gpu_fast_drag.toggled.connect(self._on_gpu_fast_drag_toggled)
         sd_l.addWidget(self.chk_gpu_fast_drag)
 
+        imp_row = QtWidgets.QHBoxLayout()
+        imp_row.addWidget(QtWidgets.QLabel("Imposter Drag:"))
+        self.cmb_imposter = QtWidgets.QComboBox()
+        self.cmb_imposter.addItem("Auto (100K+)", "AUTO")
+        self.cmb_imposter.addItem("Always On", "ON")
+        self.cmb_imposter.addItem("Off", "OFF")
+        self.cmb_imposter.currentIndexChanged.connect(self._on_imposter_mode_changed)
+        imp_row.addWidget(self.cmb_imposter, 1)
+        sd_l.addLayout(imp_row)
+
         self.chk_viewport_dock = QtWidgets.QCheckBox("Show 3D Viewport Action Dock")
         self.chk_viewport_dock.setChecked(True)
         self.chk_viewport_dock.toggled.connect(self._on_viewport_dock_toggled)
@@ -1179,6 +1189,16 @@ class FullDestrucWindow(QtWidgets.QWidget):
                 settings.gpu_fast_drag = bool(checked)
         _tag_all_view3d_redraw()
 
+    def _on_imposter_mode_changed(self, _idx: int) -> None:
+        val = self.cmb_imposter.currentData()
+        if not val:
+            return
+        with blender_view3d_override():
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
+            if settings is not None and getattr(settings, "imposter_drag_mode", "AUTO") != val:
+                settings.imposter_drag_mode = str(val)
+        _tag_all_view3d_redraw()
+
     def _on_viewport_dock_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
             settings = getattr(bpy.context.scene, "fdt_settings", None)
@@ -1671,6 +1691,13 @@ class FullDestrucWindow(QtWidgets.QWidget):
                     self.chk_gpu_fast_drag.blockSignals(True)
                     self.chk_gpu_fast_drag.setChecked(gpu_fd)
                     self.chk_gpu_fast_drag.blockSignals(False)
+                imp_mode = str(getattr(settings, "imposter_drag_mode", "AUTO") or "AUTO")
+                imp_idx = self.cmb_imposter.findData(imp_mode)
+                if imp_idx >= 0 and self.cmb_imposter.currentIndex() != imp_idx:
+                    self.cmb_imposter.blockSignals(True)
+                    self.cmb_imposter.setCurrentIndex(imp_idx)
+                    self.cmb_imposter.blockSignals(False)
+                self.cmb_imposter.setEnabled(gpu_fd)
                 vdock = bool(getattr(settings, "show_viewport_dock", True))
                 if self.chk_viewport_dock.isChecked() != vdock:
                     self.chk_viewport_dock.blockSignals(True)

@@ -268,6 +268,7 @@ class _MockScene:
         self.fdt_settings = types.SimpleNamespace(
             boolean_solver="RUST",
             gpu_fast_drag=True,
+            imposter_drag_mode="OFF",
             show_viewport_dock=True,
             ui_active_tool="APPLE_BITE",
             active_zone="A",
