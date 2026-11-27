@@ -898,6 +898,8 @@ def _sync_rust_session(
     recreate_pieces: bool = False,
     is_live: bool = False,
     force_write: bool = False,
+    include_edges: bool | None = None,
+    apply_custom_normals: bool = True,
 ) -> bool:
     """Evaluate all targets & active cutters via the Rust Boolean Engine (O(N) single-pass split)."""
     cols = session.get_collections()
@@ -971,6 +973,8 @@ def _sync_rust_session(
             piece_objs=target_piece_objs,
             is_live=is_live,
             force_write=force_write,
+            include_edges=include_edges,
+            apply_custom_normals=apply_custom_normals,
         )
 
     # Remove stale piece objects (e.g., muted or deleted cutters)
@@ -1052,7 +1056,12 @@ def submit_rust_session_async_delta(
     return job_map
 
 
-def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
+def commit_rust_gpu_drag(
+    scene: bpy.types.Scene,
+    write_orig_attr: bool = False,
+    include_edges: bool = True,
+    apply_custom_normals: bool = True,
+) -> bool:
     """Commit the already-computed Rust async cache ONCE into real Blender meshes (0 ms Rust recompute)."""
     session = load_session(scene)
     if session is None:
@@ -1080,6 +1089,8 @@ def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
         if src and cname:
             piece_map[(src, cname)] = obj
 
+    valid_piece_keys: set[tuple[str, str]] = set()
+
     for orig in targets:
         res_obj = res_by_source.get(orig.name)
         if res_obj is None:
@@ -1092,6 +1103,7 @@ def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
         target_piece_objs: list[bpy.types.Object] = []
         for idx, (cutter_obj, zone) in enumerate(active_cutters):
             key = (orig.name, cutter_obj.name)
+            valid_piece_keys.add(key)
             p_obj = piece_map.get(key)
             zone_token = _zone_name_token(zone, scene)
             if p_obj is None:
@@ -1114,7 +1126,14 @@ def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
             cut_material=cut_mat,
             res_obj=res_obj,
             piece_objs=target_piece_objs,
+            write_orig_attr=write_orig_attr,
+            include_edges=include_edges,
+            apply_custom_normals=apply_custom_normals,
         )
+
+    for key, obj in list(piece_map.items()):
+        if key not in valid_piece_keys:
+            _remove_object_and_orphan_mesh(obj)
 
     try:
         from ..ops import apple_bite_ops
@@ -1162,15 +1181,57 @@ def rebuild_session(
         apply_cutter_visuals(c_obj, zone, muted=entry.muted)
         _ensure_rough_modifier(c_obj, scene, is_rough=is_rough, preview_mode=not for_apply)
 
-    # Fast path: Rust Boolean Engine (v2.0 Spatial Islands + Chunked Delta GPU)
+    # Fast path: Rust Boolean Engine (v2.1 Spatial Islands + Chunked Delta GPU + Async Target Upload)
     if solver == "RUST" and rust_bridge.is_available():
+        active_cutters = session.get_valid_cutters(include_muted=False)
+
+        # v2.1 Instant 0-cutter path (Enter Cut Mode / all cutters muted or deleted):
+        # Never block Main Thread building a 4M-tri BVH or rewriting uncut 4M-tri mesh!
+        # Instead, keep untouched `FDT_Res_*` directly and pre-warm Rust BVH + Base GPU asynchronously!
+        if not for_apply and len(active_cutters) == 0:
+            live_sync.reset_sync_cache(session.session_id)
+            _remove_objects_in_collection(pieces_col)
+            res_by_source: dict[str, bpy.types.Object] = {}
+            for obj in list(results_col.objects):
+                src = obj.get(RESULT_SOURCE_PROP)
+                if src:
+                    res_by_source[str(src)] = obj
+            for orig in session.get_target_objects():
+                res_obj = res_by_source.get(orig.name)
+                if res_obj is None:
+                    res_name = f"FDT_Res_{orig.name}"[:MAX_BLENDER_NAME]
+                    res_obj = _create_working_copy(orig, res_name, results_col, session.session_id)
+                elif (
+                    res_obj.type == "MESH"
+                    and orig.type == "MESH"
+                    and (
+                        len(res_obj.data.polygons) != len(orig.data.polygons)
+                        or len(res_obj.data.vertices) != len(orig.data.vertices)
+                    )
+                ):
+                    # Restore clean uncut working mesh if last cutter was just deleted/muted
+                    old_m = res_obj.data
+                    new_m = orig.data.copy()
+                    new_m.name = f"{res_obj.name}_Mesh"[:MAX_BLENDER_NAME]
+                    res_obj.data = new_m
+                    if old_m is not None and old_m.users == 0:
+                        bpy.data.meshes.remove(old_m)
+                _clear_fdt_modifiers(res_obj)
+                # Kick off non-blocking background BVH + SpatialChunks + Base GPU build!
+                rust_bridge.preupload_target_async(session.session_id, orig)
+            if vault_col is not None:
+                set_collection_hidden(context.view_layer, vault_col, True)
+            save_session(scene, session)
+            live_sync.record_current_cutter_states(scene)
+            return True
+
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
         use_gpu_mode = (
             not for_apply
             and settings is not None
             and bool(getattr(settings, "gpu_fast_drag", True))
-            and len(session.get_valid_cutters(include_muted=False)) > 0
+            and len(active_cutters) > 0
         )
         if use_gpu_mode:
             # Zero-Switch Textured GPU Mode: stay on GPU seamlessly without flickering!
@@ -1181,7 +1242,7 @@ def rebuild_session(
             live_sync.start_gpu_async_update(scene, depsgraph, dirty_cutter_names=style_subset)
             return True
 
-        # Direct real-mesh sync (Apply, 0 cutters, or GPU Fast Drag turned OFF)
+        # Direct real-mesh sync (Apply or GPU Fast Drag turned OFF)
         live_sync.reset_sync_cache(session.session_id)
         _sync_rust_session(
             scene,
@@ -1190,6 +1251,8 @@ def rebuild_session(
             recreate_pieces=False,
             is_live=not for_apply,
             force_write=for_apply,
+            include_edges=True if for_apply else None,
+            apply_custom_normals=not for_apply,
         )
         if vault_col is not None:
             set_collection_hidden(context.view_layer, vault_col, True)
@@ -2349,6 +2412,233 @@ def reorder_cutter_layers(
     return True, f"อัปเดตลำดับ Layer ({len(new_order)} ชั้น) แล้ว"
 
 
+_HIGHPOLY_POSTPROCESS_THRESHOLD = 50_000
+
+
+def _restore_custom_normals_vectorized(
+    mesh: bpy.types.Mesh,
+    obj_name: str,
+    preloaded_nrm_3=None,
+    preloaded_good=None,
+) -> None:
+    """Restore preserved per-corner split normals in pure vectorized NumPy (0 Python loops)."""
+    import numpy as np
+
+    nrm_attr = mesh.attributes.get(rust_bridge.PRESERVED_NRM_ATTR)
+    if nrm_attr is None or nrm_attr.domain != "CORNER" or len(mesh.loops) == 0:
+        return
+    try:
+        nl = len(mesh.loops)
+        np_count = len(mesh.polygons)
+        if preloaded_nrm_3 is not None and preloaded_good is not None:
+            nrm_3 = preloaded_nrm_3
+            good = preloaded_good
+        else:
+            nrm_flat = np.empty(nl * 3, dtype=np.float32)
+            nrm_attr.data.foreach_get("vector", nrm_flat)
+            nrm_3 = nrm_flat.reshape(-1, 3)
+            nx = nrm_3[:, 0]
+            ny = nrm_3[:, 1]
+            nz = nrm_3[:, 2]
+            lens = np.sqrt(nx * nx + ny * ny + nz * nz)
+            good = lens > 1e-5
+            if np.all(good):
+                inv_l = 1.0 / lens
+                nrm_3[:, 0] *= inv_l
+                nrm_3[:, 1] *= inv_l
+                nrm_3[:, 2] *= inv_l
+            else:
+                inv_l = 1.0 / lens[good]
+                nrm_3[good, 0] *= inv_l
+                nrm_3[good, 1] *= inv_l
+                nrm_3[good, 2] *= inv_l
+
+        if not np.all(good) and np_count > 0:
+            poly_totals = np.empty(np_count, dtype=np.int32)
+            poly_nrms = np.empty(np_count * 3, dtype=np.float32)
+            mesh.polygons.foreach_get("loop_total", poly_totals)
+            mesh.polygons.foreach_get("normal", poly_nrms)
+            loop_poly = np.repeat(np.arange(np_count, dtype=np.int32), poly_totals)
+            if loop_poly.size == nl:
+                bad = ~good
+                nrm_3[bad] = poly_nrms.reshape(-1, 3)[loop_poly[bad]]
+            else:
+                nrm_3[~good] = (0.0, 0.0, 1.0)
+
+        mesh.attributes.remove(nrm_attr)
+        mesh.polygons.foreach_set("use_smooth", np.ones(np_count, dtype=bool))
+        mesh.normals_split_custom_set(nrm_3)
+    except Exception as exc:
+        print(f"[FullDestruc_Tool] Custom split normal restore warning on {obj_name}: {exc}")
+
+
+def _ensure_cut_material_vectorized(mesh: bpy.types.Mesh, cut_material: bpy.types.Material | None) -> None:
+    """Ensure cut material is assigned to cut faces in pure vectorized NumPy."""
+    if cut_material is None or cut_material.name in mesh.materials:
+        return
+    orig_attr = mesh.attributes.get(ORIG_ATTR_NAME)
+    if orig_attr is None or orig_attr.domain != "FACE" or len(mesh.polygons) == 0:
+        return
+    import numpy as np
+
+    np_count = len(mesh.polygons)
+    vals = np.empty(np_count, dtype=np.float32)
+    orig_attr.data.foreach_get("value", vals)
+    cut_mask = vals < 0.5
+    if np.any(cut_mask):
+        mesh.materials.append(cut_material)
+        slot_idx = len(mesh.materials) - 1
+        mat_ids = np.empty(np_count, dtype=np.int32)
+        mesh.polygons.foreach_get("material_index", mat_ids)
+        mat_ids[cut_mask] = slot_idx
+        mesh.polygons.foreach_set("material_index", mat_ids)
+
+
+def _postprocess_highpoly_numpy(
+    obj: bpy.types.Object,
+    cut_material: bpy.types.Material | None,
+) -> int:
+    """Vectorized NumPy post-processor for high-poly (>= 50K poly) Rust meshes (~50-200ms vs 45s bmesh!).
+
+    Computes exact `freestyle_edge` (`orig != cut` border edges) and `sharp_edge` (border + split-normal
+    discontinuity across shared edge) in O(N) NumPy without ever converting 4M tris into BMesh,
+    then restores exact custom split normals via `normals_split_custom_set`.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    np_count = len(mesh.polygons)
+    nl = len(mesh.loops)
+    ne = len(mesh.edges)
+    if np_count == 0 or nl == 0 or ne == 0:
+        _restore_custom_normals_vectorized(mesh, obj.name)
+        _ensure_cut_material_vectorized(mesh, cut_material)
+        return 0
+
+    orig_attr = mesh.attributes.get(ORIG_ATTR_NAME)
+    nrm_attr = mesh.attributes.get(rust_bridge.PRESERVED_NRM_ATTR)
+
+    loop_edges = np.empty(nl, dtype=np.int32)
+    mesh.loops.foreach_get("edge_index", loop_edges)
+
+    poly_starts = np.empty(np_count, dtype=np.int32)
+    poly_totals = np.empty(np_count, dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", poly_starts)
+    mesh.polygons.foreach_get("loop_total", poly_totals)
+    loop_poly = np.repeat(np.arange(np_count, dtype=np.int32), poly_totals)
+
+    # O(NL) edge-to-2-loops scatter (ZERO sorting!)
+    edge_count = np.bincount(loop_edges, minlength=ne)
+    two_edges = np.flatnonzero(edge_count == 2)
+
+    border_flags = np.zeros(ne, dtype=bool)
+    sharp_flags = np.zeros(ne, dtype=bool)
+    preloaded_nrm_3 = None
+    preloaded_good = None
+
+    if two_edges.size > 0 and loop_poly.size == nl:
+        lp_seq = np.arange(nl, dtype=np.int32)
+        second_lp = np.empty(ne, dtype=np.int32)
+        second_lp[loop_edges] = lp_seq
+        first_lp = np.empty(ne, dtype=np.int32)
+        first_lp[loop_edges[::-1]] = lp_seq[::-1]
+
+        l0 = first_lp[two_edges]
+        l1 = second_lp[two_edges]
+
+        if orig_attr is not None and orig_attr.domain == "FACE":
+            orig_vals = np.empty(np_count, dtype=np.float32)
+            orig_attr.data.foreach_get("value", orig_vals)
+            is_orig_face = orig_vals >= 0.5
+            is_border_2 = is_orig_face[loop_poly[l0]] != is_orig_face[loop_poly[l1]]
+            border_edges = two_edges[is_border_2]
+            border_flags[border_edges] = True
+            sharp_flags[border_edges] = True
+        else:
+            is_border_2 = np.zeros(two_edges.size, dtype=bool)
+
+        # Sharp edges from preserved split-normal discontinuity across shared edge endpoints
+        non_border_idx = np.flatnonzero(~is_border_2)
+        if (
+            non_border_idx.size > 0
+            and nrm_attr is not None
+            and nrm_attr.domain == "CORNER"
+        ):
+            nrm_flat = np.empty(nl * 3, dtype=np.float32)
+            nrm_attr.data.foreach_get("vector", nrm_flat)
+            nrm_3 = nrm_flat.reshape(-1, 3)
+            nx = nrm_3[:, 0]
+            ny = nrm_3[:, 1]
+            nz = nrm_3[:, 2]
+            lens = np.sqrt(nx * nx + ny * ny + nz * nz)
+            valid_n = lens > 1e-5
+            if np.all(valid_n):
+                inv_l = 1.0 / lens
+                nx *= inv_l
+                ny *= inv_l
+                nz *= inv_l
+            else:
+                inv_l = 1.0 / lens[valid_n]
+                nrm_3[valid_n, 0] *= inv_l
+                nrm_3[valid_n, 1] *= inv_l
+                nrm_3[valid_n, 2] *= inv_l
+            preloaded_nrm_3 = nrm_3
+            preloaded_good = valid_n
+
+            loop_verts = np.empty(nl, dtype=np.int32)
+            mesh.loops.foreach_get("vertex_index", loop_verts)
+
+            next_lp = lp_seq + 1
+            poly_ends = poly_starts + poly_totals - 1
+            next_lp[poly_ends] = poly_starts
+
+            nb_e = two_edges[non_border_idx]
+            a0 = l0[non_border_idx]
+            b0 = next_lp[a0]
+            a1 = l1[non_border_idx]
+            b1 = next_lp[a1]
+
+            # Match loop pairs at the SAME shared vertex (handles both opposite & same winding)
+            same_dir = loop_verts[a0] == loop_verts[a1]
+            c0_peer = np.where(same_dir, a1, b1)
+            c1_peer = np.where(same_dir, b1, a1)
+
+            dot0 = nx[a0] * nx[c0_peer] + ny[a0] * ny[c0_peer] + nz[a0] * nz[c0_peer]
+            dot1 = nx[b0] * nx[c1_peer] + ny[b0] * ny[c1_peer] + nz[b0] * nz[c1_peer]
+            if np.all(valid_n):
+                is_sharp_nb = (dot0 < 0.995) | (dot1 < 0.995)
+            else:
+                ok0 = valid_n[a0] & valid_n[c0_peer]
+                ok1 = valid_n[b0] & valid_n[c1_peer]
+                is_sharp_nb = (ok0 & (dot0 < 0.995)) | (ok1 & (dot1 < 0.995))
+            if np.any(is_sharp_nb):
+                sharp_flags[nb_e[is_sharp_nb]] = True
+
+    if np.any(border_flags):
+        fs_attr = mesh.attributes.get("freestyle_edge")
+        if fs_attr is None:
+            fs_attr = mesh.attributes.new(name="freestyle_edge", type="BOOLEAN", domain="EDGE")
+        fs_attr.data.foreach_set("value", border_flags)
+
+    if np.any(sharp_flags):
+        sh_attr = mesh.attributes.get("sharp_edge")
+        if sh_attr is not None and (sh_attr.data_type != "BOOLEAN" or sh_attr.domain != "EDGE"):
+            mesh.attributes.remove(sh_attr)
+            sh_attr = None
+        if sh_attr is None:
+            sh_attr = mesh.attributes.new(name="sharp_edge", type="BOOLEAN", domain="EDGE")
+        sh_attr.data.foreach_set("value", sharp_flags)
+
+    _restore_custom_normals_vectorized(
+        mesh,
+        obj.name,
+        preloaded_nrm_3=preloaded_nrm_3,
+        preloaded_good=preloaded_good,
+    )
+    _ensure_cut_material_vectorized(mesh, cut_material)
+    return 0
+
+
 def _postprocess_baked_mesh(
     obj: bpy.types.Object,
     cut_material: bpy.types.Material | None,
@@ -2367,6 +2657,11 @@ def _postprocess_baked_mesh(
     mesh = obj.data
     if not isinstance(mesh, bpy.types.Mesh) or len(mesh.polygons) == 0:
         return 0
+
+    # High-poly fast path (>= 50K polys, e.g. 1M–4M tri sculpted/subd models):
+    # Pure vectorized NumPy post-process (~50ms vs 45s pure-Python BMesh loops!).
+    if len(mesh.polygons) >= _HIGHPOLY_POSTPROCESS_THRESHOLD and mesh.attributes.get(ORIG_ATTR_NAME) is not None:
+        return _postprocess_highpoly_numpy(obj, cut_material)
 
     import numpy as np
     from . import cap_fill
@@ -2526,41 +2821,10 @@ def _postprocess_baked_mesh(
         sh_attr.data.foreach_set("value", sflags)
 
     # 6. Restore exact preserved custom split normals (`has_custom_normals = True`) and remove temp attr
-    nrm_attr = mesh.attributes.get(rust_bridge.PRESERVED_NRM_ATTR)
-    if nrm_attr is not None and nrm_attr.domain == "CORNER" and len(mesh.loops) > 0:
-        try:
-            nl = len(mesh.loops)
-            nrm_flat = np.empty(nl * 3, dtype=np.float32)
-            nrm_attr.data.foreach_get("vector", nrm_flat)
-            nrm_3 = nrm_flat.reshape(-1, 3)
-            # Normalize and replace any zero vectors with polygon geometric normal
-            lens = np.linalg.norm(nrm_3, axis=1)
-            good = lens > 1e-5
-            nrm_3[good] /= lens[good, None]
-            if not np.all(good):
-                for poly in mesh.polygons:
-                    pn = poly.normal
-                    for li in range(poly.loop_start, poly.loop_start + poly.loop_total):
-                        if not good[li]:
-                            nrm_3[li] = (pn.x, pn.y, pn.z)
-            mesh.attributes.remove(nrm_attr)
-            mesh.polygons.foreach_set("use_smooth", np.ones(len(mesh.polygons), dtype=bool))
-            mesh.normals_split_custom_set(nrm_3)
-        except Exception as exc:
-            print(f"[FullDestruc_Tool] Custom split normal restore warning on {obj.name}: {exc}")
+    _restore_custom_normals_vectorized(mesh, obj.name)
 
     # 7. Ensure cut material is present on mesh if needed
-    if cut_material is not None and cut_material.name not in mesh.materials:
-        orig_attr = mesh.attributes.get(ORIG_ATTR_NAME)
-        if orig_attr is not None and orig_attr.domain == "FACE":
-            vals = [0.0] * len(mesh.polygons)
-            orig_attr.data.foreach_get("value", vals)
-            if any(v < 0.5 for v in vals):
-                mesh.materials.append(cut_material)
-                slot_idx = len(mesh.materials) - 1
-                for poly, val in zip(mesh.polygons, vals):
-                    if val < 0.5:
-                        poly.material_index = slot_idx
+    _ensure_cut_material_vectorized(mesh, cut_material)
     return auto_filled_tris
 
 
@@ -2647,13 +2911,40 @@ def apply_session(
     t_apply_start = time.perf_counter()
     profiler.record_marker("APPLY_START", f"{session.session_id} (rust={use_rust})")
 
+    from . import gpu_preview
+
+    gpu_was_active = gpu_preview.is_active()
+    has_rough_active = any(bool(e.rough) for e in session.cutters if not e.muted)
+    targets_for_cache = session.get_target_objects() if use_rust else []
+    can_reuse_rust_cache = (
+        use_rust
+        and gpu_was_active
+        and not has_rough_active
+        and len(session.get_valid_cutters(include_muted=False)) > 0
+        and len(targets_for_cache) > 0
+        and all(rust_bridge.has_session_target(session.session_id, t) for t in targets_for_cache)
+    )
+
     with live_sync.suspend():
         with temporary_vault_evaluation(
             context,
             [root_col, vault_col, cutters_col, results_col, pieces_col],
         ):
             with profiler.action_scope("APPLY_EVAL", session.session_id):
-                rebuild_session(context, solver_override="RUST" if use_rust else "EXACT", for_apply=True)
+                if can_reuse_rust_cache:
+                    # 0 ms Rust boolean recomputation: reuse the exact already-evaluated Rust cache
+                    # WITH precomputed Rust edges (skips Blender calc_edges) and deferred normals!
+                    commit_rust_gpu_drag(
+                        scene,
+                        write_orig_attr=True,
+                        include_edges=True,
+                        apply_custom_normals=False,
+                    )
+                    if vault_col is not None:
+                        set_collection_hidden(context.view_layer, vault_col, True)
+                    save_session(scene, session)
+                else:
+                    rebuild_session(context, solver_override="RUST" if use_rust else "EXACT", for_apply=True)
             depsgraph = context.evaluated_depsgraph_get()
 
             from . import cap_fill
@@ -2674,7 +2965,8 @@ def apply_session(
                 if use_rust and src_obj.type == "MESH" and src_obj.data is not None:
                     # Rust already wrote the final evaluated mesh directly into src_obj.data
                     baked_mesh = src_obj.data.copy()
-                    baked_mesh.validate(verbose=False, clean_customdata=False)
+                    if len(baked_mesh.polygons) < _HIGHPOLY_POSTPROCESS_THRESHOLD:
+                        baked_mesh.validate(verbose=False, clean_customdata=False)
                 else:
                     eval_obj = src_obj.evaluated_get(depsgraph)
                     baked_mesh = bpy.data.meshes.new_from_object(
@@ -2691,26 +2983,35 @@ def apply_session(
                 new_obj[OBJ_SESSION_ID_PROP] = session.session_id
                 final_col.objects.link(new_obj)
 
-                mw_key = _mw_cache_key(new_obj.matrix_world) if active_cutter_objs else ()
-                if (auto_fill_caps or line_backfaces) and active_cutter_objs:
-                    planes = _planes_cache.get(mw_key)
-                    if planes is None:
-                        planes = cap_fill.extract_cutter_planes_local(
-                            active_cutter_objs, new_obj.matrix_world, depsgraph
-                        )
-                        _planes_cache[mw_key] = planes
-                else:
+                is_highpoly_rust = (
+                    use_rust
+                    and len(baked_mesh.polygons) >= _HIGHPOLY_POSTPROCESS_THRESHOLD
+                    and baked_mesh.attributes.get(ORIG_ATTR_NAME) is not None
+                )
+                if is_highpoly_rust:
                     planes = None
-
-                if line_backfaces and active_cutter_objs:
-                    cutter_bboxes = _bboxes_cache.get(mw_key)
-                    if cutter_bboxes is None:
-                        cutter_bboxes = cap_fill.extract_cutter_bboxes_local(
-                            active_cutter_objs, new_obj.matrix_world, depsgraph
-                        )
-                        _bboxes_cache[mw_key] = cutter_bboxes
-                else:
                     cutter_bboxes = None
+                else:
+                    mw_key = _mw_cache_key(new_obj.matrix_world) if active_cutter_objs else ()
+                    if (auto_fill_caps or line_backfaces) and active_cutter_objs:
+                        planes = _planes_cache.get(mw_key)
+                        if planes is None:
+                            planes = cap_fill.extract_cutter_planes_local(
+                                active_cutter_objs, new_obj.matrix_world, depsgraph
+                            )
+                            _planes_cache[mw_key] = planes
+                    else:
+                        planes = None
+
+                    if line_backfaces and active_cutter_objs:
+                        cutter_bboxes = _bboxes_cache.get(mw_key)
+                        if cutter_bboxes is None:
+                            cutter_bboxes = cap_fill.extract_cutter_bboxes_local(
+                                active_cutter_objs, new_obj.matrix_world, depsgraph
+                            )
+                            _bboxes_cache[mw_key] = cutter_bboxes
+                    else:
+                        cutter_bboxes = None
 
                 total_auto_filled_tris += _postprocess_baked_mesh(
                     new_obj,
