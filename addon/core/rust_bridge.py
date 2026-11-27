@@ -326,26 +326,42 @@ def bmesh_to_input(
     return inp, keepalive
 
 
+def _compute_true_matrix_world(obj: bpy.types.Object) -> Matrix:
+    """Compute world matrix from matrix_basis + parent chain (never stale even inside hidden/excluded Vaults)."""
+    mat = obj.matrix_basis.copy()
+    cur = obj
+    while cur.parent is not None:
+        mat = cur.parent.matrix_basis @ cur.matrix_parent_inverse @ mat
+        cur = cur.parent
+    return mat
+
+
 def _cutter_obj_to_input(
     c_obj: bpy.types.Object,
     depsgraph: bpy.types.Depsgraph | None,
     temp_meshes: list[bpy.types.Mesh],
 ) -> tuple[FdtMeshInput, list[np.ndarray], int]:
     """Extract live cutter geometry (handles BOTH Object Mode and live Edit Mode BMesh + modifiers)."""
+    mw = _compute_true_matrix_world(c_obj)
     if c_obj.mode == "EDIT" and c_obj.data is not None and len(c_obj.modifiers) == 0:
         bm = bmesh.from_edit_mesh(c_obj.data)
-        c_inp, ka = bmesh_to_input(bm, c_obj.matrix_world)
+        c_inp, ka = bmesh_to_input(bm, mw)
         return c_inp, ka, int(c_inp.num_polys)
 
+    mesh_for_input = c_obj.data
     if depsgraph is not None and (len(c_obj.modifiers) > 0 or c_obj.mode == "EDIT"):
-        eval_obj = c_obj.evaluated_get(depsgraph)
-        eval_mesh = bpy.data.meshes.new_from_object(eval_obj, depsgraph=depsgraph)
-        temp_meshes.append(eval_mesh)
-        mesh_for_input = eval_mesh
-    else:
-        mesh_for_input = c_obj.data
+        try:
+            eval_obj = c_obj.evaluated_get(depsgraph)
+            eval_mesh = bpy.data.meshes.new_from_object(eval_obj, depsgraph=depsgraph)
+            if len(eval_mesh.polygons) > 0:
+                temp_meshes.append(eval_mesh)
+                mesh_for_input = eval_mesh
+            else:
+                bpy.data.meshes.remove(eval_mesh)
+        except RuntimeError:
+            mesh_for_input = c_obj.data
 
-    c_inp, ka = mesh_to_input(mesh_for_input, c_obj.matrix_world, include_uvs=False)
+    c_inp, ka = mesh_to_input(mesh_for_input, mw, include_uvs=False)
     return c_inp, ka, len(mesh_for_input.polygons)
 
 
@@ -588,7 +604,7 @@ _SESSION_CACHE: dict[str, _RustSessionEntry] = {}
 
 def _target_signature(obj: bpy.types.Object) -> tuple:
     mesh = obj.data
-    m = obj.matrix_world
+    m = _compute_true_matrix_world(obj)
     mat_tuple = tuple(round(m[r][c], 5) for r in range(4) for c in range(4))
     return (
         mesh.as_pointer(),
@@ -621,7 +637,9 @@ def ensure_session_target(
     sig = _target_signature(target_obj)
     uploaded = False
     if force_upload or entry.target_sigs.get(target_obj.name) != sig:
-        inp, keepalive = mesh_to_input(target_obj.data, target_obj.matrix_world, include_uvs=True)
+        inp, keepalive = mesh_to_input(
+            target_obj.data, _compute_true_matrix_world(target_obj), include_uvs=True
+        )
         rc = int(dll.fdt_session_set_target(entry.handle, tid, ctypes.byref(inp)))
         del keepalive
         if rc != 0:

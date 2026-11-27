@@ -155,23 +155,27 @@ def start_gpu_async_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgrap
     disp_mode = str(getattr(settings, "preview_display_mode", "ALL") or "ALL") if settings else "ALL"
 
     prev_sync = _IS_SYNCING
+    was_active = gpu_preview.is_active()
     _IS_SYNCING = True
     try:
         from . import apple_bite
 
-        gpu_preview.begin_drag_preview(
-            session, grid_size=grid_sz, show_grid=show_grid, display_mode=disp_mode
-        )
         job_map = apple_bite.submit_rust_session_async(scene, depsgraph)
+        submitted = False
         for tname, jid in job_map.items():
             if jid > 0:
                 _LAST_SUBMITTED_JOB_IDS[f"{session.session_id}::{tname}"] = jid
+                submitted = True
+        if submitted or was_active:
+            gpu_preview.begin_drag_preview(
+                session, grid_size=grid_sz, show_grid=show_grid, display_mode=disp_mode
+            )
     except Exception as exc:
         print(f"[FullDestruc_Tool] Async GPU submit error: {exc}")
     finally:
         _IS_SYNCING = prev_sync
 
-    if not _GPU_POLL_ACTIVE:
+    if not _GPU_POLL_ACTIVE and gpu_preview.is_active():
         _GPU_POLL_ACTIVE = True
         bpy.app.timers.register(_gpu_poll_timer, first_interval=_POLL_INTERVAL_SEC)
 

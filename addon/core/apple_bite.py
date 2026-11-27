@@ -849,6 +849,9 @@ def resume_session(
     # Isolate view to ONLY this re-edited session (hide all other visible scene objects)
     _isolate_reedit_session_objects(context, sess)
 
+    # Flush view-layer / depsgraph so newly un-excluded cutters & modifiers evaluate cleanly after reload
+    context.view_layer.update()
+
     save_session(scene, sess)
     rebuild_session(context)
 
@@ -933,7 +936,8 @@ def _sync_rust_session(
             res_name = f"FDT_Res_{orig.name}"[:MAX_BLENDER_NAME]
             res_obj = _create_working_copy(orig, res_name, results_col, session.session_id)
         _clear_fdt_modifiers(res_obj)
-        res_obj.matrix_world = orig.matrix_world.copy()
+        orig_mw = _compute_true_matrix_world(orig)
+        res_obj.matrix_world = orig_mw.copy()
 
         target_piece_objs: list[bpy.types.Object] = []
         for idx, (cutter_obj, zone) in enumerate(active_cutters):
@@ -950,7 +954,7 @@ def _sync_rust_session(
                 if desired_piece_name != p_obj.name:
                     p_obj.name = desired_piece_name
             _clear_fdt_modifiers(p_obj)
-            p_obj.matrix_world = orig.matrix_world.copy()
+            p_obj.matrix_world = orig_mw.copy()
             p_obj[PIECE_ZONE_PROP] = zone
             p_obj["fdt_piece_cutter"] = cutter_obj.name
             target_piece_objs.append(p_obj)
@@ -1051,7 +1055,8 @@ def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
             res_name = f"FDT_Res_{orig.name}"[:MAX_BLENDER_NAME]
             res_obj = _create_working_copy(orig, res_name, results_col, session.session_id)
         _clear_fdt_modifiers(res_obj)
-        res_obj.matrix_world = orig.matrix_world.copy()
+        orig_mw = _compute_true_matrix_world(orig)
+        res_obj.matrix_world = orig_mw.copy()
 
         target_piece_objs: list[bpy.types.Object] = []
         for idx, (cutter_obj, zone) in enumerate(active_cutters):
@@ -1067,7 +1072,7 @@ def commit_rust_gpu_drag(scene: bpy.types.Scene) -> bool:
                 if desired_piece_name != p_obj.name:
                     p_obj.name = desired_piece_name
             _clear_fdt_modifiers(p_obj)
-            p_obj.matrix_world = orig.matrix_world.copy()
+            p_obj.matrix_world = orig_mw.copy()
             p_obj[PIECE_ZONE_PROP] = zone
             p_obj["fdt_piece_cutter"] = cutter_obj.name
             target_piece_objs.append(p_obj)
@@ -1124,6 +1129,7 @@ def rebuild_session(
 
     # Fast path: Rust Boolean Engine (O(N) single-pass split + prefix cache)
     if solver == "RUST" and rust_bridge.is_available():
+        context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
         use_gpu_mode = (
             not for_apply
