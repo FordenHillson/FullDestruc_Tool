@@ -99,15 +99,15 @@ class WheelItem:
 
 
 WHEEL_ITEMS: tuple[WheelItem, ...] = (
-    WheelItem("pick_axis", "Next Box", "Pick 3D Axis", "axis", (0.96, 0.52, 0.14, 0.95)),
-    WheelItem("zone_menu", "Zone", "Search / manage zones", "zone", (0.20, 0.65, 1.00, 0.95)),
-    WheelItem("toggle_rough", "Rough", "Rough / Smooth", "rough", (0.76, 0.36, 1.00, 0.95)),
-    WheelItem("apply", "Apply", "Bake Cuts", "check", (0.18, 0.78, 0.44, 0.95)),
-    WheelItem("delete", "Delete", "Remove Box", "cross", (0.88, 0.25, 0.25, 0.95)),
-    WheelItem("toggle_mute", "Mute", "Pause / Resume", "pause", (0.94, 0.76, 0.16, 0.95)),
-    WheelItem("add_box", "New Box", "Add Cutter", "plus_box", (0.14, 0.76, 0.72, 0.95)),
-    WheelItem("view_mode", "View", "All / Piece / Hole", "eye", (0.28, 0.84, 0.96, 0.95)),
-    WheelItem("draw_edit", "Draw Cut", "Carve / Keep / Add", "pen", (0.98, 0.38, 0.62, 0.95)),
+    WheelItem("pick_axis", "Next Box", "Pick 3D Axis", "axis", (0.96, 0.62, 0.08, 0.96)),
+    WheelItem("zone_menu", "Zone", "Search / manage zones", "zone", (0.22, 0.74, 0.97, 0.96)),
+    WheelItem("toggle_rough", "Rough", "Rough / Smooth", "rough", (0.66, 0.33, 0.97, 0.96)),
+    WheelItem("apply", "Apply", "Bake Cuts", "check", (0.18, 0.83, 0.48, 0.98)),
+    WheelItem("delete", "Delete", "Remove Box", "cross", (0.94, 0.27, 0.27, 0.96)),
+    WheelItem("toggle_mute", "Mute", "Pause / Resume", "pause", (0.58, 0.64, 0.72, 0.95)),
+    WheelItem("add_box", "New Box", "Add Cutter", "plus_box", (0.96, 0.62, 0.08, 0.96)),
+    WheelItem("view_mode", "View", "All / Piece / Hole", "eye", (0.22, 0.74, 0.97, 0.96)),
+    WheelItem("draw_edit", "Draw Cut", "Carve / Keep / Add", "pen", (0.96, 0.25, 0.37, 0.96)),
 )
 
 ZONE_SLICE_INDEX = 1
@@ -540,19 +540,26 @@ class FDT_OT_cutter_wheel_menu(bpy.types.Operator):
 
             tris, outline = build_wedge_geometry(cx, cy, r_in, r_out, a0, a1, steps=22)
 
+            is_apply_slice = item.id == "apply"
             if is_hover:
                 fill_col = item.accent
+            elif is_apply_slice:
+                fill_col = (item.accent[0] * 0.32, item.accent[1] * 0.36, item.accent[2] * 0.32, 0.92)
             elif is_active_view:
                 fill_col = (item.accent[0] * 0.42, item.accent[1] * 0.42, item.accent[2] * 0.42, 0.92)
             else:
-                fill_col = (0.12, 0.14, 0.18, 0.88)
+                fill_col = (0.10, 0.12, 0.16, 0.88)
             batch_fill = batch_for_shader(shader, "TRIS", {"pos": tris})
             shader.bind()
             shader.uniform_float("color", fill_col)
             batch_fill.draw(shader)
 
-            gpu.state.line_width_set(2.2 if is_hover else 1.2)
-            rim_col = (1.0, 1.0, 1.0, 0.95) if is_hover else (item.accent[0], item.accent[1], item.accent[2], 0.55)
+            gpu.state.line_width_set(2.2 if is_hover else (1.8 if is_apply_slice else 1.2))
+            rim_col = (
+                (1.0, 1.0, 1.0, 0.95)
+                if is_hover
+                else (item.accent[0], item.accent[1], item.accent[2], 0.88 if is_apply_slice else 0.50)
+            )
             batch_line = batch_for_shader(shader, "LINE_LOOP", {"pos": outline})
             shader.bind()
             shader.uniform_float("color", rim_col)

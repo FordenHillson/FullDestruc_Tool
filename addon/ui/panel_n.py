@@ -1,4 +1,4 @@
-"""Step-by-Step Guided N-Panel for FullDestruc_Tool (English UI, Blender 5.2+)."""
+"""Minimal, Single-Screen Guided N-Panel with Popovers & Colored Icons (Blender 5.2+)."""
 
 from __future__ import annotations
 
@@ -8,17 +8,16 @@ from ..core import apple_bite, rust_bridge, zone_registry
 from ..core.session import load_session
 from ..ops import apple_bite_ops
 from ..ops.material_picker import draw_cut_material_row
+from . import icons
 from .panel_rebar import draw as draw_rebar_section
 
 
-# Zen UV-style tool rail.  The left column is the tool selector; the right
-# column renders only the selected tool's detail.  Icons are checked against
-# Blender 5.2 in tests/test_rebar_ops.py.
-_TOOL_TABS = (
-    ("APPLE_BITE", "MOD_BOOLEAN"),
-    ("REBAR", "MOD_CURVE"),
-    ("CLEANUP", "BRUSH_DATA"),
-    ("BATCH", "MOD_ARRAY"),
+# Zen UV-style left tool rail: (tool_id, custom_icon_name, blender_fallback_icon)
+_TOOL_TABS: tuple[tuple[str, str, str], ...] = (
+    ("APPLE_BITE", "tool_apple_bite", "MOD_BOOLEAN"),
+    ("REBAR", "tool_rebar", "MOD_CURVE"),
+    ("CLEANUP", "tool_cleanup", "BRUSH_DATA"),
+    ("BATCH", "tool_batch", "MOD_ARRAY"),
 )
 
 
@@ -66,6 +65,162 @@ def _on_cutter_list_handler(_dummy=None) -> None:
         sync_cutter_layer_items(scene)
 
 
+def _draw_rough_sliders(layout: bpy.types.UILayout, context: bpy.types.Context, settings, session) -> None:
+    """Shared Rough Cut Edge tuning block (used inside FDT_PT_popover_rough)."""
+    target_cutter, target_is_rough = apple_bite.get_active_rough_cutter(context, session)
+    cr = getattr(target_cutter, "fdt_rough", None) if target_cutter is not None else None
+    if cr is not None:
+        status = "" if target_is_rough else " (OFF)"
+        layout.label(text=f"{target_cutter.name}{status}", **icons.icon_kw("rough_edge", "MOD_DISPLACE"))
+        layout.prop(cr, "inward_depth", text="Inward Depth", slider=True)
+        layout.prop(cr, "jaggedness", text="Jaggedness", slider=True)
+        layout.prop(cr, "noise_scale", text="Noise Scale")
+        layout.prop(cr, "detail", text="Detail (1-3)")
+        layout.prop(cr, "seed", text="Seed")
+    else:
+        layout.label(text="Default (New Cutters)", **icons.icon_kw("rough_edge", "MOD_DISPLACE"))
+        layout.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
+        layout.prop(settings, "rough_jaggedness", text="Jaggedness", slider=True)
+        layout.prop(settings, "rough_scale", text="Noise Scale")
+        layout.prop(settings, "rough_subdiv", text="Detail (1-3)")
+        layout.prop(settings, "rough_seed", text="Seed")
+
+
+# ---------------------------------------------------------------------------
+# Compact Popover Panels (keep N-Panel single-screen & clutter-free)
+# ---------------------------------------------------------------------------
+
+
+class FDT_PT_popover_settings(bpy.types.Panel):
+    """Engine, GPU Fast Drag, Viewport Dock toggle & utility launchers."""
+
+    bl_label = "Engine & Settings"
+    bl_idname = "FDT_PT_popover_settings"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "HEADER"
+    bl_ui_units_x = 13
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.fdt_settings
+
+        layout.label(text="Boolean Engine", **icons.icon_kw("settings_gear", "PREFERENCES"))
+        layout.prop(settings, "boolean_solver", text="")
+        if settings.boolean_solver == "RUST":
+            if rust_bridge.is_available():
+                layout.prop(settings, "gpu_fast_drag", text="GPU Fast Drag (60+ FPS)", icon="SHADING_RENDERED")
+                layout.label(text="Rust v1.5: CDT + GPU Ready", **icons.icon_kw("apply_green", "CHECKMARK"))
+            else:
+                layout.label(text="Rust DLL missing — Blender Exact", icon="ERROR")
+
+        layout.separator()
+        layout.prop(settings, "show_viewport_dock", text="3D Viewport Dock")
+        layout.prop(settings, "cutter_size", text="Default Box Size (m)")
+
+        layout.separator()
+        row = layout.row(align=True)
+        row.operator("fdt.quick_popup", text="Quick Tune", icon="PREFERENCES")
+        row.operator("fdt.open_debug_window", text="Debug", icon="SYSTEM")
+
+
+class FDT_PT_popover_zones(bpy.types.Panel):
+    """Quick A-H Zone Grid + clearly labeled Zone Registry management."""
+
+    bl_label = "Zones"
+    bl_idname = "FDT_PT_popover_zones"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "HEADER"
+    bl_ui_units_x = 13
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        settings = scene.fdt_settings
+
+        layout.label(text="Quick Zones", **icons.icon_kw("zones_grid", "COLOR"))
+        grid = layout.grid_flow(row_major=True, columns=4, even_columns=True, align=True)
+        for zdef in zone_registry.load_zones(scene)[:8]:
+            op = grid.operator(
+                "fdt.applebite_set_zone",
+                text=zdef.token[:8],
+                depress=(settings.active_zone == zdef.key),
+            )
+            op.zone = zdef.key
+
+        layout.separator()
+        layout.label(text="Manage Zone Registry")
+        row = layout.row(align=True)
+        op_new = row.operator("fdt.zone_manage", text="New", **icons.icon_kw("plus_add", "ADD"))
+        op_new.action = "NEW"
+        op_new.zone_key = settings.active_zone
+
+        op_edit = row.operator("fdt.zone_manage", text="Edit", **icons.icon_kw("rename_pen", "GREASEPENCIL"))
+        op_edit.action = "RENAME"
+        op_edit.zone_key = settings.active_zone
+
+        op_del = row.operator("fdt.zone_manage", text="Delete", **icons.icon_kw("trash_red", "TRASH"))
+        op_del.action = "DELETE"
+        op_del.zone_key = settings.active_zone
+
+
+class FDT_PT_popover_rough(bpy.types.Panel):
+    """Rough Cut Edge toggle & fracture parameter sliders."""
+
+    bl_label = "Rough Edge"
+    bl_idname = "FDT_PT_popover_rough"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "HEADER"
+    bl_ui_units_x = 13
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        settings = scene.fdt_settings
+        session = load_session(scene)
+
+        layout.prop(settings, "enable_rough", text="Rough Cut Edge (All)")
+        layout.separator()
+        _draw_rough_sliders(layout, context, settings, session)
+
+
+class FDT_PT_popover_output(bpy.types.Panel):
+    """UV Texel, Output Keep flags, Cap Fill, Backface Liner & Object Rename."""
+
+    bl_label = "Output & UV"
+    bl_idname = "FDT_PT_popover_output"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "HEADER"
+    bl_ui_units_x = 13
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.fdt_settings
+
+        layout.label(text="Cut UV Scale", **icons.icon_kw("output_box", "UV"))
+        row_uv = layout.row(align=True)
+        row_uv.prop(settings, "texel_per_meter", text="Texel")
+        row_uv.prop(settings, "texture_size", text="Size")
+
+        layout.separator()
+        layout.label(text="Apply Output")
+        row_keep = layout.row(align=True)
+        row_keep.prop(settings, "apply_keep_result", text="Main Mesh", toggle=True)
+        row_keep.prop(settings, "apply_keep_pieces", text="Zone Pieces", toggle=True)
+
+        layout.prop(settings, "apply_auto_fill_caps", text="Auto-Fill Cut Gaps", **icons.icon_kw("fill_cap", "FACESEL"))
+        layout.prop(settings, "apply_line_backfaces", text="Close See-Through Backfaces", icon="MOD_SOLIDIFY")
+
+        layout.separator()
+        tools_row = layout.row(align=True)
+        tools_row.operator("fdt.applebite_fill_cut_caps", text="Fill Cap", **icons.icon_kw("fill_cap", "FACESEL"))
+        tools_row.operator("fdt.rename_popup", text="Rename Obj", **icons.icon_kw("rename_pen", "GREASEPENCIL"))
+
+
+# ---------------------------------------------------------------------------
+# Scrollable Cutter Layers UIList & Tool Switcher
+# ---------------------------------------------------------------------------
+
+
 class FDT_UL_cutter_layers(bpy.types.UIList):
     """Compact scrollable Cutter Layers list with inline Zone, Rough & Mute controls."""
 
@@ -99,9 +254,9 @@ class FDT_UL_cutter_layers(bpy.types.UIList):
             op_rough = act.operator(
                 "fdt.applebite_toggle_rough",
                 text="",
-                icon="MOD_DISPLACE",
                 depress=bool(item.rough),
                 emboss=bool(item.rough),
+                **(icons.icon_kw("rough_edge", "MOD_DISPLACE") if item.rough else {"icon": "MOD_DISPLACE"}),
             )
             op_rough.cutter_name = item.name
 
@@ -145,8 +300,13 @@ class FDT_OT_set_active_tool(bpy.types.Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Main Minimal N-Panel
+# ---------------------------------------------------------------------------
+
+
 class FDT_PT_main_panel(bpy.types.Panel):
-    bl_label = "FullDestruc Tool"
+    bl_label = "FullDestruc"
     bl_idname = "FDT_PT_main_panel"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -158,114 +318,145 @@ class FDT_PT_main_panel(bpy.types.Panel):
         settings = scene.fdt_settings
         session = load_session(scene)
 
-        # Quick UI launcher bar
-        top_row = layout.row(align=True)
-        top_row.operator("fdt.open_qt_window", text="Python Window", icon="WINDOW")
-        top_row.operator("fdt.quick_popup", text="Popup", icon="PREFERENCES")
-        top_row.operator("fdt.open_debug_window", text="Debug", icon="SYSTEM")
-
-        # Zen UV-style body: tool icons on the left, that tool's detail right.
+        # Zen UV-style left vertical tool rail with colored flat icons
         body = layout.split(factor=0.16)
         rail = body.column(align=True)
         detail = body.column()
 
-        for tool_id, icon in _TOOL_TABS:
-            op = rail.operator(
+        for tool_id, custom_ico, fallback_ico in _TOOL_TABS:
+            btn_row = rail.row(align=True)
+            btn_row.scale_y = 1.25
+            op = btn_row.operator(
                 "fdt.set_active_tool",
                 text="",
-                icon=icon,
-                depress=settings.ui_active_tool == tool_id,
+                depress=(settings.ui_active_tool == tool_id),
+                **icons.icon_kw(custom_ico, fallback_ico),
             )
             op.tool = tool_id
 
         active = settings.ui_active_tool
         if active == "APPLE_BITE":
-            # The boolean engine is Apple Bite's own setting, so it lives in
-            # this detail area instead of floating above every tool tab.
-            eng_box = detail.box()
-            eng_row = eng_box.row(align=True)
-            eng_row.prop(settings, "boolean_solver", text="Engine")
-            if settings.boolean_solver == "RUST":
-                if rust_bridge.is_available():
-                    eng_box.prop(settings, "gpu_fast_drag", text="GPU Fast Drag (60+ FPS)", icon="SHADING_RENDERED")
-                    eng_box.label(text="Rust Engine v1.5: CDT + GPU Ready", icon="CHECKMARK")
-                else:
-                    eng_box.label(text="Rust DLL missing — using Blender Exact", icon="ERROR")
+            # Slim 2-icon header: Title + status | [❐ Window] [⚙ Engine/Settings]
+            hdr = detail.row(align=True)
+            if session is not None:
+                valid_count = len(session.get_valid_cutters(include_muted=True))
+                hdr.label(text=f"Apple Bite · {valid_count}", **icons.icon_kw("tool_apple_bite", "MOD_BOOLEAN"))
+            else:
+                hdr.label(text="Apple Bite", **icons.icon_kw("tool_apple_bite", "MOD_BOOLEAN"))
+            hdr.operator("fdt.open_qt_window", text="", **icons.icon_kw("window_qt", "WINDOW"))
+            hdr.popover(
+                panel=FDT_PT_popover_settings.bl_idname,
+                text="",
+                **icons.icon_kw("settings_gear", "PREFERENCES"),
+            )
 
             box_dst = detail.box()
             if session is None:
                 self._draw_step1_idle(box_dst, context)
             else:
                 self._draw_step2_and_step3_active(box_dst, context, settings, session)
+
         elif active == "REBAR":
-            # The tab itself is the top-level switch — show the detail directly.
+            hdr = detail.row(align=True)
+            hdr.label(text="Concrete Rebars", **icons.icon_kw("tool_rebar", "MOD_CURVE"))
+            hdr.operator("fdt.open_qt_window", text="", **icons.icon_kw("window_qt", "WINDOW"))
             draw_rebar_section(detail, context, force_open=True)
+
         elif active == "CLEANUP":
+            hdr = detail.row(align=True)
+            hdr.label(text="Cleanup", **icons.icon_kw("tool_cleanup", "BRUSH_DATA"))
             box_clean = detail.box()
-            box_clean.label(text="Find Texture / Del by Material / Replace / Fix Slots", icon="INFO")
+            box_clean.label(text="Find Texture / Del by Mat / Replace / Fix Slots", icon="INFO")
+
         elif active == "BATCH":
+            hdr = detail.row(align=True)
+            hdr.label(text="Batch", **icons.icon_kw("tool_batch", "MOD_ARRAY"))
             box_batch = detail.box()
-            box_batch.label(text="Reserved slot for future Batch Pipeline", icon="TIME")
+            box_batch.label(text="Reserved for future Batch Pipeline", icon="TIME")
 
     def _draw_step1_idle(self, layout: bpy.types.UILayout, context: bpy.types.Context) -> None:
         info = apple_bite.detect_step1_action(context)
+        mode = info["mode"]
 
-        # Guide banner
-        guide = layout.box()
-        icon = "INFO" if info["mode"] == "NONE" else ("LOOP_BACK" if info["mode"] in ("REEDIT", "BOTH") else "CHECKMARK")
-        guide.label(text=info["guide_text"], icon=icon)
+        # Concise 1-line contextual status
+        if mode == "NONE":
+            layout.label(text="Select a mesh to start", icon="INFO")
+        elif mode == "START":
+            names = ", ".join(o.name for o in info["targets"][:2])
+            if len(info["targets"]) > 2:
+                names += f" +{len(info['targets']) - 2}"
+            layout.label(text=f"Ready · {names}", **icons.icon_kw("apply_green", "CHECKMARK"))
+        elif mode == "REEDIT":
+            layout.label(text=f"Paused · {info['session_id']}", **icons.icon_kw("reedit_cyan", "LOOP_BACK"))
+        elif mode == "BOTH":
+            layout.label(text=f"Baked · {info['session_id']}", **icons.icon_kw("reedit_cyan", "LOOP_BACK"))
 
-        # Primary button
-        row = layout.row()
-        row.scale_y = 1.4
-        row.enabled = info["mode"] != "NONE"
-        btn_icon = "GREASEPENCIL" if info["mode"] == "REEDIT" else "MOD_BOOLEAN"
-        row.operator("fdt.applebite_smart_start", text=info["button_label"], icon=btn_icon)
+        # Primary / Round-trip Actions
+        if mode == "BOTH" and info["session_id"]:
+            # Clearly distinguish Re-edit (cyan) vs Cut Further (amber) to prevent accidental nested cuts
+            pair = layout.row(align=True)
+            pair.scale_y = 1.45
+            op_re = pair.operator(
+                "fdt.applebite_reedit",
+                text="Re-edit Cut",
+                **icons.icon_kw("reedit_cyan", "LOOP_BACK"),
+            )
+            op_re.session_id = info["session_id"]
+            pair.operator(
+                "fdt.applebite_smart_start",
+                text="Cut Further",
+                **icons.icon_kw("start_orange", "MOD_BOOLEAN"),
+            )
+        else:
+            row = layout.row()
+            row.scale_y = 1.55
+            row.enabled = mode != "NONE"
+            btn_ico = (
+                icons.icon_kw("reedit_cyan", "LOOP_BACK")
+                if mode == "REEDIT"
+                else icons.icon_kw("start_orange", "MOD_BOOLEAN")
+            )
+            btn_txt = "Resume Cut" if mode == "REEDIT" else ("Start Cut" if mode == "START" else "Select Mesh")
+            row.operator("fdt.applebite_smart_start", text=btn_txt, **btn_ico)
 
-        # Secondary button when clicking an already-applied piece: Re-edit old cut
-        if info["mode"] == "BOTH" and info["session_id"]:
-            row2 = layout.row()
-            op = row2.operator("fdt.applebite_reedit", text=info["reedit_label"], icon="LOOP_BACK")
-            op.session_id = info["session_id"]
-
-        # Reset button: remove all related cuts and restore the root original mesh
-        show_applied_tools = info["mode"] in ("BOTH", "REEDIT") and bool(info["session_id"])
+        # Destructive Reset (only on already-cut pieces)
+        show_applied_tools = mode in ("BOTH", "REEDIT") and bool(info["session_id"])
         if show_applied_tools:
-            row3 = layout.row()
-            row3.alert = True
-            op_reset = row3.operator(
+            row_reset = layout.row()
+            row_reset.alert = True
+            op_reset = row_reset.operator(
                 "fdt.applebite_reset_original",
-                text=info["reset_label"],
-                icon="TRASH",
+                text="Reset to Original",
+                **icons.icon_kw("trash_red", "TRASH"),
             )
             op_reset.session_id = info["session_id"]
 
+        # Compact Post-Cut Tools
         active_obj = context.active_object
         has_mesh = (active_obj is not None and active_obj.type == "MESH") or any(
             o.type == "MESH" for o in context.selected_objects
         )
         if show_applied_tools or has_mesh:
             settings = context.scene.fdt_settings
-            mat_box = layout.box()
-            mat_box.label(
-                text="Cut Face Material & Cap Fill:" if show_applied_tools else "Cut Cap Fill:",
-                icon="MATERIAL",
-            )
-            draw_cut_material_row(mat_box, settings, text="Mat")
+            layout.separator(factor=0.6)
+            draw_cut_material_row(layout, settings, text="Mat")
+            tools = layout.row(align=True)
             if show_applied_tools:
-                row_am = mat_box.row()
-                row_am.enabled = settings.cut_material is not None
-                row_am.operator("fdt.applebite_assign_cut_material", text="Apply Cut Material", icon="BRUSH_DATA")
+                sub_am = tools.row(align=True)
+                sub_am.enabled = settings.cut_material is not None
+                sub_am.operator("fdt.applebite_assign_cut_material", text="Apply Mat", icon="BRUSH_DATA")
             if has_mesh:
-                row_fill = mat_box.row()
-                fill_lbl = (
-                    "Fill Selected Cut Cap"
-                    if context.mode == "EDIT_MESH"
-                    else "Fill Cut Cap (Auto)"
+                fill_lbl = "Fill Cap" if context.mode != "EDIT_MESH" else "Fill Sel"
+                tools.operator(
+                    "fdt.applebite_fill_cut_caps",
+                    text=fill_lbl,
+                    **icons.icon_kw("fill_cap", "FACESEL"),
                 )
-                row_fill.operator("fdt.applebite_fill_cut_caps", text=fill_lbl, icon="FACESEL")
-                row_ren = mat_box.row()
-                row_ren.operator("fdt.rename_popup", text="Rename Selected", icon="GREASEPENCIL")
+                tools.operator(
+                    "fdt.rename_popup",
+                    text="Rename",
+                    **icons.icon_kw("rename_pen", "GREASEPENCIL"),
+                )
 
     def _draw_step2_and_step3_active(
         self,
@@ -274,188 +465,198 @@ class FDT_PT_main_panel(bpy.types.Panel):
         settings,
         session,
     ) -> None:
-        # Dynamic Guide Banner
-        guide = layout.box()
-        if not session.cutters:
-            guide.label(text="Step 2: Click '+ Add Box' or 'Click Place (Ctrl+RMB)'", icon="INFO")
-        else:
-            guide.label(text="Step 2: Move/Scale box (G/R/S) or click Gear icon on box", icon="PLAY")
-        guide.label(text=f"Session: {session.session_id}  |  Targets: {len(session.target_names)}", icon="HOME")
+        # Count ONLY valid existing cutters (handles manual X-key deletes cleanly)
+        valid_all = session.get_valid_cutters(include_muted=True)
+        valid_active = session.get_valid_cutters(include_muted=False)
+        total_c = len(valid_all)
+        active_c = len(valid_active)
 
-        # --- Step 2: Place & Manage Cutters ---
-        step2 = layout.box()
-        step2.label(text="2. Place & Manage Cutters", icon="MESH_CUBE")
-
-        # Zone quick selector + searchable dropdown backed by the Scene zone registry.
-        grid = step2.grid_flow(row_major=True, columns=4, even_columns=True, align=True)
-        for zdef in zone_registry.load_zones(context.scene)[:8]:
-            op = grid.operator(
-                "fdt.applebite_set_zone",
-                text=zdef.token,
-                depress=(settings.active_zone == zdef.key),
-            )
-            op.zone = zdef.key
-        step2.prop(settings, "active_zone", text="Zone (type to search)")
-        zone_manage = step2.row(align=True)
-        op_new = zone_manage.operator("fdt.zone_manage", text="New Zone", icon="ADD")
-        op_new.action = "NEW"
-        op_new.zone_key = settings.active_zone
-        zone_manage.operator("fdt.rename_popup", text="Rename", icon="GREASEPENCIL")
-        op_del_z = zone_manage.operator("fdt.zone_manage", text="Delete", icon="TRASH")
-        op_del_z.action = "DELETE"
-        op_del_z.zone_key = settings.active_zone
-
-        row_add = step2.row(align=True)
-        row_add.scale_y = 1.2
-        row_add.operator("fdt.applebite_add_box", text="+ Add Box", icon="MESH_CUBE")
-        row_add.operator("fdt.applebite_add_mesh", text="+ Use Mesh", icon="MOD_SOLIDIFY")
-
-        row_draw = step2.row(align=True)
-        row_draw.scale_y = 1.25
-        row_draw.operator("fdt.applebite_draw_cutter", text="Draw Cutter (2D -> Extrude)", icon="GREASEPENCIL")
-
-        is_placing = bool(apple_bite_ops._interactive_active)
-        step2.operator(
-            "fdt.applebite_interactive",
-            text="Stop Click Place (ESC)" if is_placing else "Click Place (Ctrl+RMB)",
-            icon="CURSOR",
-            depress=is_placing,
+        # 1. Clean 1-Row Zone Strip: [● Color Dot] [Zone Dropdown] [⊞ Zones Popover]
+        z_row = layout.row(align=True)
+        z_row.label(text="", **icons.get_zone_dot_icon_kw(settings.active_zone, context.scene))
+        z_row.prop(settings, "active_zone", text="")
+        z_row.popover(
+            panel=FDT_PT_popover_zones.bl_idname,
+            text="",
+            **icons.icon_kw("zones_grid", "COLOR"),
         )
 
-        if session.cutters:
-            row_view = step2.row(align=True)
-            row_view.prop(settings, "preview_display_mode", expand=True)
+        # 2. Compact 2x2 Add Cutters Grid
+        add_r1 = layout.row(align=True)
+        add_r1.scale_y = 1.25
+        add_r1.operator("fdt.applebite_add_box", text="+ Box", **icons.icon_kw("add_box", "MESH_CUBE"))
+        add_r1.operator("fdt.applebite_draw_cutter", text="Draw", **icons.icon_kw("draw_pen", "GREASEPENCIL"))
 
-            row_grid = step2.row(align=True)
-            row_grid.prop(settings, "show_zone_grid", text="Zone Grid", icon="MESH_GRID", toggle=True)
-            if settings.show_zone_grid:
-                row_grid.prop(settings, "zone_grid_size", text="Size")
-            step2.label(text="Tip: Click Gear icon on box for Radial Wheel & 3D Axis", icon="PREFERENCES")
+        add_r2 = layout.row(align=True)
+        is_placing = bool(apple_bite_ops._interactive_active)
+        add_r2.operator(
+            "fdt.applebite_interactive",
+            text="Stop Click" if is_placing else "Click Place",
+            depress=is_placing,
+            **icons.icon_kw("click_place", "CURSOR"),
+        )
+        add_r2.operator("fdt.applebite_add_mesh", text="+ Mesh", **icons.icon_kw("use_mesh", "MOD_SOLIDIFY"))
 
-            # Compact collapsible & scrollable Cutter Layers (UIList + Up/Down/Delete sidebar)
-            list_box = step2.box()
-            total_c = len(session.cutters)
-            show_layers = bool(getattr(settings, "ui_show_cutter_layers", True))
-            hdr = list_box.row(align=True)
-            hdr.prop(
-                settings,
-                "ui_show_cutter_layers",
-                text=f"Cutter Layers ({total_c}) — Top = Priority",
-                icon="TRIA_DOWN" if show_layers else "TRIA_RIGHT",
-                emboss=False,
-            )
-            if show_layers:
-                items = getattr(settings, "cutter_layer_items", None)
-                if items is not None:
-                    cur_sig = [(it.name, it.zone, bool(it.muted), bool(it.rough)) for it in items]
-                    want_sig = [(c.name, c.zone, bool(c.muted), bool(c.rough)) for c in session.cutters]
-                    if cur_sig != want_sig:
-                        _schedule_cutter_list_sync()
+        # Phase A: 0 valid cutters -> keep ultra-clean & guide next step
+        if total_c == 0:
+            layout.separator(factor=0.6)
+            layout.label(text="Add a box or draw a cut in 3D View", icon="INFO")
+            row_end = layout.row(align=True)
+            row_end.operator("fdt.applebite_exit", text="Pause", **icons.icon_kw("pause_slate", "PAUSE"))
+            row_end.operator("fdt.applebite_cancel", text="Cancel", **icons.icon_kw("cancel_red", "LOOP_BACK"))
+            return
 
-                list_row = list_box.row(align=True)
-                if hasattr(list_row, "template_list"):
-                    list_row.template_list(
-                        "FDT_UL_cutter_layers",
-                        "",
-                        settings,
-                        "cutter_layer_items",
-                        settings,
-                        "cutter_layer_index",
-                        rows=min(5, max(2, total_c)),
-                        maxrows=8,
-                    )
+        # Phase B: >= 1 valid cutter
+        layout.separator(factor=0.4)
 
-                active_idx = int(getattr(settings, "cutter_layer_index", 0))
-                if active_idx < 0 or active_idx >= total_c:
-                    active_obj = context.active_object
-                    active_idx = next(
-                        (i for i, c in enumerate(session.cutters) if active_obj is not None and c.name == active_obj.name),
-                        0,
-                    )
-                sel_entry = session.cutters[active_idx] if 0 <= active_idx < total_c else None
+        # 3. View Mode + Quick Grid / Rough Strip
+        row_view = layout.row(align=True)
+        row_view.prop(settings, "preview_display_mode", expand=True)
 
-                side = list_row.column(align=True)
-                col_up = side.row(align=True)
-                col_up.enabled = sel_entry is not None and active_idx > 0
-                op_up = col_up.operator("fdt.applebite_move_cutter", text="", icon="TRIA_UP")
-                if sel_entry is not None:
-                    op_up.cutter_name = sel_entry.name
-                op_up.direction = "UP"
+        row_quick = layout.row(align=True)
+        row_quick.prop(
+            settings,
+            "show_zone_grid",
+            text="Grid",
+            toggle=True,
+            **icons.icon_kw("zone_grid", "MESH_GRID"),
+        )
+        if settings.show_zone_grid:
+            sub_sz = row_quick.row(align=True)
+            sub_sz.scale_x = 0.65
+            sub_sz.prop(settings, "zone_grid_size", text="")
+        row_quick.prop(
+            settings,
+            "enable_rough",
+            text="Rough",
+            toggle=True,
+            **icons.icon_kw("rough_edge", "MOD_DISPLACE"),
+        )
+        row_quick.popover(
+            panel=FDT_PT_popover_rough.bl_idname,
+            text="",
+            **icons.icon_kw("settings_gear", "PREFERENCES"),
+        )
 
-                col_dn = side.row(align=True)
-                col_dn.enabled = sel_entry is not None and active_idx < (total_c - 1)
-                op_dn = col_dn.operator("fdt.applebite_move_cutter", text="", icon="TRIA_DOWN")
-                if sel_entry is not None:
-                    op_dn.cutter_name = sel_entry.name
-                op_dn.direction = "DOWN"
+        # 4. 1-Row Cut Material + Eyedropper + Output Popover
+        mat_row = draw_cut_material_row(layout, settings, text="Mat")
+        mat_row.popover(
+            panel=FDT_PT_popover_output.bl_idname,
+            text="",
+            **icons.icon_kw("output_box", "PREFERENCES"),
+        )
 
-                col_del = side.row(align=True)
-                col_del.enabled = sel_entry is not None
-                op_del = col_del.operator("fdt.applebite_delete_cutter", text="", icon="X")
-                if sel_entry is not None:
-                    op_del.cutter_name = sel_entry.name
+        # 5. Collapsible Cutter Layers (Collapsed by default for 1-screen fit)
+        show_layers = bool(getattr(settings, "ui_show_cutter_layers", False))
+        list_box = layout.box()
+        hdr = list_box.row(align=True)
+        hdr.prop(
+            settings,
+            "ui_show_cutter_layers",
+            text=f"Layers ({total_c})",
+            icon="TRIA_DOWN" if show_layers else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if show_layers:
+            items = getattr(settings, "cutter_layer_items", None)
+            if items is not None:
+                cur_sig = [(it.name, it.zone, bool(it.muted), bool(it.rough)) for it in items]
+                want_sig = [(c.name, c.zone, bool(c.muted), bool(c.rough)) for c in session.cutters]
+                if cur_sig != want_sig:
+                    _schedule_cutter_list_sync()
 
-        # --- Step 3: Tune Cut & Apply ---
-        if session.cutters:
-            step3 = layout.box()
-            step3.label(text="3. Tune & Apply", icon="CHECKMARK")
+            list_row = list_box.row(align=True)
+            if hasattr(list_row, "template_list"):
+                list_row.template_list(
+                    "FDT_UL_cutter_layers",
+                    "",
+                    settings,
+                    "cutter_layer_items",
+                    settings,
+                    "cutter_layer_index",
+                    rows=min(5, max(2, len(session.cutters))),
+                    maxrows=8,
+                )
 
-            step3.prop(settings, "enable_rough", text="Rough Cut Edge (All)")
-            target_cutter, target_is_rough = apple_bite.get_active_rough_cutter(context, session)
-            any_rough = settings.enable_rough or any(c.rough for c in session.cutters)
-            if any_rough:
-                rbox = step3.box()
-                cr = getattr(target_cutter, "fdt_rough", None) if target_cutter is not None else None
-                if cr is not None:
-                    status = "" if target_is_rough else " (OFF)"
-                    rbox.label(text=f"Cutter: {target_cutter.name}{status}", icon="MOD_DISPLACE")
-                    rbox.prop(cr, "inward_depth", text="Inward Depth", slider=True)
-                    rbox.prop(cr, "jaggedness", text="Jaggedness", slider=True)
-                    rbox.prop(cr, "noise_scale", text="Noise Scale")
-                    rbox.prop(cr, "detail", text="Detail (1-3)")
-                    rbox.prop(cr, "seed", text="Seed")
-                else:
-                    rbox.label(text="Default Rough (New Cutters)", icon="MOD_DISPLACE")
-                    rbox.prop(settings, "rough_inward_ratio", text="Inward Depth", slider=True)
-                    rbox.prop(settings, "rough_jaggedness", text="Jaggedness", slider=True)
-                    rbox.prop(settings, "rough_scale", text="Noise Scale")
-                    rbox.prop(settings, "rough_subdiv", text="Detail (1-3)")
-                    rbox.prop(settings, "rough_seed", text="Seed")
+            all_count = len(session.cutters)
+            active_idx = int(getattr(settings, "cutter_layer_index", 0))
+            if active_idx < 0 or active_idx >= all_count:
+                active_obj = context.active_object
+                active_idx = next(
+                    (i for i, c in enumerate(session.cutters) if active_obj is not None and c.name == active_obj.name),
+                    0,
+                )
+            sel_entry = session.cutters[active_idx] if 0 <= active_idx < all_count else None
 
-            draw_cut_material_row(step3, settings, text="Cut Material")
-            row_uv = step3.row(align=True)
-            row_uv.prop(settings, "texel_per_meter", text="Texel")
-            row_uv.prop(settings, "texture_size", text="Tex Size")
+            side = list_row.column(align=True)
+            col_up = side.row(align=True)
+            col_up.enabled = sel_entry is not None and active_idx > 0
+            op_up = col_up.operator("fdt.applebite_move_cutter", text="", icon="TRIA_UP")
+            if sel_entry is not None:
+                op_up.cutter_name = sel_entry.name
+            op_up.direction = "UP"
 
-            row_keep = step3.row(align=True)
-            row_keep.prop(settings, "apply_keep_result", text="Main Mesh")
-            row_keep.prop(settings, "apply_keep_pieces", text="Zone Pieces")
+            col_dn = side.row(align=True)
+            col_dn.enabled = sel_entry is not None and active_idx < (all_count - 1)
+            op_dn = col_dn.operator("fdt.applebite_move_cutter", text="", icon="TRIA_DOWN")
+            if sel_entry is not None:
+                op_dn.cutter_name = sel_entry.name
+            op_dn.direction = "DOWN"
 
-            step3.prop(settings, "apply_auto_fill_caps", text="Auto-Fill Cut Gaps", icon="FACESEL")
-            step3.prop(settings, "apply_line_backfaces", text="Close See-Through Backfaces", icon="MOD_SOLIDIFY")
+            col_del = side.row(align=True)
+            col_del.enabled = sel_entry is not None
+            op_del = col_del.operator("fdt.applebite_delete_cutter", text="", **icons.icon_kw("trash_red", "X"))
+            if sel_entry is not None:
+                op_del.cutter_name = sel_entry.name
 
+        # 6. Hero APPLY Section with Round-3 Safety Guards
+        has_output = bool(settings.apply_keep_result or settings.apply_keep_pieces)
+        can_apply = has_output and active_c > 0
+
+        if not has_output:
+            warn_row = layout.row()
+            warn_row.alert = True
+            warn_row.label(text="Output: None (enable in Output)", **icons.icon_kw("mat_alert_red", "ERROR"))
+        elif active_c == 0:
+            layout.label(text="All cutters muted — unmute to apply", icon="INFO")
+        else:
             summary = apple_bite.get_apply_preview_summary(context.scene)
             zone_str = ", ".join(
                 f"{zone_registry.zone_token(z, context.scene)}({n})"
                 for z, n in sorted(summary["zone_counts"].items())
             ) or "None"
-            sum_box = step3.box()
-            sum_box.label(
-                text=f"Output: Main {summary['main_count']} | Zones: {zone_str}",
+            layout.label(
+                text=f"Main {summary['main_count']} · {zone_str}",
                 icon="OUTLINER_COLLECTION",
             )
 
-            row_apply = step3.row()
-            row_apply.scale_y = 1.4
-            row_apply.operator("fdt.applebite_apply", text="APPLY", icon="CHECKMARK")
+        row_apply = layout.row()
+        row_apply.scale_y = 1.7
+        row_apply.enabled = can_apply
+        cut_word = "Cut" if active_c == 1 else "Cuts"
+        apply_label = f"APPLY · {active_c} {cut_word}" if active_c > 0 else "APPLY"
+        row_apply.operator(
+            "fdt.applebite_apply",
+            text=apply_label,
+            depress=can_apply,
+            **icons.icon_kw("apply_green", "CHECKMARK"),
+        )
 
-        # Footer: Pause / Cancel
+        # 7. Subtle Footer: Pause | Cancel
         row_end = layout.row(align=True)
-        row_end.operator("fdt.applebite_exit", text="Pause / Exit", icon="PAUSE")
-        row_end.operator("fdt.applebite_cancel", text="Cancel & Restore", icon="LOOP_BACK")
+        row_end.operator("fdt.applebite_exit", text="Pause", **icons.icon_kw("pause_slate", "PAUSE"))
+        row_end.operator("fdt.applebite_cancel", text="Cancel", **icons.icon_kw("cancel_red", "LOOP_BACK"))
 
 
-CLASSES = (FDT_OT_set_active_tool, FDT_UL_cutter_layers, FDT_PT_main_panel)
+CLASSES = (
+    FDT_PT_popover_settings,
+    FDT_PT_popover_zones,
+    FDT_PT_popover_rough,
+    FDT_PT_popover_output,
+    FDT_OT_set_active_tool,
+    FDT_UL_cutter_layers,
+    FDT_PT_main_panel,
+)
 
 _HANDLER_ATTRS = ("load_post", "undo_post", "redo_post")
 

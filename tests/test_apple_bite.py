@@ -304,8 +304,11 @@ class _MockUILayout:
 
     def __init__(self):
         self.operators: list[str] = []
+        self.popovers: list[str] = []
+        self.scale_x = 1.0
         self.scale_y = 1.0
         self.enabled = True
+        self.alert = False
 
     def box(self):
         return self
@@ -322,7 +325,14 @@ class _MockUILayout:
     def grid_flow(self, **kwargs):
         return self
 
-    def label(self, text="", icon="NONE"):
+    def separator(self, **kwargs):
+        return None
+
+    def label(self, text="", **kwargs):
+        return None
+
+    def popover(self, panel="", **kwargs):
+        self.popovers.append(str(panel))
         return None
 
     def prop(self, data, prop_name, **kwargs):
@@ -362,7 +372,7 @@ def test_10_panel_draw_renders_apply_button_without_errors() -> None:
     FDT_PT_main_panel.draw(panel, ctx)
     assert "fdt.applebite_smart_start" in mock_idle.operators
 
-    # 2. Active session with cutter -> MUST render scrollable UIList, Apply, Exit, Cancel without NameError!
+    # 2. Active session with cutter -> compact default (Layers collapsed) renders Apply, Exit, Cancel & Popovers
     wall = _make_box("Panel_Wall", location=(0, 0, 0), scale=(4, 0.5, 3))
     ok, msg, _ = apple_bite.enter_session(ctx, target_objects=[wall])
     assert ok, msg
@@ -371,15 +381,26 @@ def test_10_panel_draw_renders_apply_button_without_errors() -> None:
     assert len(ctx.scene.fdt_settings.cutter_layer_items) == 1
     assert ctx.scene.fdt_settings.cutter_layer_items[0].name == c1.name
 
+    ctx.scene.fdt_settings.ui_show_cutter_layers = False
+    mock_collapsed = _MockUILayout()
+    panel.layout = mock_collapsed
+    FDT_PT_main_panel.draw(panel, ctx)
+    assert "fdt.applebite_apply" in mock_collapsed.operators, "Apply button was NOT drawn in N-Panel!"
+    assert "fdt.applebite_exit" in mock_collapsed.operators, "Exit button was NOT drawn in N-Panel!"
+    assert "fdt.applebite_cancel" in mock_collapsed.operators, "Cancel button was NOT drawn in N-Panel!"
+    assert "FDT_PT_popover_settings" in mock_collapsed.popovers
+    assert "FDT_PT_popover_zones" in mock_collapsed.popovers
+    assert "FDT_PT_popover_output" in mock_collapsed.popovers
+
+    # 3. Expanding Cutter Layers MUST render scrollable FDT_UL_cutter_layers UIList cleanly
+    ctx.scene.fdt_settings.ui_show_cutter_layers = True
     mock_active = _MockUILayout()
     panel.layout = mock_active
     FDT_PT_main_panel.draw(panel, ctx)
     assert any(lt == "FDT_UL_cutter_layers" for lt, _, _ in getattr(mock_active, "lists", [])), (
         "Scrollable FDT_UL_cutter_layers UIList was NOT drawn in N-Panel!"
     )
-    assert "fdt.applebite_apply" in mock_active.operators, "Apply button was NOT drawn in N-Panel!"
-    assert "fdt.applebite_exit" in mock_active.operators, "Exit button was NOT drawn in N-Panel!"
-    assert "fdt.applebite_cancel" in mock_active.operators, "Cancel button was NOT drawn in N-Panel!"
+    ctx.scene.fdt_settings.ui_show_cutter_layers = False
 
 
 def test_12_adjacent_box_cutter_overlap_no_sliver() -> None:
@@ -832,16 +853,17 @@ def test_22_user_driven_rename_tool() -> None:
     sess_after2 = session.load_session(scene)
     assert sess_after2 is not None and sess_after2.cutters[0].name == "MyManualCutter"
 
-    # 5. Panel draw renders fdt.rename_objects cleanly
-    class _DummyPanel:
-        _draw_step1_idle = FDT_PT_main_panel._draw_step1_idle
-        _draw_step2_and_step3_active = FDT_PT_main_panel._draw_step2_and_step3_active
+    # 5. Output popover renders fdt.rename_popup cleanly (separated from Zone controls)
+    from FullDestruc_Tool.ui.panel_n import FDT_PT_popover_output
 
-    panel = _DummyPanel()
+    class _DummyPopover:
+        pass
+
+    pop = _DummyPopover()
     mock_layout = _MockUILayout()
-    panel.layout = mock_layout
-    FDT_PT_main_panel.draw(panel, ctx)
-    assert "fdt.rename_popup" in mock_layout.operators, "Rename popup button was not drawn in N-Panel!"
+    pop.layout = mock_layout
+    FDT_PT_popover_output.draw(pop, ctx)
+    assert "fdt.rename_popup" in mock_layout.operators, "Rename popup button was not drawn in Output Popover!"
 
 
 def test_23_next_box_spawns_cube_and_duplicate_cutter() -> None:

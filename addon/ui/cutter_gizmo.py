@@ -752,9 +752,9 @@ class FDT_GGT_cutter_gear(bpy.types.GizmoGroup):
         gz.icon = "PREFERENCES"
         gz.draw_options = {"BACKDROP", "OUTLINE"}
         gz.scale_basis = 0.22
-        gz.color = (0.18, 0.20, 0.24)
-        gz.alpha = 0.88
-        gz.color_highlight = (0.95, 0.55, 0.15)
+        gz.color = (0.10, 0.12, 0.16)
+        gz.alpha = 0.90
+        gz.color_highlight = (0.96, 0.62, 0.08)
         gz.alpha_highlight = 1.0
 
         gz.target_set_operator("fdt.cutter_wheel_menu")
@@ -764,6 +764,12 @@ class FDT_GGT_cutter_gear(bpy.types.GizmoGroup):
         obj = context.active_object
         if obj is None:
             return
+        try:
+            zkey = str(obj.get(apple_bite.CUTTER_ZONE_PROP, "A") or "A")
+            zdef = zone_registry.resolve_zone(zkey, context.scene)
+            self.gear_gizmo.color_highlight = (float(zdef.color[0]), float(zdef.color[1]), float(zdef.color[2]))
+        except Exception:
+            pass
         # Float the gear neatly slightly above the cutter's top face
         top_z = max(float(obj.dimensions.z) * 0.5, 0.3) + 0.18
         pos = obj.matrix_world.translation + Vector((0.0, 0.0, top_z))

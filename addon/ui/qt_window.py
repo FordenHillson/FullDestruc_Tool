@@ -1,4 +1,4 @@
-"""Detached dark-themed PySide6 window (English UI, Step-by-Step Guided UX & Live Cutter List)."""
+"""Minimal dark-themed PySide6 companion window (Apple Bite + Rebar, Sticky Emerald Footer)."""
 
 from __future__ import annotations
 
@@ -8,8 +8,15 @@ from contextlib import contextmanager
 import bpy
 from PySide6 import QtCore, QtGui, QtWidgets  # type: ignore
 
-from ..core import apple_bite, zone_registry
+from ..core import apple_bite, rebar_state, zone_registry
 from ..core.session import load_session
+from ..ops import rebar_ops
+from . import icons
+
+
+def _qicon(name: str) -> QtGui.QIcon:
+    path = icons.get_icon_path(name)
+    return QtGui.QIcon(path) if path else QtGui.QIcon()
 
 
 @contextmanager
@@ -59,77 +66,160 @@ def _tag_all_view3d_redraw() -> None:
             if area.type == "VIEW_3D":
                 area.tag_redraw()
 
+
 DARK_STYLESHEET = """
 QWidget {
-    background-color: #23252a;
-    color: #e6e8ec;
+    background-color: #16181e;
+    color: #e6eaf2;
     font-family: "Segoe UI", sans-serif;
     font-size: 12px;
 }
-QGroupBox {
-    border: 1px solid #3c4049;
-    border-radius: 6px;
-    margin-top: 8px;
-    padding: 8px;
-    font-weight: bold;
-    color: #f3c669;
+QFrame#Card {
+    background-color: #1e212a;
+    border: 1px solid #2b303d;
+    border-radius: 8px;
 }
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 10px;
-    padding: 0 4px;
+QFrame#StickyFooter {
+    background-color: #1a1d25;
+    border-top: 1px solid #2d3342;
 }
 QPushButton {
-    background-color: #343842;
-    border: 1px solid #494f5c;
-    border-radius: 5px;
+    background-color: #272c38;
+    border: 1px solid #353c4c;
+    border-radius: 6px;
     padding: 6px 10px;
+    color: #e6eaf2;
 }
 QPushButton:hover {
-    background-color: #424857;
+    background-color: #323949;
+    border-color: #4a546b;
 }
 QPushButton:disabled {
-    background-color: #2b2e35;
-    color: #707785;
+    background-color: #1e2129;
+    border-color: #282c36;
+    color: #636b7a;
 }
-QPushButton#PrimaryBtn {
-    background-color: #2c6e49;
-    border-color: #3b9160;
+QPushButton:checked, QPushButton[active="true"] {
+    background-color: #2c3a4f;
+    border-color: #38bdf8;
+    color: #f8fafc;
+    font-weight: bold;
+}
+QPushButton#TabBtn {
+    background-color: #1e212a;
+    border: 1px solid #2b303d;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-weight: bold;
+    color: #9aa4b6;
+}
+QPushButton#TabBtn:checked {
+    background-color: #2b3140;
+    border-color: #525f7a;
+    color: #ffffff;
+}
+QPushButton#ApplyHeroBtn {
+    background-color: #1da65c;
+    border: 1px solid #30d07a;
+    border-radius: 8px;
+    color: #ffffff;
+    font-size: 13px;
+    font-weight: bold;
+    padding: 10px 14px;
+}
+QPushButton#ApplyHeroBtn:hover {
+    background-color: #24bf6b;
+    border-color: #5ce89c;
+}
+QPushButton#ApplyHeroBtn:disabled {
+    background-color: #22352c;
+    border-color: #2c463a;
+    color: #708c7d;
+}
+QPushButton#AmberHeroBtn {
+    background-color: #c97a12;
+    border: 1px solid #f59e0b;
+    border-radius: 7px;
+    color: #ffffff;
     font-weight: bold;
     padding: 8px 12px;
 }
-QPushButton#PrimaryBtn:hover {
-    background-color: #358458;
+QPushButton#AmberHeroBtn:hover {
+    background-color: #df8a1a;
+}
+QPushButton#CyanHeroBtn {
+    background-color: #1b6d96;
+    border: 1px solid #38bdf8;
+    border-radius: 7px;
+    color: #ffffff;
+    font-weight: bold;
+    padding: 8px 12px;
+}
+QPushButton#CyanHeroBtn:hover {
+    background-color: #2282b3;
 }
 QPushButton#DangerBtn {
-    background-color: #7c2d2d;
-    border-color: #a33d3d;
+    background-color: #5a2226;
+    border: 1px solid #a0383e;
+    color: #fca5a5;
+}
+QPushButton#DangerBtn:hover {
+    background-color: #782b30;
+    border-color: #ef4444;
+    color: #ffffff;
+}
+QPushButton#DrawerToggle {
+    background-color: transparent;
+    border: none;
+    text-align: left;
+    color: #aeb8ca;
+    font-weight: bold;
+    padding: 4px 2px;
+}
+QPushButton#DrawerToggle:hover {
+    color: #ffffff;
 }
 QPushButton#ZoneBtn[active="true"] {
-    background-color: #c97a1d;
-    border-color: #f3a847;
+    background-color: #c97a12;
+    border-color: #f59e0b;
+    color: #ffffff;
     font-weight: bold;
 }
-QLabel#GuideBanner {
-    color: #ffd97d;
-    padding: 8px;
-    background-color: #1b1d21;
-    border: 1px solid #3c4049;
+QComboBox, QDoubleSpinBox, QSpinBox {
+    background-color: #212530;
+    border: 1px solid #343b4a;
     border-radius: 5px;
+    padding: 4px 8px;
+    color: #eef2f8;
+}
+QComboBox:hover, QDoubleSpinBox:hover, QSpinBox:hover {
+    border-color: #4b556b;
+}
+QLabel#StatusPill {
+    color: #cbd5e1;
+    font-size: 11px;
+    padding: 4px 8px;
+    background-color: #1c2029;
+    border: 1px solid #2c3240;
+    border-radius: 6px;
+}
+QLabel#SummaryLabel {
+    color: #a6b2c6;
+    font-size: 11px;
 }
 QScrollBar:vertical {
-    background: #1b1d22;
-    width: 8px;
+    background: #16181e;
+    width: 7px;
     margin: 2px 0;
-    border-radius: 4px;
+    border-radius: 3px;
 }
 QScrollBar::handle:vertical {
-    background: #4b5263;
+    background: #3a4254;
     min-height: 24px;
-    border-radius: 4px;
+    border-radius: 3px;
 }
 QScrollBar::handle:vertical:hover {
-    background: #677087;
+    background: #535f78;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
     height: 0px;
@@ -151,17 +241,17 @@ class LayerRowWidget(QtWidgets.QFrame):
         self.setStyleSheet(
             """
             QFrame#LayerRow {
-                background-color: #292d36;
-                border: 1px solid #3a3f4b;
+                background-color: #232732;
+                border: 1px solid #323846;
                 border-radius: 5px;
             }
             QFrame#LayerRow:hover {
-                background-color: #303542;
-                border: 1px solid #586175;
+                background-color: #2a2f3d;
+                border: 1px solid #4d566b;
             }
             QFrame#LayerRow[selected="true"] {
-                background-color: #363d4d;
-                border: 1px solid #f3a847;
+                background-color: #303747;
+                border: 1px solid #f59e0b;
             }
             """
         )
@@ -216,7 +306,7 @@ class CutterLayerListWidget(QtWidgets.QFrame):
     orderChanged = QtCore.Signal(list)
     rowClicked = QtCore.Signal(str)
 
-    ROW_H = 36
+    ROW_H = 34
     ROW_GAP = 4
     PAD = 5
 
@@ -234,13 +324,13 @@ class CutterLayerListWidget(QtWidgets.QFrame):
         self.setStyleSheet(
             """
             QFrame#LayerListBox {
-                background-color: #1b1d22;
-                border: 1px solid #3c4049;
+                background-color: #181b22;
+                border: 1px solid #2c313f;
                 border-radius: 6px;
             }
             """
         )
-        self.setMinimumHeight(46)
+        self.setMinimumHeight(44)
 
     @property
     def is_dragging(self) -> bool:
@@ -258,12 +348,12 @@ class CutterLayerListWidget(QtWidgets.QFrame):
             row.hide()
             row.deleteLater()
         self._rows.clear()
-        self.setFixedHeight(46)
+        self.setFixedHeight(44)
 
     def set_rows(self, rows: list[LayerRowWidget]) -> None:
         self.clear_rows()
         self._rows = list(rows)
-        total_h = max(46, self.PAD * 2 + len(self._rows) * self.ROW_H + max(0, len(self._rows) - 1) * self.ROW_GAP)
+        total_h = max(44, self.PAD * 2 + len(self._rows) * self.ROW_H + max(0, len(self._rows) - 1) * self.ROW_GAP)
         self.setFixedHeight(total_h)
         w = max(self.width() - self.PAD * 2, 240)
         for idx, row in enumerate(self._rows):
@@ -302,54 +392,41 @@ class CutterLayerListWidget(QtWidgets.QFrame):
         self._target_index = self._rows.index(row)
         w = max(self.width() - self.PAD * 2, 120)
 
-        # Dashed glowing drop placeholder at target slot
         self._placeholder = QtWidgets.QFrame(self)
         self._placeholder.setStyleSheet(
-            """
-            QFrame {
-                background-color: rgba(243, 168, 71, 28);
-                border: 1.5px dashed #f3a847;
-                border-radius: 5px;
-            }
-            """
+            "QFrame { background-color: rgba(245, 158, 11, 28); border: 1.5px dashed #f59e0b; border-radius: 5px; }"
         )
         self._placeholder.setGeometry(self.PAD, self._slot_y(self._target_index), w, self.ROW_H)
         self._placeholder.show()
         self._placeholder.lower()
 
-        # Translucent floating ghost snapshot of the dragged row
         pixmap = row.grab()
         self._ghost_label = QtWidgets.QLabel(self)
         self._ghost_label.setPixmap(pixmap)
         self._ghost_label.setStyleSheet(
-            "border: 1.5px solid #f3a847; border-radius: 5px; background-color: rgba(48, 54, 68, 220);"
+            "border: 1.5px solid #f59e0b; border-radius: 5px; background-color: rgba(40, 46, 58, 225);"
         )
         effect = QtWidgets.QGraphicsOpacityEffect(self._ghost_label)
-        effect.setOpacity(0.80)
+        effect.setOpacity(0.82)
         self._ghost_label.setGraphicsEffect(effect)
         self._ghost_label.setFixedSize(w, self.ROW_H)
-        ghost_y = int(round(cursor_y - self._drag_grab_y))
-        ghost_y = max(0, min(self.height() - self.ROW_H, ghost_y))
+        ghost_y = max(0, min(self.height() - self.ROW_H, int(round(cursor_y - self._drag_grab_y))))
         self._ghost_label.move(self.PAD, ghost_y)
         self._ghost_label.show()
         self._ghost_label.raise_()
 
-        # Hide original widget while ghost is floating
         row.setVisible(False)
         self.setCursor(QtCore.Qt.ClosedHandCursor)
 
     def update_row_drag(self, cursor_y: float) -> None:
         if self._dragging_row is None or self._ghost_label is None:
             return
-        ghost_y = int(round(cursor_y - self._drag_grab_y))
-        ghost_y = max(0, min(self.height() - self.ROW_H, ghost_y))
+        ghost_y = max(0, min(self.height() - self.ROW_H, int(round(cursor_y - self._drag_grab_y))))
         self._ghost_label.move(self.PAD, ghost_y)
 
-        # Determine which slot the ghost center is over
         center_y = ghost_y + self.ROW_H * 0.5
         step = self.ROW_H + self.ROW_GAP
-        new_idx = int((center_y - self.PAD) // step)
-        new_idx = max(0, min(len(self._rows) - 1, new_idx))
+        new_idx = max(0, min(len(self._rows) - 1, int((center_y - self.PAD) // step)))
 
         if new_idx != self._target_index:
             old_idx = self._rows.index(self._dragging_row)
@@ -360,8 +437,6 @@ class CutterLayerListWidget(QtWidgets.QFrame):
             w = max(self.width() - self.PAD * 2, 120)
             if self._placeholder is not None:
                 self._placeholder.setGeometry(self.PAD, self._slot_y(new_idx), w, self.ROW_H)
-
-            # Smoothly slide all other rows to their new slots!
             for idx, r in enumerate(self._rows):
                 if r is not self._dragging_row:
                     self._animate_row_to(r, self._slot_y(idx))
@@ -397,79 +472,200 @@ class CutterLayerListWidget(QtWidgets.QFrame):
 
 
 class FullDestrucWindow(QtWidgets.QWidget):
+    """Minimal detached companion window synchronized live with Blender 5.2."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FullDestruc Tool — Apple Bite")
-        self.setMinimumWidth(420)
+        self.setWindowTitle("FullDestruc Tool")
+        self.setMinimumWidth(380)
+        self.resize(400, 560)
         self.setWindowFlags(self.windowFlags() | QtCore.Qt.WindowStaysOnTopHint)
         self.setStyleSheet(DARK_STYLESHEET)
 
         self._zone_buttons: dict[str, QtWidgets.QPushButton] = {}
         self._last_cutter_sig: tuple = ()
         self._last_mat_sig: tuple = ()
+        self._last_rebar_mat_sig: tuple = ()
+        self._active_tab: str = "APPLE_BITE"
         self._build_ui()
 
     def _build_ui(self) -> None:
-        root = QtWidgets.QVBoxLayout(self)
-        root.setSpacing(8)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
 
-        # Always-visible Guide Banner
-        self.guide_label = QtWidgets.QLabel("Step 1: Select building meshes in 3D View")
-        self.guide_label.setObjectName("GuideBanner")
-        self.guide_label.setWordWrap(True)
-        root.addWidget(self.guide_label)
+        # --- SLIM TOP BAR (Tool Switcher + Collapsible Engine Settings) ---
+        top_wrap = QtWidgets.QWidget()
+        top_l = QtWidgets.QHBoxLayout(top_wrap)
+        top_l.setContentsMargins(10, 8, 10, 6)
+        top_l.setSpacing(6)
 
-        # Boolean Engine selector (always visible)
+        self.btn_tab_ab = QtWidgets.QPushButton("Apple Bite")
+        self.btn_tab_ab.setObjectName("TabBtn")
+        self.btn_tab_ab.setIcon(_qicon("tool_apple_bite"))
+        self.btn_tab_ab.setCheckable(True)
+        self.btn_tab_ab.setChecked(True)
+        self.btn_tab_ab.clicked.connect(lambda: self._switch_tab("APPLE_BITE"))
+
+        self.btn_tab_rb = QtWidgets.QPushButton("Rebar")
+        self.btn_tab_rb.setObjectName("TabBtn")
+        self.btn_tab_rb.setIcon(_qicon("tool_rebar"))
+        self.btn_tab_rb.setCheckable(True)
+        self.btn_tab_rb.clicked.connect(lambda: self._switch_tab("REBAR"))
+
+        self.btn_settings = QtWidgets.QPushButton("")
+        self.btn_settings.setIcon(_qicon("settings_gear"))
+        self.btn_settings.setFixedSize(32, 30)
+        self.btn_settings.setCheckable(True)
+        self.btn_settings.setToolTip("Engine, GPU Fast Drag & Viewport Dock Settings")
+        self.btn_settings.toggled.connect(lambda checked: self.settings_drawer.setVisible(checked))
+
+        top_l.addWidget(self.btn_tab_ab, 1)
+        top_l.addWidget(self.btn_tab_rb, 1)
+        top_l.addWidget(self.btn_settings)
+        outer.addWidget(top_wrap)
+
+        # Collapsible Engine/Settings Drawer (hidden by default!)
+        self.settings_drawer = QtWidgets.QFrame()
+        self.settings_drawer.setObjectName("Card")
+        sd_l = QtWidgets.QVBoxLayout(self.settings_drawer)
+        sd_l.setContentsMargins(10, 8, 10, 8)
+        sd_l.setSpacing(6)
+
         eng_row = QtWidgets.QHBoxLayout()
-        eng_lbl = QtWidgets.QLabel("Boolean Engine:")
-        eng_lbl.setFixedWidth(105)
+        eng_row.addWidget(QtWidgets.QLabel("Engine:"))
         self.cmb_engine = QtWidgets.QComboBox()
         self.cmb_engine.addItem("Rust Engine (Fast & UV Safe)", "RUST")
         self.cmb_engine.addItem("Blender Exact", "EXACT")
         self.cmb_engine.addItem("Blender Float (Fast)", "FLOAT")
         self.cmb_engine.currentIndexChanged.connect(self._on_engine_changed)
-        eng_row.addWidget(eng_lbl)
         eng_row.addWidget(self.cmb_engine, 1)
-        root.addLayout(eng_row)
+        sd_l.addLayout(eng_row)
 
-        self.chk_gpu_fast_drag = QtWidgets.QCheckBox("GPU Fast Drag (60+ FPS Async Preview)")
+        self.chk_gpu_fast_drag = QtWidgets.QCheckBox("GPU Fast Drag (60+ FPS)")
         self.chk_gpu_fast_drag.setChecked(True)
         self.chk_gpu_fast_drag.toggled.connect(self._on_gpu_fast_drag_toggled)
-        root.addWidget(self.chk_gpu_fast_drag)
+        sd_l.addWidget(self.chk_gpu_fast_drag)
 
-        # --- STEP 1 WIDGET (Idle) ---
-        self.step1_widget = QtWidgets.QGroupBox("Step 1: Start or Re-edit Cut")
-        s1_layout = QtWidgets.QVBoxLayout(self.step1_widget)
-        self.btn_smart_start = QtWidgets.QPushButton("Select Meshes to Start")
-        self.btn_smart_start.setObjectName("PrimaryBtn")
-        self.btn_smart_start.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_smart_start))
-        s1_layout.addWidget(self.btn_smart_start)
+        self.chk_viewport_dock = QtWidgets.QCheckBox("Show 3D Viewport Action Dock")
+        self.chk_viewport_dock.setChecked(True)
+        self.chk_viewport_dock.toggled.connect(self._on_viewport_dock_toggled)
+        sd_l.addWidget(self.chk_viewport_dock)
 
-        self.btn_reedit_old = QtWidgets.QPushButton("Re-edit Previous Cut")
+        self.settings_drawer.setVisible(False)
+        sd_wrap = QtWidgets.QWidget()
+        sd_wl = QtWidgets.QVBoxLayout(sd_wrap)
+        sd_wl.setContentsMargins(10, 0, 10, 4)
+        sd_wl.addWidget(self.settings_drawer)
+        outer.addWidget(sd_wrap)
+
+        # --- SCROLLABLE BODY (Apple Bite / Rebar pages) ---
+        self.body_scroll = QtWidgets.QScrollArea()
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.body_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self.stack = QtWidgets.QStackedWidget()
+        self.stack.addWidget(self._build_apple_bite_page())
+        self.stack.addWidget(self._build_rebar_page())
+        self.body_scroll.setWidget(self.stack)
+        outer.addWidget(self.body_scroll, 1)
+
+        # --- STICKY BOTTOM ACTION FOOTER (ALWAYS VISIBLE!) ---
+        self.sticky_footer = QtWidgets.QFrame()
+        self.sticky_footer.setObjectName("StickyFooter")
+        sf_l = QtWidgets.QVBoxLayout(self.sticky_footer)
+        sf_l.setContentsMargins(10, 8, 10, 10)
+        sf_l.setSpacing(6)
+
+        self.summary_label = QtWidgets.QLabel("")
+        self.summary_label.setObjectName("SummaryLabel")
+        sf_l.addWidget(self.summary_label)
+
+        # Giant Vivid Emerald APPLY / BAKE button
+        self.btn_hero_commit = QtWidgets.QPushButton("APPLY")
+        self.btn_hero_commit.setObjectName("ApplyHeroBtn")
+        self.btn_hero_commit.setIcon(_qicon("apply_green"))
+        self.btn_hero_commit.setIconSize(QtCore.QSize(18, 18))
+        self.btn_hero_commit.setMinimumHeight(42)
+        self.btn_hero_commit.clicked.connect(self._on_hero_commit_clicked)
+        sf_l.addWidget(self.btn_hero_commit)
+
+        self.footer_sec_row = QtWidgets.QWidget()
+        fs_l = QtWidgets.QHBoxLayout(self.footer_sec_row)
+        fs_l.setContentsMargins(0, 0, 0, 0)
+        fs_l.setSpacing(6)
+        self.btn_exit = QtWidgets.QPushButton("Pause")
+        self.btn_exit.setIcon(_qicon("pause_slate"))
+        self.btn_exit.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_exit))
+        self.btn_cancel = QtWidgets.QPushButton("Cancel & Restore")
+        self.btn_cancel.setObjectName("DangerBtn")
+        self.btn_cancel.setIcon(_qicon("cancel_red"))
+        self.btn_cancel.clicked.connect(self._on_cancel_clicked)
+        fs_l.addWidget(self.btn_exit)
+        fs_l.addWidget(self.btn_cancel)
+        sf_l.addWidget(self.footer_sec_row)
+
+        outer.addWidget(self.sticky_footer)
+
+    def _build_apple_bite_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        root = QtWidgets.QVBoxLayout(page)
+        root.setContentsMargins(10, 4, 10, 10)
+        root.setSpacing(8)
+
+        # Compact status pill
+        self.guide_label = QtWidgets.QLabel("Select a mesh in 3D View to start")
+        self.guide_label.setObjectName("StatusPill")
+        self.guide_label.setWordWrap(True)
+        root.addWidget(self.guide_label)
+
+        # --- IDLE CARD ---
+        self.step1_widget = QtWidgets.QFrame()
+        self.step1_widget.setObjectName("Card")
+        s1_l = QtWidgets.QVBoxLayout(self.step1_widget)
+        s1_l.setContentsMargins(10, 10, 10, 10)
+        s1_l.setSpacing(6)
+
+        pair_row = QtWidgets.QHBoxLayout()
+        pair_row.setSpacing(6)
+        self.btn_reedit_old = QtWidgets.QPushButton("Re-edit Cut")
+        self.btn_reedit_old.setObjectName("CyanHeroBtn")
+        self.btn_reedit_old.setIcon(_qicon("reedit_cyan"))
         self.btn_reedit_old.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_reedit))
         self.btn_reedit_old.setVisible(False)
-        s1_layout.addWidget(self.btn_reedit_old)
+
+        self.btn_smart_start = QtWidgets.QPushButton("Start Cut")
+        self.btn_smart_start.setObjectName("AmberHeroBtn")
+        self.btn_smart_start.setIcon(_qicon("start_orange"))
+        self.btn_smart_start.setMinimumHeight(38)
+        self.btn_smart_start.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_smart_start))
+
+        pair_row.addWidget(self.btn_reedit_old, 1)
+        pair_row.addWidget(self.btn_smart_start, 1)
+        s1_l.addLayout(pair_row)
 
         self.btn_reset_original = QtWidgets.QPushButton("Reset to Original")
         self.btn_reset_original.setObjectName("DangerBtn")
+        self.btn_reset_original.setIcon(_qicon("trash_red"))
         self.btn_reset_original.clicked.connect(self._on_reset_original_clicked)
         self.btn_reset_original.setVisible(False)
-        s1_layout.addWidget(self.btn_reset_original)
+        s1_l.addWidget(self.btn_reset_original)
         root.addWidget(self.step1_widget)
 
-        # --- STEP 2 WIDGET (Active Session: Cutters & Zones) ---
-        self.step2_widget = QtWidgets.QGroupBox("Step 2: Place & Manage Cutters")
-        s2_layout = QtWidgets.QVBoxLayout(self.step2_widget)
+        # --- ACTIVE SESSION CARD ---
+        self.step2_widget = QtWidgets.QFrame()
+        self.step2_widget.setObjectName("Card")
+        s2_l = QtWidgets.QVBoxLayout(self.step2_widget)
+        s2_l.setContentsMargins(10, 10, 10, 10)
+        s2_l.setSpacing(7)
 
-        zone_grid = QtWidgets.QGridLayout()
-        initial_zones = zone_registry.load_zones(getattr(bpy.context, "scene", None))[:8]
-        for idx, zdef in enumerate(initial_zones):
-            btn = QtWidgets.QPushButton(zdef.token)
-            btn.setObjectName("ZoneBtn")
-            btn.clicked.connect(lambda _chk=False, z=zdef.key: self._set_zone(z))
-            self._zone_buttons[zdef.key] = btn
-            zone_grid.addWidget(btn, idx // 4, idx % 4)
-        s2_layout.addLayout(zone_grid)
+        # 1-Row Zone Strip + collapsible Quick Zones drawer
+        z_row = QtWidgets.QHBoxLayout()
+        z_row.setSpacing(5)
+        self.zone_swatch = QtWidgets.QLabel()
+        self.zone_swatch.setFixedSize(14, 14)
+        self.zone_swatch.setStyleSheet("border-radius: 7px; background-color: #f59e0b;")
 
         self.cmb_zone = QtWidgets.QComboBox()
         self.cmb_zone.setEditable(True)
@@ -479,162 +675,144 @@ class FullDestrucWindow(QtWidgets.QWidget):
             completer.setFilterMode(QtCore.Qt.MatchContains)
             completer.setCompletionMode(QtWidgets.QCompleter.PopupCompletion)
         self.cmb_zone.currentIndexChanged.connect(self._on_zone_combo_changed)
-        s2_layout.addWidget(self.cmb_zone)
 
-        zone_manage_row = QtWidgets.QHBoxLayout()
-        btn_z_new = QtWidgets.QPushButton("+ New Zone")
+        self.btn_zone_drawer = QtWidgets.QPushButton("")
+        self.btn_zone_drawer.setIcon(_qicon("zones_grid"))
+        self.btn_zone_drawer.setFixedSize(30, 28)
+        self.btn_zone_drawer.setCheckable(True)
+        self.btn_zone_drawer.setToolTip("Quick Zones (A-H) & Manage Zone Registry")
+        self.btn_zone_drawer.toggled.connect(lambda c: self.zone_drawer.setVisible(c))
+
+        z_row.addWidget(self.zone_swatch)
+        z_row.addWidget(self.cmb_zone, 1)
+        z_row.addWidget(self.btn_zone_drawer)
+        s2_l.addLayout(z_row)
+
+        self.zone_drawer = QtWidgets.QWidget()
+        zd_l = QtWidgets.QVBoxLayout(self.zone_drawer)
+        zd_l.setContentsMargins(0, 2, 0, 2)
+        zd_l.setSpacing(5)
+        zone_grid = QtWidgets.QGridLayout()
+        zone_grid.setSpacing(4)
+        initial_zones = zone_registry.load_zones(getattr(bpy.context, "scene", None))[:8]
+        for idx, zdef in enumerate(initial_zones):
+            btn = QtWidgets.QPushButton(zdef.token)
+            btn.setObjectName("ZoneBtn")
+            btn.clicked.connect(lambda _chk=False, z=zdef.key: self._set_zone(z))
+            self._zone_buttons[zdef.key] = btn
+            zone_grid.addWidget(btn, idx // 4, idx % 4)
+        zd_l.addLayout(zone_grid)
+
+        zm_row = QtWidgets.QHBoxLayout()
+        zm_row.setSpacing(4)
+        btn_z_new = QtWidgets.QPushButton("New Zone")
+        btn_z_new.setIcon(_qicon("plus_add"))
         btn_z_new.clicked.connect(
-            lambda _checked=False: self._run_op(
-                bpy.ops.fdt.zone_manage, action="NEW", zone_key=self._active_zone_key()
-            )
+            lambda _c=False: self._run_invoke_op(bpy.ops.fdt.zone_manage, action="NEW", zone_key=self._active_zone_key())
         )
-        btn_obj_ren = QtWidgets.QPushButton("Rename")
-        btn_obj_ren.clicked.connect(
-            lambda _checked=False: self._run_invoke_op(bpy.ops.fdt.rename_popup)
+        btn_z_edit = QtWidgets.QPushButton("Edit")
+        btn_z_edit.setIcon(_qicon("rename_pen"))
+        btn_z_edit.clicked.connect(
+            lambda _c=False: self._run_invoke_op(bpy.ops.fdt.zone_manage, action="RENAME", zone_key=self._active_zone_key())
         )
         btn_z_del = QtWidgets.QPushButton("Delete")
+        btn_z_del.setIcon(_qicon("trash_red"))
         btn_z_del.clicked.connect(
-            lambda _checked=False: self._run_op(
-                bpy.ops.fdt.zone_manage, action="DELETE", zone_key=self._active_zone_key()
-            )
+            lambda _c=False: self._run_invoke_op(bpy.ops.fdt.zone_manage, action="DELETE", zone_key=self._active_zone_key())
         )
-        zone_manage_row.addWidget(btn_z_new)
-        zone_manage_row.addWidget(btn_obj_ren)
-        zone_manage_row.addWidget(btn_z_del)
-        s2_layout.addLayout(zone_manage_row)
+        zm_row.addWidget(btn_z_new)
+        zm_row.addWidget(btn_z_edit)
+        zm_row.addWidget(btn_z_del)
+        zd_l.addLayout(zm_row)
+        self.zone_drawer.setVisible(False)
+        s2_l.addWidget(self.zone_drawer)
 
-        row_cut = QtWidgets.QHBoxLayout()
-        btn_box = QtWidgets.QPushButton("+ Add Box")
+        # 2x2 Add Cutters Grid
+        add_grid = QtWidgets.QGridLayout()
+        add_grid.setSpacing(5)
+        btn_box = QtWidgets.QPushButton("+ Box")
+        btn_box.setIcon(_qicon("add_box"))
+        btn_box.setMinimumHeight(32)
         btn_box.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_add_box))
-        btn_mesh = QtWidgets.QPushButton("+ Use Selected Mesh")
-        btn_mesh.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_add_mesh))
-        row_cut.addWidget(btn_box)
-        row_cut.addWidget(btn_mesh)
-        s2_layout.addLayout(row_cut)
 
-        btn_draw = QtWidgets.QPushButton("Draw Cutter (2D -> Extrude)")
-        btn_draw.setObjectName("PrimaryBtn")
+        btn_draw = QtWidgets.QPushButton("Draw")
+        btn_draw.setIcon(_qicon("draw_pen"))
+        btn_draw.setMinimumHeight(32)
         btn_draw.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_draw_cutter))
-        s2_layout.addWidget(btn_draw)
 
-        self.layer_header = QtWidgets.QLabel("Cutter Layers (Drag ☰ to reorder — Top = Priority):")
-        self.layer_header.setStyleSheet("color: #c8cdd8; font-size: 11px; margin-top: 4px;")
-        s2_layout.addWidget(self.layer_header)
+        btn_click = QtWidgets.QPushButton("Click Place")
+        btn_click.setIcon(_qicon("click_place"))
+        btn_click.clicked.connect(lambda: self._run_invoke_op(bpy.ops.fdt.applebite_interactive))
+
+        btn_mesh = QtWidgets.QPushButton("+ Mesh")
+        btn_mesh.setIcon(_qicon("use_mesh"))
+        btn_mesh.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_add_mesh))
+
+        add_grid.addWidget(btn_box, 0, 0)
+        add_grid.addWidget(btn_draw, 0, 1)
+        add_grid.addWidget(btn_click, 1, 0)
+        add_grid.addWidget(btn_mesh, 1, 1)
+        s2_l.addLayout(add_grid)
+
+        # Phase B controls (hidden when 0 valid cutters)
+        self.phase_b_widget = QtWidgets.QWidget()
+        pb_l = QtWidgets.QVBoxLayout(self.phase_b_widget)
+        pb_l.setContentsMargins(0, 2, 0, 0)
+        pb_l.setSpacing(6)
 
         row_view = QtWidgets.QHBoxLayout()
         row_view.setSpacing(4)
         self._view_mode_buttons: dict[str, QtWidgets.QPushButton] = {}
-        for mode_id, lbl in (
-            ("ALL", "All"),
-            ("PIECES", "Piece Only"),
-            ("MAIN", "Hole Only"),
-            ("MAIN_WIRE", "Hole + Wire"),
-        ):
+        for mode_id, lbl in (("ALL", "All"), ("PIECES", "Piece"), ("MAIN", "Hole"), ("MAIN_WIRE", "Wire")):
             b = QtWidgets.QPushButton(lbl)
             b.setCheckable(True)
             b.setProperty("active", mode_id == "ALL")
             b.clicked.connect(lambda _=False, m=mode_id: self._on_preview_view_clicked(m))
             row_view.addWidget(b)
             self._view_mode_buttons[mode_id] = b
-        s2_layout.addLayout(row_view)
+        pb_l.addLayout(row_view)
 
-        row_grid = QtWidgets.QHBoxLayout()
-        self.chk_zone_grid = QtWidgets.QCheckBox("Zone Grid Overlay")
+        quick_row = QtWidgets.QHBoxLayout()
+        quick_row.setSpacing(6)
+        self.chk_zone_grid = QtWidgets.QCheckBox("Zone Grid")
         self.chk_zone_grid.setChecked(True)
         self.chk_zone_grid.toggled.connect(self._on_zone_grid_toggled)
-        row_grid.addWidget(self.chk_zone_grid)
-        s2_layout.addLayout(row_grid)
-
-        self.cutter_layer_list = CutterLayerListWidget()
-        self.cutter_layer_list.orderChanged.connect(self._on_layers_reordered)
-        self.cutter_layer_list.rowClicked.connect(self._on_layer_row_clicked)
-
-        self.layer_scroll = QtWidgets.QScrollArea()
-        self.layer_scroll.setWidgetResizable(True)
-        self.layer_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-        self.layer_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        self.layer_scroll.setMinimumHeight(48)
-        self.layer_scroll.setMaximumHeight(240)
-        self.layer_scroll.setWidget(self.cutter_layer_list)
-        s2_layout.addWidget(self.layer_scroll)
-        root.addWidget(self.step2_widget)
-
-        # --- CUT FACE MATERIAL WIDGET (Live in Step 3 & Post-Apply in Step 1) ---
-        self.cut_mat_box = QtWidgets.QGroupBox("Cut Face Material")
-        cm_layout = QtWidgets.QVBoxLayout(self.cut_mat_box)
-        cm_row = QtWidgets.QHBoxLayout()
-        self.cmb_cut_mat = QtWidgets.QComboBox()
-        self.cmb_cut_mat.setEditable(False)
-        self.cmb_cut_mat.currentIndexChanged.connect(self._on_cut_mat_changed)
-        self.btn_pick_mat = QtWidgets.QPushButton("Pick 3D")
-        self.btn_pick_mat.setFixedWidth(74)
-        self.btn_pick_mat.setToolTip("Click a surface in 3D View to pick its material (Eyedropper)")
-        self.btn_pick_mat.clicked.connect(self._on_pick_surface_material)
-        cm_row.addWidget(self.cmb_cut_mat, 1)
-        cm_row.addWidget(self.btn_pick_mat)
-        cm_layout.addLayout(cm_row)
-
-        self.btn_assign_cut_mat = QtWidgets.QPushButton("Apply Cut Material to Selected")
-        self.btn_assign_cut_mat.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_assign_cut_material))
-        self.btn_assign_cut_mat.setVisible(False)
-        cm_layout.addWidget(self.btn_assign_cut_mat)
-
-        self.btn_fill_cut_caps = QtWidgets.QPushButton("Fill Cut Cap (Auto)")
-        self.btn_fill_cut_caps.setToolTip(
-            "Object Mode: Auto-fill unclosed holes on cut planes.\n"
-            "Edit Mode: Fill selected open edges with Cut Material + Box UV."
-        )
-        self.btn_fill_cut_caps.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_fill_cut_caps))
-        self.btn_fill_cut_caps.setVisible(False)
-        cm_layout.addWidget(self.btn_fill_cut_caps)
-        self.cut_mat_box.setVisible(False)
-        root.addWidget(self.cut_mat_box)
-
-        # --- STEP 3 WIDGET (Tune & Apply) ---
-        self.step3_widget = QtWidgets.QGroupBox("Step 3: Tune & Apply")
-        s3_layout = QtWidgets.QVBoxLayout(self.step3_widget)
-
-        self.chk_rough = QtWidgets.QCheckBox("Rough Cut Edge")
+        self.chk_rough = QtWidgets.QCheckBox("Rough Edge")
         self.chk_rough.toggled.connect(self._on_rough_toggled)
-        s3_layout.addWidget(self.chk_rough)
+        quick_row.addWidget(self.chk_zone_grid)
+        quick_row.addWidget(self.chk_rough)
+        quick_row.addStretch(1)
+        pb_l.addLayout(quick_row)
 
+        # Collapsible Rough Params
         self.rough_params_box = QtWidgets.QFrame()
         self.rough_params_box.setStyleSheet(
-            "QFrame { background-color: #20232a; border: 1px solid #353944; border-radius: 5px; }"
+            "QFrame { background-color: #181b22; border: 1px solid #2e3444; border-radius: 6px; }"
             "QLabel { border: none; background: transparent; color: #cfd5df; font-size: 11px; }"
         )
         rp_layout = QtWidgets.QFormLayout(self.rough_params_box)
         rp_layout.setContentsMargins(8, 6, 8, 6)
         rp_layout.setSpacing(5)
-
         self.lbl_rough_target = QtWidgets.QLabel("Cutter: -")
         self.lbl_rough_target.setStyleSheet("color: #c4b5fd; font-weight: bold; font-size: 11px;")
         rp_layout.addRow(self.lbl_rough_target)
 
-        # Inward Depth (0-100%, uniform scale inward preserving jagged pattern)
         inward_row = QtWidgets.QHBoxLayout()
-        inward_row.setContentsMargins(0, 0, 0, 0)
-        inward_row.setSpacing(6)
         self.sld_rough_inward = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sld_rough_inward.setRange(0, 100)
-        self.sld_rough_inward.setValue(0)
         self.spn_rough_inward = QtWidgets.QDoubleSpinBox()
         self.spn_rough_inward.setRange(0.0, 100.0)
         self.spn_rough_inward.setSingleStep(5.0)
         self.spn_rough_inward.setDecimals(0)
         self.spn_rough_inward.setSuffix("%")
-        self.spn_rough_inward.setValue(0.0)
-        self.spn_rough_inward.setFixedWidth(64)
+        self.spn_rough_inward.setFixedWidth(60)
         self.sld_rough_inward.valueChanged.connect(self._on_rough_inward_slider_changed)
         self.spn_rough_inward.valueChanged.connect(self._on_rough_inward_spin_changed)
         inward_row.addWidget(self.sld_rough_inward, 1)
         inward_row.addWidget(self.spn_rough_inward)
-        rp_layout.addRow("Inward Depth:", inward_row)
+        rp_layout.addRow("Inward:", inward_row)
 
-        # Jaggedness (0-100%, fracture depth around edges)
         jagged_row = QtWidgets.QHBoxLayout()
-        jagged_row.setContentsMargins(0, 0, 0, 0)
-        jagged_row.setSpacing(6)
         self.sld_rough_jagged = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.sld_rough_jagged.setRange(0, 100)
         self.sld_rough_jagged.setValue(45)
@@ -644,84 +822,257 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.spn_rough_jagged.setDecimals(0)
         self.spn_rough_jagged.setSuffix("%")
         self.spn_rough_jagged.setValue(45.0)
-        self.spn_rough_jagged.setFixedWidth(64)
+        self.spn_rough_jagged.setFixedWidth(60)
         self.sld_rough_jagged.valueChanged.connect(self._on_rough_jagged_slider_changed)
         self.spn_rough_jagged.valueChanged.connect(self._on_rough_jagged_spin_changed)
         jagged_row.addWidget(self.sld_rough_jagged, 1)
         jagged_row.addWidget(self.spn_rough_jagged)
-        rp_layout.addRow("Jaggedness:", jagged_row)
+        rp_layout.addRow("Jagged:", jagged_row)
 
-        # Noise Scale (chunks across cutter)
         self.spn_rough_scale = QtWidgets.QDoubleSpinBox()
         self.spn_rough_scale.setRange(0.5, 10.0)
         self.spn_rough_scale.setSingleStep(0.25)
-        self.spn_rough_scale.setDecimals(2)
         self.spn_rough_scale.setValue(2.5)
-        self.spn_rough_scale.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("noise_scale", float(v))
-        )
-        rp_layout.addRow("Noise Scale:", self.spn_rough_scale)
+        self.spn_rough_scale.valueChanged.connect(lambda v: self._on_rough_param_changed("noise_scale", float(v)))
+        rp_layout.addRow("Scale:", self.spn_rough_scale)
 
-        # Low-Poly Detail (1-3)
         self.spn_rough_subdiv = QtWidgets.QSpinBox()
         self.spn_rough_subdiv.setRange(1, 3)
         self.spn_rough_subdiv.setValue(2)
-        self.spn_rough_subdiv.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("detail", int(v))
-        )
-        rp_layout.addRow("Detail (1-3):", self.spn_rough_subdiv)
+        self.spn_rough_subdiv.valueChanged.connect(lambda v: self._on_rough_param_changed("detail", int(v)))
+        rp_layout.addRow("Detail:", self.spn_rough_subdiv)
 
-        # Seed
         self.spn_rough_seed = QtWidgets.QDoubleSpinBox()
         self.spn_rough_seed.setRange(-10000.0, 10000.0)
         self.spn_rough_seed.setSingleStep(0.5)
-        self.spn_rough_seed.setDecimals(2)
-        self.spn_rough_seed.setValue(0.0)
-        self.spn_rough_seed.valueChanged.connect(
-            lambda v: self._on_rough_param_changed("seed", float(v))
-        )
+        self.spn_rough_seed.valueChanged.connect(lambda v: self._on_rough_param_changed("seed", float(v)))
         rp_layout.addRow("Seed:", self.spn_rough_seed)
-
         self.rough_params_box.setVisible(False)
-        s3_layout.addWidget(self.rough_params_box)
+        pb_l.addWidget(self.rough_params_box)
+
+        # Collapsible Cutter Layers Drawer (collapsed by default!)
+        self.btn_layers_toggle = QtWidgets.QPushButton("▸ Layers (0)")
+        self.btn_layers_toggle.setObjectName("DrawerToggle")
+        self.btn_layers_toggle.setCheckable(True)
+        self.btn_layers_toggle.toggled.connect(self._on_layers_drawer_toggled)
+        pb_l.addWidget(self.btn_layers_toggle)
+
+        self.cutter_layer_list = CutterLayerListWidget()
+        self.cutter_layer_list.orderChanged.connect(self._on_layers_reordered)
+        self.cutter_layer_list.rowClicked.connect(self._on_layer_row_clicked)
+        self.layer_scroll = QtWidgets.QScrollArea()
+        self.layer_scroll.setWidgetResizable(True)
+        self.layer_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.layer_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.layer_scroll.setMinimumHeight(46)
+        self.layer_scroll.setMaximumHeight(210)
+        self.layer_scroll.setWidget(self.cutter_layer_list)
+        self.layer_scroll.setVisible(False)
+        pb_l.addWidget(self.layer_scroll)
+
+        # Collapsible Output Options Drawer
+        self.btn_output_toggle = QtWidgets.QPushButton("▸ Output Options")
+        self.btn_output_toggle.setObjectName("DrawerToggle")
+        self.btn_output_toggle.setCheckable(True)
+        self.btn_output_toggle.toggled.connect(self._on_output_drawer_toggled)
+        pb_l.addWidget(self.btn_output_toggle)
+
+        self.output_drawer = QtWidgets.QWidget()
+        od_l = QtWidgets.QVBoxLayout(self.output_drawer)
+        od_l.setContentsMargins(6, 2, 0, 2)
+        od_l.setSpacing(4)
+        keep_row = QtWidgets.QHBoxLayout()
+        self.chk_keep_main = QtWidgets.QCheckBox("Main Mesh")
+        self.chk_keep_main.setChecked(True)
+        self.chk_keep_main.toggled.connect(self._on_keep_main_toggled)
+        self.chk_keep_pieces = QtWidgets.QCheckBox("Zone Pieces")
+        self.chk_keep_pieces.setChecked(True)
+        self.chk_keep_pieces.toggled.connect(self._on_keep_pieces_toggled)
+        keep_row.addWidget(self.chk_keep_main)
+        keep_row.addWidget(self.chk_keep_pieces)
+        od_l.addLayout(keep_row)
 
         self.chk_auto_fill = QtWidgets.QCheckBox("Auto-Fill Cut Gaps")
         self.chk_auto_fill.setChecked(True)
-        self.chk_auto_fill.setToolTip("Automatically fill unclosed solid holes strictly on cut planes on Apply")
         self.chk_auto_fill.toggled.connect(self._on_auto_fill_toggled)
-        s3_layout.addWidget(self.chk_auto_fill)
+        od_l.addWidget(self.chk_auto_fill)
 
         self.chk_line_backfaces = QtWidgets.QCheckBox("Close See-Through Backfaces")
         self.chk_line_backfaces.setChecked(True)
-        self.chk_line_backfaces.setToolTip(
-            "Automatically add inner liner faces behind single-sided attics/walls exposed by the cut"
-        )
         self.chk_line_backfaces.toggled.connect(self._on_line_backfaces_toggled)
-        s3_layout.addWidget(self.chk_line_backfaces)
+        od_l.addWidget(self.chk_line_backfaces)
 
-        self.summary_label = QtWidgets.QLabel("Output: -")
-        s3_layout.addWidget(self.summary_label)
+        btn_ren_obj = QtWidgets.QPushButton("Rename Selected Objects")
+        btn_ren_obj.setIcon(_qicon("rename_pen"))
+        btn_ren_obj.clicked.connect(lambda: self._run_invoke_op(bpy.ops.fdt.rename_popup))
+        od_l.addWidget(btn_ren_obj)
+        self.output_drawer.setVisible(False)
+        pb_l.addWidget(self.output_drawer)
 
-        btn_apply = QtWidgets.QPushButton("APPLY")
-        btn_apply.setObjectName("PrimaryBtn")
-        btn_apply.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_apply))
-        s3_layout.addWidget(btn_apply)
-        root.addWidget(self.step3_widget)
+        s2_l.addWidget(self.phase_b_widget)
+        root.addWidget(self.step2_widget)
 
-        # Footer
-        self.footer_widget = QtWidgets.QWidget()
-        f_layout = QtWidgets.QHBoxLayout(self.footer_widget)
-        f_layout.setContentsMargins(0, 0, 0, 0)
-        btn_exit = QtWidgets.QPushButton("Pause / Exit")
-        btn_exit.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_exit))
-        btn_cancel = QtWidgets.QPushButton("Cancel & Restore")
-        btn_cancel.setObjectName("DangerBtn")
-        btn_cancel.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_cancel))
-        f_layout.addWidget(btn_exit)
-        f_layout.addWidget(btn_cancel)
-        root.addWidget(self.footer_widget)
+        # --- CUT FACE MATERIAL CARD (Compact 1-row + optional post-cut tools) ---
+        self.cut_mat_box = QtWidgets.QFrame()
+        self.cut_mat_box.setObjectName("Card")
+        cm_l = QtWidgets.QVBoxLayout(self.cut_mat_box)
+        cm_l.setContentsMargins(10, 8, 10, 8)
+        cm_l.setSpacing(6)
+
+        cm_row = QtWidgets.QHBoxLayout()
+        cm_row.setSpacing(5)
+        self.cmb_cut_mat = QtWidgets.QComboBox()
+        self.cmb_cut_mat.currentIndexChanged.connect(self._on_cut_mat_changed)
+        self.btn_pick_mat = QtWidgets.QPushButton("Pick")
+        self.btn_pick_mat.setIcon(_qicon("eyedropper"))
+        self.btn_pick_mat.setFixedWidth(72)
+        self.btn_pick_mat.clicked.connect(self._on_pick_surface_material)
+        cm_row.addWidget(self.cmb_cut_mat, 1)
+        cm_row.addWidget(self.btn_pick_mat)
+        cm_l.addLayout(cm_row)
+
+        post_row = QtWidgets.QHBoxLayout()
+        post_row.setSpacing(5)
+        self.btn_assign_cut_mat = QtWidgets.QPushButton("Apply Mat")
+        self.btn_assign_cut_mat.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_assign_cut_material))
+        self.btn_assign_cut_mat.setVisible(False)
+        self.btn_fill_cut_caps = QtWidgets.QPushButton("Fill Cap")
+        self.btn_fill_cut_caps.setIcon(_qicon("fill_cap"))
+        self.btn_fill_cut_caps.clicked.connect(lambda: self._run_op(bpy.ops.fdt.applebite_fill_cut_caps))
+        self.btn_fill_cut_caps.setVisible(False)
+        post_row.addWidget(self.btn_assign_cut_mat)
+        post_row.addWidget(self.btn_fill_cut_caps)
+        cm_l.addLayout(post_row)
+        self.cut_mat_box.setVisible(False)
+        root.addWidget(self.cut_mat_box)
 
         root.addStretch(1)
+        return page
+
+    def _build_rebar_page(self) -> QtWidgets.QWidget:
+        page = QtWidgets.QWidget()
+        root = QtWidgets.QVBoxLayout(page)
+        root.setContentsMargins(10, 4, 10, 10)
+        root.setSpacing(8)
+
+        self.lbl_rebar_stale = QtWidgets.QLabel("")
+        self.lbl_rebar_stale.setStyleSheet(
+            "background-color: #422b0c; border: 1px solid #f59e0b; border-radius: 6px; "
+            "color: #fde68a; padding: 6px 8px; font-weight: bold;"
+        )
+        self.lbl_rebar_stale.setVisible(False)
+        root.addWidget(self.lbl_rebar_stale)
+
+        card = QtWidgets.QFrame()
+        card.setObjectName("Card")
+        c_l = QtWidgets.QVBoxLayout(card)
+        c_l.setContentsMargins(10, 10, 10, 10)
+        c_l.setSpacing(7)
+
+        # Target Mat + Eyedropper
+        m_row = QtWidgets.QHBoxLayout()
+        m_row.setSpacing(5)
+        self.cmb_rebar_mat = QtWidgets.QComboBox()
+        self.cmb_rebar_mat.currentIndexChanged.connect(self._on_rebar_mat_changed)
+        btn_rb_pick = QtWidgets.QPushButton("Pick")
+        btn_rb_pick.setIcon(_qicon("eyedropper"))
+        btn_rb_pick.setFixedWidth(72)
+        btn_rb_pick.clicked.connect(lambda: self._run_invoke_op(bpy.ops.fdt.rebar_pick_material, slot="TARGET"))
+        m_row.addWidget(self.cmb_rebar_mat, 1)
+        m_row.addWidget(btn_rb_pick)
+        c_l.addLayout(m_row)
+
+        # Density + Bar Size
+        p_row = QtWidgets.QHBoxLayout()
+        p_row.setSpacing(5)
+        self.cmb_rebar_density = QtWidgets.QComboBox()
+        for key, lbl in (
+            ("FINE", "Fine · 75mm"),
+            ("STANDARD", "Std · 150mm"),
+            ("COARSE", "Coarse · 250mm"),
+            ("SPARSE", "Sparse · 400mm"),
+            ("CUSTOM", "Custom"),
+        ):
+            self.cmb_rebar_density.addItem(lbl, key)
+        self.cmb_rebar_density.currentIndexChanged.connect(self._on_rebar_density_changed)
+
+        self.cmb_rebar_bar = QtWidgets.QComboBox()
+        for key in ("RB6", "RB9", "DB10", "DB12", "DB16", "DB20", "DB25", "CUSTOM"):
+            self.cmb_rebar_bar.addItem(key, key)
+        self.cmb_rebar_bar.currentIndexChanged.connect(self._on_rebar_bar_changed)
+        p_row.addWidget(self.cmb_rebar_density, 1)
+        p_row.addWidget(self.cmb_rebar_bar, 1)
+        c_l.addLayout(p_row)
+
+        meta_row = QtWidgets.QHBoxLayout()
+        self.lbl_rebar_est = QtWidgets.QLabel("~0 bars")
+        self.lbl_rebar_est.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        self.chk_rebar_debris = QtWidgets.QCheckBox("Concrete Debris")
+        self.chk_rebar_debris.toggled.connect(self._on_rebar_debris_toggled)
+        meta_row.addWidget(self.lbl_rebar_est, 1)
+        meta_row.addWidget(self.chk_rebar_debris)
+        c_l.addLayout(meta_row)
+
+        self.btn_rebar_create_extra = QtWidgets.QPushButton("Create Another Rebar")
+        self.btn_rebar_create_extra.setIcon(_qicon("plus_add"))
+        self.btn_rebar_create_extra.clicked.connect(lambda: self._run_op(bpy.ops.fdt.rebar_create))
+        self.btn_rebar_create_extra.setVisible(False)
+        c_l.addWidget(self.btn_rebar_create_extra)
+
+        self.btn_rebar_rebuild = QtWidgets.QPushButton("Re-apply Stale Rebar")
+        self.btn_rebar_rebuild.setObjectName("AmberHeroBtn")
+        self.btn_rebar_rebuild.setIcon(_qicon("rebuild_amber"))
+        self.btn_rebar_rebuild.clicked.connect(lambda: self._run_op(bpy.ops.fdt.rebar_rebuild))
+        self.btn_rebar_rebuild.setVisible(False)
+        c_l.addWidget(self.btn_rebar_rebuild)
+
+        self.rebar_target_wrap = QtWidgets.QWidget()
+        rt_l = QtWidgets.QVBoxLayout(self.rebar_target_wrap)
+        rt_l.setContentsMargins(0, 4, 0, 0)
+        rt_l.setSpacing(5)
+        self.lbl_rebar_target = QtWidgets.QLabel("")
+        self.lbl_rebar_target.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        rt_l.addWidget(self.lbl_rebar_target)
+        q_row = QtWidgets.QHBoxLayout()
+        q_row.setSpacing(4)
+        self.btn_rb_edit = QtWidgets.QPushButton("Edit")
+        self.btn_rb_edit.setIcon(_qicon("rename_pen"))
+        self.btn_rb_edit.clicked.connect(self._on_rebar_edit_clicked)
+        self.btn_rb_faces = QtWidgets.QPushButton("Faces")
+        self.btn_rb_faces.clicked.connect(self._on_rebar_faces_clicked)
+        self.btn_rb_clear = QtWidgets.QPushButton("Clear")
+        self.btn_rb_clear.clicked.connect(self._on_rebar_clear_clicked)
+        self.btn_rb_remove = QtWidgets.QPushButton("Remove")
+        self.btn_rb_remove.setObjectName("DangerBtn")
+        self.btn_rb_remove.setIcon(_qicon("trash_red"))
+        self.btn_rb_remove.clicked.connect(lambda: self._run_op(bpy.ops.fdt.rebar_remove))
+        q_row.addWidget(self.btn_rb_edit)
+        q_row.addWidget(self.btn_rb_faces)
+        q_row.addWidget(self.btn_rb_clear)
+        q_row.addWidget(self.btn_rb_remove)
+        rt_l.addLayout(q_row)
+        self.rebar_target_wrap.setVisible(False)
+        c_l.addWidget(self.rebar_target_wrap)
+
+        root.addWidget(card)
+        root.addStretch(1)
+        return page
+
+    # ------------------------------------------------------------------
+    # Tab & Operator Helpers
+    # ------------------------------------------------------------------
+
+    def _switch_tab(self, tab: str) -> None:
+        self._active_tab = tab
+        self.btn_tab_ab.setChecked(tab == "APPLE_BITE")
+        self.btn_tab_rb.setChecked(tab == "REBAR")
+        self.stack.setCurrentIndex(0 if tab == "APPLE_BITE" else 1)
+        with blender_view3d_override():
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
+            if settings is not None and settings.ui_active_tool != tab:
+                settings.ui_active_tool = tab
+        _tag_all_view3d_redraw()
+        self.refresh_from_blender()
 
     def _run_op(self, op_func, **kwargs) -> None:
         try:
@@ -740,6 +1091,58 @@ class FullDestrucWindow(QtWidgets.QWidget):
             self.guide_label.setText(f"Notice: {exc}")
         _tag_all_view3d_redraw()
         self.refresh_from_blender()
+
+    def _on_hero_commit_clicked(self) -> None:
+        if self._active_tab == "REBAR":
+            with blender_view3d_override():
+                rset = getattr(bpy.context.scene, "fdt_rebar_settings", None)
+                active = rebar_state.find_entry(rset.rebar_active_sid) if (rset and rset.rebar_active_sid) else None
+            if active is not None:
+                self._run_op(bpy.ops.fdt.rebar_bake)
+            else:
+                self._run_op(bpy.ops.fdt.rebar_create)
+        else:
+            self._run_op(bpy.ops.fdt.applebite_apply)
+
+    def _on_cancel_clicked(self) -> None:
+        n_cutters = 0
+        has_final = False
+        with blender_view3d_override():
+            session = load_session(bpy.context.scene)
+            if session is not None:
+                n_cutters = len(session.get_valid_cutters(include_muted=True))
+                fcol = session.get_collections().get("final")
+                has_final = fcol is not None and len(fcol.objects) > 0
+        if n_cutters > 0:
+            if has_final:
+                msg = (
+                    f"WARNING: You are re-editing an applied cut.\n\n"
+                    f"Canceling will delete ALL {n_cutters} cutter(s) AND the baked Final cut, "
+                    f"restoring the uncut original mesh.\n\n"
+                    f"Tip: Click 'Pause' instead if you want to keep your cutters."
+                )
+            else:
+                msg = f"Discard {n_cutters} cutter(s) and restore the original mesh?"
+            ans = QtWidgets.QMessageBox.question(
+                self,
+                "Cancel & Restore",
+                msg,
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if ans != QtWidgets.QMessageBox.Yes:
+                return
+        self._run_op(bpy.ops.fdt.applebite_cancel)
+
+    def _on_layers_drawer_toggled(self, checked: bool) -> None:
+        self.layer_scroll.setVisible(checked)
+        txt = self.btn_layers_toggle.text()
+        prefix = "▾" if checked else "▸"
+        self.btn_layers_toggle.setText(prefix + txt[1:] if txt else f"{prefix} Layers")
+
+    def _on_output_drawer_toggled(self, checked: bool) -> None:
+        self.output_drawer.setVisible(checked)
+        self.btn_output_toggle.setText("▾ Output Options" if checked else "▸ Output Options")
 
     def _active_zone_key(self) -> str:
         idx = self.cmb_zone.currentIndex()
@@ -764,24 +1167,28 @@ class FullDestrucWindow(QtWidgets.QWidget):
         if not val:
             return
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and settings.boolean_solver != val:
                 settings.boolean_solver = val
         _tag_all_view3d_redraw()
 
     def _on_gpu_fast_drag_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and bool(settings.gpu_fast_drag) != bool(checked):
                 settings.gpu_fast_drag = bool(checked)
         _tag_all_view3d_redraw()
 
+    def _on_viewport_dock_toggled(self, checked: bool) -> None:
+        with blender_view3d_override():
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
+            if settings is not None and bool(getattr(settings, "show_viewport_dock", True)) != bool(checked):
+                settings.show_viewport_dock = bool(checked)
+        _tag_all_view3d_redraw()
+
     def _on_rough_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and bool(settings.enable_rough) != bool(checked):
                 settings.enable_rough = bool(checked)
         _tag_all_view3d_redraw()
@@ -851,34 +1258,44 @@ class FullDestrucWindow(QtWidgets.QWidget):
             self.sld_rough_jagged.blockSignals(False)
         self._on_rough_param_changed("jaggedness", float(pct) / 100.0)
 
+    def _on_keep_main_toggled(self, checked: bool) -> None:
+        with blender_view3d_override():
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
+            if settings is not None and bool(settings.apply_keep_result) != bool(checked):
+                settings.apply_keep_result = bool(checked)
+        self.refresh_from_blender()
+
+    def _on_keep_pieces_toggled(self, checked: bool) -> None:
+        with blender_view3d_override():
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
+            if settings is not None and bool(settings.apply_keep_pieces) != bool(checked):
+                settings.apply_keep_pieces = bool(checked)
+        self.refresh_from_blender()
+
     def _on_auto_fill_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and bool(getattr(settings, "apply_auto_fill_caps", True)) != bool(checked):
                 settings.apply_auto_fill_caps = bool(checked)
         _tag_all_view3d_redraw()
 
     def _on_line_backfaces_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and bool(getattr(settings, "apply_line_backfaces", True)) != bool(checked):
                 settings.apply_line_backfaces = bool(checked)
         _tag_all_view3d_redraw()
 
     def _on_zone_grid_toggled(self, checked: bool) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and bool(settings.show_zone_grid) != bool(checked):
                 settings.show_zone_grid = bool(checked)
         _tag_all_view3d_redraw()
 
     def _on_preview_view_clicked(self, mode_id: str) -> None:
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None and getattr(settings, "preview_display_mode", "ALL") != mode_id:
                 settings.preview_display_mode = mode_id
         _tag_all_view3d_redraw()
@@ -889,8 +1306,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
             return
         mat_name = self.cmb_cut_mat.itemData(index)
         with blender_view3d_override():
-            scene = bpy.context.scene
-            settings = getattr(scene, "fdt_settings", None)
+            settings = getattr(bpy.context.scene, "fdt_settings", None)
             if settings is not None:
                 new_mat = bpy.data.materials.get(mat_name) if mat_name else None
                 if settings.cut_material != new_mat:
@@ -902,9 +1318,73 @@ class FullDestrucWindow(QtWidgets.QWidget):
         try:
             with blender_view3d_override():
                 bpy.ops.fdt.pick_surface_material("INVOKE_DEFAULT")
-            self.guide_label.setText("Eyedropper active: Click any surface in 3D View (ESC / RMB to cancel)")
+            self.guide_label.setText("Eyedropper active: Click any surface in 3D View (ESC / RMB cancel)")
         except Exception as exc:
             self.guide_label.setText(f"Notice: {exc}")
+
+    # --- Rebar callbacks ---
+
+    def _on_rebar_mat_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        mat_name = self.cmb_rebar_mat.itemData(index)
+        with blender_view3d_override():
+            rset = getattr(bpy.context.scene, "fdt_rebar_settings", None)
+            if rset is not None:
+                new_mat = bpy.data.materials.get(mat_name) if mat_name else None
+                if rset.target_material != new_mat:
+                    rset.target_material = new_mat
+        _tag_all_view3d_redraw()
+        self.refresh_from_blender()
+
+    def _on_rebar_density_changed(self, index: int) -> None:
+        val = self.cmb_rebar_density.itemData(index)
+        if not val:
+            return
+        with blender_view3d_override():
+            rset = getattr(bpy.context.scene, "fdt_rebar_settings", None)
+            if rset is not None and rset.density_preset != val:
+                rset.density_preset = val
+        _tag_all_view3d_redraw()
+
+    def _on_rebar_bar_changed(self, index: int) -> None:
+        val = self.cmb_rebar_bar.itemData(index)
+        if not val:
+            return
+        with blender_view3d_override():
+            rset = getattr(bpy.context.scene, "fdt_rebar_settings", None)
+            if rset is not None and rset.bar_size != val:
+                rset.bar_size = val
+        _tag_all_view3d_redraw()
+
+    def _on_rebar_debris_toggled(self, checked: bool) -> None:
+        with blender_view3d_override():
+            rset = getattr(bpy.context.scene, "fdt_rebar_settings", None)
+            if rset is not None and bool(rset.enable_debris) != bool(checked):
+                rset.enable_debris = bool(checked)
+        _tag_all_view3d_redraw()
+
+    def _rebar_target_sid(self) -> str:
+        with blender_view3d_override():
+            target, _hint = rebar_ops.resolve_remove_target(bpy.context)
+            return target.sid if target is not None else ""
+
+    def _on_rebar_edit_clicked(self) -> None:
+        sid = self._rebar_target_sid()
+        if sid:
+            self._run_op(bpy.ops.fdt.rebar_reedit, sid=sid)
+
+    def _on_rebar_faces_clicked(self) -> None:
+        sid = self._rebar_target_sid()
+        if sid:
+            self._run_op(bpy.ops.fdt.rebar_select_faces, sid=sid)
+
+    def _on_rebar_clear_clicked(self) -> None:
+        sid = self._rebar_target_sid()
+        if sid:
+            self._run_op(bpy.ops.fdt.rebar_clear_faces, sid=sid)
+
+    # --- Sync Helpers ---
 
     def _sync_cut_material_combo(self, settings) -> None:
         if settings is None:
@@ -919,7 +1399,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
 
         self.cmb_cut_mat.blockSignals(True)
         self.cmb_cut_mat.clear()
-        self.cmb_cut_mat.addItem("-- Select Cut Material (Default) --", "")
+        self.cmb_cut_mat.addItem("-- Cut Material (Unset) --", "")
         sel_idx = 0
         for idx, name in enumerate(mat_names, start=1):
             self.cmb_cut_mat.addItem(name, name)
@@ -929,10 +1409,37 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self.cmb_cut_mat.blockSignals(False)
 
         if cur_mat is None:
-            self.cmb_cut_mat.setStyleSheet("QComboBox { border: 1px solid #d9534f; }")
+            self.cmb_cut_mat.setStyleSheet("QComboBox { border: 1px solid #ef4444; }")
         else:
             self.cmb_cut_mat.setStyleSheet("")
         self.btn_assign_cut_mat.setEnabled(cur_mat is not None)
+
+    def _sync_rebar_mat_combo(self, rset) -> None:
+        if rset is None:
+            return
+        cur_mat = rset.target_material
+        cur_name = cur_mat.name if cur_mat is not None else ""
+        mat_names = sorted(m.name for m in bpy.data.materials if not m.name.startswith("Dots Stroke"))
+        sig = (cur_name, tuple(mat_names))
+        if sig == self._last_rebar_mat_sig:
+            return
+        self._last_rebar_mat_sig = sig
+
+        self.cmb_rebar_mat.blockSignals(True)
+        self.cmb_rebar_mat.clear()
+        self.cmb_rebar_mat.addItem("-- Target Material --", "")
+        sel_idx = 0
+        for idx, name in enumerate(mat_names, start=1):
+            self.cmb_rebar_mat.addItem(name, name)
+            if name == cur_name:
+                sel_idx = idx
+        self.cmb_rebar_mat.setCurrentIndex(sel_idx)
+        self.cmb_rebar_mat.blockSignals(False)
+
+        if cur_mat is None:
+            self.cmb_rebar_mat.setStyleSheet("QComboBox { border: 1px solid #ef4444; }")
+        else:
+            self.cmb_rebar_mat.setStyleSheet("")
 
     def _on_reset_original_clicked(self) -> None:
         sid = ""
@@ -958,11 +1465,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
             return
 
         extra = "\n(Includes all Cut Further & Final pieces)" if fam_count > 1 else ""
-        msg = (
-            f"Delete all cuts and restore original?\n\n"
-            f"Original: {display_names}\n"
-            f"Cut sessions to delete: {fam_count}{extra}"
-        )
+        msg = f"Delete all cuts and restore original?\n\nOriginal: {display_names}\nSessions: {fam_count}{extra}"
         ans = QtWidgets.QMessageBox.question(
             self,
             "Reset to Original",
@@ -998,8 +1501,8 @@ class FullDestrucWindow(QtWidgets.QWidget):
         self._last_cutter_sig = sig
 
         total = len(session.cutters)
-        self.layer_header.setVisible(total > 0)
-        self.layer_scroll.setVisible(total > 0)
+        prefix = "▾" if self.btn_layers_toggle.isChecked() else "▸"
+        self.btn_layers_toggle.setText(f"{prefix} Layers ({total})")
         if total == 0:
             self.cutter_layer_list.clear_rows()
             return
@@ -1013,24 +1516,22 @@ class FullDestrucWindow(QtWidgets.QWidget):
             row_l.setSpacing(4)
 
             grip = QtWidgets.QLabel(f"☰ #{idx + 1}")
-            grip.setFixedWidth(36)
-            grip.setStyleSheet("color: #9aa3b5; font-weight: bold; font-size: 11px; background: transparent;")
-            grip.setToolTip("Drag up/down to change cut priority")
+            grip.setFixedWidth(34)
+            grip.setStyleSheet("color: #8f9bb0; font-weight: bold; font-size: 11px; background: transparent;")
 
             r, g, b, _ = apple_bite.get_zone_color(entry.zone)
-            rgb_hex = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+            rgb_hex = f"#{int(r * 255):02x}{int(g * 255):02x}{int(b * 255):02x}"
 
-            btn_z = QtWidgets.QPushButton(zone_registry.zone_token(entry.zone, bpy.context.scene)[:12])
+            btn_z = QtWidgets.QPushButton(zone_registry.zone_token(entry.zone, bpy.context.scene)[:10])
             btn_z.setFixedWidth(26)
-            btn_z.setStyleSheet(f"background-color: {rgb_hex}; color: #111; font-weight: bold; padding: 3px;")
+            btn_z.setStyleSheet(f"background-color: {rgb_hex}; color: #111; font-weight: bold; padding: 2px;")
             btn_z.clicked.connect(lambda _=False, n=entry.name: self._run_op(bpy.ops.fdt.applebite_cycle_zone, cutter_name=n))
 
             lbl_name = QtWidgets.QLabel(entry.name)
-            lbl_name.setStyleSheet("color: #e6e8ec; padding-left: 2px; background: transparent;")
-            lbl_name.setToolTip("Click to select in 3D View, or drag up/down to reorder layer")
+            lbl_name.setStyleSheet("color: #e6eaf2; padding-left: 2px; background: transparent;")
 
             btn_up = QtWidgets.QPushButton("▲")
-            btn_up.setFixedWidth(24)
+            btn_up.setFixedWidth(22)
             btn_up.setEnabled(idx > 0)
             btn_up.setStyleSheet("padding: 2px;")
             btn_up.clicked.connect(
@@ -1038,7 +1539,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
             )
 
             btn_dn = QtWidgets.QPushButton("▼")
-            btn_dn.setFixedWidth(24)
+            btn_dn.setFixedWidth(22)
             btn_dn.setEnabled(idx < total - 1)
             btn_dn.setStyleSheet("padding: 2px;")
             btn_dn.clicked.connect(
@@ -1046,24 +1547,23 @@ class FullDestrucWindow(QtWidgets.QWidget):
             )
 
             btn_rough = QtWidgets.QPushButton("R" if entry.rough else "F")
-            btn_rough.setFixedWidth(26)
-            btn_rough.setToolTip("Toggle Rough / Flat Cut Edge")
-            if entry.rough:
-                btn_rough.setStyleSheet("background-color: #7c3aed; color: #fff; font-weight: bold; padding: 3px;")
-            else:
-                btn_rough.setStyleSheet("padding: 3px;")
+            btn_rough.setFixedWidth(24)
+            btn_rough.setStyleSheet(
+                "background-color: #9333ea; color: #fff; font-weight: bold; padding: 2px;"
+                if entry.rough
+                else "padding: 2px;"
+            )
             btn_rough.clicked.connect(lambda _=False, n=entry.name: self._run_op(bpy.ops.fdt.applebite_toggle_rough, cutter_name=n))
 
             btn_mute = QtWidgets.QPushButton("Off" if entry.muted else "On")
-            btn_mute.setFixedWidth(32)
-            btn_mute.setToolTip("Mute / Unmute Cutter")
-            btn_mute.setStyleSheet("padding: 3px;")
+            btn_mute.setFixedWidth(30)
+            btn_mute.setStyleSheet("padding: 2px;")
             btn_mute.clicked.connect(lambda _=False, n=entry.name: self._run_op(bpy.ops.fdt.applebite_toggle_mute, cutter_name=n))
 
-            btn_del = QtWidgets.QPushButton("X")
+            btn_del = QtWidgets.QPushButton("×")
             btn_del.setObjectName("DangerBtn")
-            btn_del.setFixedWidth(24)
-            btn_del.setStyleSheet("padding: 3px;")
+            btn_del.setFixedWidth(22)
+            btn_del.setStyleSheet("padding: 2px;")
             btn_del.clicked.connect(lambda _=False, n=entry.name: self._run_op(bpy.ops.fdt.applebite_delete_cutter, cutter_name=n))
 
             row_l.addWidget(grip)
@@ -1077,8 +1577,80 @@ class FullDestrucWindow(QtWidgets.QWidget):
             rows.append(row_w)
 
         self.cutter_layer_list.set_rows(rows)
-        scroll_h = min(self.cutter_layer_list.height() + 2, 240)
-        self.layer_scroll.setFixedHeight(max(48, scroll_h))
+        scroll_h = min(self.cutter_layer_list.height() + 2, 210)
+        self.layer_scroll.setFixedHeight(max(46, scroll_h))
+
+    def _refresh_rebar_page(self, context, scene) -> None:
+        rset = getattr(scene, "fdt_rebar_settings", None)
+        if rset is None:
+            self.sticky_footer.setVisible(False)
+            return
+        self._sync_rebar_mat_combo(rset)
+
+        d_idx = self.cmb_rebar_density.findData(str(rset.density_preset))
+        if d_idx >= 0 and self.cmb_rebar_density.currentIndex() != d_idx:
+            self.cmb_rebar_density.blockSignals(True)
+            self.cmb_rebar_density.setCurrentIndex(d_idx)
+            self.cmb_rebar_density.blockSignals(False)
+
+        b_idx = self.cmb_rebar_bar.findData(str(rset.bar_size))
+        if b_idx >= 0 and self.cmb_rebar_bar.currentIndex() != b_idx:
+            self.cmb_rebar_bar.blockSignals(True)
+            self.cmb_rebar_bar.setCurrentIndex(b_idx)
+            self.cmb_rebar_bar.blockSignals(False)
+
+        if self.chk_rebar_debris.isChecked() != bool(rset.enable_debris):
+            self.chk_rebar_debris.blockSignals(True)
+            self.chk_rebar_debris.setChecked(bool(rset.enable_debris))
+            self.chk_rebar_debris.blockSignals(False)
+
+        states = rebar_state.load_all_generators(scene)
+        stale_count = sum(1 for s in states.values() if s.entry.stale)
+        self.lbl_rebar_stale.setVisible(stale_count > 0)
+        if stale_count > 0:
+            self.lbl_rebar_stale.setText(f"⚠ {stale_count} rebar set(s) stale — press Re-apply then Bake")
+
+        active = rebar_state.find_entry(rset.rebar_active_sid, scene) if rset.rebar_active_sid else None
+        obj = context.active_object
+        has_mesh = bool(obj is not None and obj.type == "MESH")
+
+        if active is not None:
+            est = int(rset.rebar_estimate)
+        elif has_mesh and rset.target_material is not None:
+            faces = rebar_ops.resolve_faces(context, obj, rset)
+            est = rebar_ops.estimate_for(obj.data, faces, rebar_ops.settings_to_params(rset))
+        else:
+            est = 0
+        self.lbl_rebar_est.setText(
+            "Pick Target Mat first" if (rset.target_material is None and active is None) else f"~{est:,} bars"
+        )
+
+        self.btn_rebar_create_extra.setVisible(active is not None)
+        self.btn_rebar_create_extra.setEnabled(has_mesh)
+        self.btn_rebar_rebuild.setVisible(active is not None and bool(active.stale))
+
+        target, _hint = rebar_ops.resolve_remove_target(context)
+        self.rebar_target_wrap.setVisible(target is not None)
+        if target is not None:
+            self.lbl_rebar_target.setText(f"Target: {target.display_label} · {target.sid8}")
+
+        # Sticky footer in Rebar mode
+        self.sticky_footer.setVisible(True)
+        self.footer_sec_row.setVisible(False)
+        if active is not None:
+            self.summary_label.setText(
+                "Host changed · Re-apply then Bake"
+                if active.stale
+                else ("Baked · click Edit to adjust" if active.baked else "Live preview · press Bake to commit")
+            )
+            self.btn_hero_commit.setText("BAKE REBAR")
+            self.btn_hero_commit.setIcon(_qicon("apply_green"))
+            self.btn_hero_commit.setEnabled(has_mesh)
+        else:
+            self.summary_label.setText(f"Estimated: ~{est:,} bars")
+            self.btn_hero_commit.setText("CREATE REBAR")
+            self.btn_hero_commit.setIcon(_qicon("start_orange"))
+            self.btn_hero_commit.setEnabled(has_mesh and rset.target_material is not None)
 
     def refresh_from_blender(self) -> None:
         with blender_view3d_override():
@@ -1087,25 +1659,53 @@ class FullDestrucWindow(QtWidgets.QWidget):
             if scene is None:
                 return
             settings = getattr(scene, "fdt_settings", None)
-            session = load_session(scene)
+            if settings is not None:
+                cur_eng = getattr(settings, "boolean_solver", "RUST")
+                eng_idx = self.cmb_engine.findData(cur_eng)
+                if eng_idx >= 0 and self.cmb_engine.currentIndex() != eng_idx:
+                    self.cmb_engine.blockSignals(True)
+                    self.cmb_engine.setCurrentIndex(eng_idx)
+                    self.cmb_engine.blockSignals(False)
+                gpu_fd = bool(getattr(settings, "gpu_fast_drag", True))
+                if self.chk_gpu_fast_drag.isChecked() != gpu_fd:
+                    self.chk_gpu_fast_drag.blockSignals(True)
+                    self.chk_gpu_fast_drag.setChecked(gpu_fd)
+                    self.chk_gpu_fast_drag.blockSignals(False)
+                vdock = bool(getattr(settings, "show_viewport_dock", True))
+                if self.chk_viewport_dock.isChecked() != vdock:
+                    self.chk_viewport_dock.blockSignals(True)
+                    self.chk_viewport_dock.setChecked(vdock)
+                    self.chk_viewport_dock.blockSignals(False)
 
+            if self._active_tab == "REBAR":
+                self._refresh_rebar_page(context, scene)
+                return
+
+            session = load_session(scene)
             if session is None:
                 self.step1_widget.setVisible(True)
                 self.step2_widget.setVisible(False)
-                self.step3_widget.setVisible(False)
-                self.footer_widget.setVisible(False)
+                self.sticky_footer.setVisible(False)
                 info = apple_bite.detect_step1_action(context)
+                mode = info["mode"]
                 self.guide_label.setText(info["guide_text"])
-                self.btn_smart_start.setText(info["button_label"])
-                self.btn_smart_start.setEnabled(info["mode"] != "NONE")
-                show_reedit = info["mode"] == "BOTH" and bool(info["session_id"])
+
+                show_reedit = mode == "BOTH" and bool(info["session_id"])
                 self.btn_reedit_old.setVisible(show_reedit)
                 if show_reedit:
-                    self.btn_reedit_old.setText(info["reedit_label"])
-                show_reset = info["mode"] in ("BOTH", "REEDIT") and bool(info["session_id"])
+                    self.btn_reedit_old.setText("Re-edit Cut")
+                    self.btn_smart_start.setText("Cut Further")
+                else:
+                    self.btn_smart_start.setText(
+                        "Resume Cut" if mode == "REEDIT" else ("Start Cut" if mode == "START" else "Select Mesh")
+                    )
+                self.btn_smart_start.setEnabled(mode != "NONE")
+
+                show_reset = mode in ("BOTH", "REEDIT") and bool(info["session_id"])
                 self.btn_reset_original.setVisible(show_reset)
                 if show_reset:
-                    self.btn_reset_original.setText(info["reset_label"])
+                    self.btn_reset_original.setText("Reset to Original")
+
                 active_obj = context.active_object
                 has_mesh = (active_obj is not None and active_obj.type == "MESH") or any(
                     o.type == "MESH" for o in context.selected_objects
@@ -1115,49 +1715,70 @@ class FullDestrucWindow(QtWidgets.QWidget):
                 self.btn_assign_cut_mat.setVisible(show_reset)
                 self.btn_fill_cut_caps.setVisible(has_mesh)
                 if has_mesh:
-                    self.btn_fill_cut_caps.setText(
-                        "Fill Selected Cut Cap"
-                        if context.mode == "EDIT_MESH"
-                        else "Fill Cut Cap (Auto)"
-                    )
+                    self.btn_fill_cut_caps.setText("Fill Selected" if context.mode == "EDIT_MESH" else "Fill Cut Cap")
                 if show_cut_tools:
                     self._sync_cut_material_combo(settings)
                 self._last_cutter_sig = ()
                 return
 
+            # Active Apple Bite Session (count ONLY valid existing cutters!)
+            valid_all = session.get_valid_cutters(include_muted=True)
+            valid_active = session.get_valid_cutters(include_muted=False)
+            total_c = len(valid_all)
+            active_c = len(valid_active)
+            has_cutters = total_c > 0
+
             self.step1_widget.setVisible(False)
             self.step2_widget.setVisible(True)
-            self.footer_widget.setVisible(True)
-
-            has_cutters = len(session.cutters) > 0
-            self.step3_widget.setVisible(has_cutters)
+            self.phase_b_widget.setVisible(has_cutters)
             self.cut_mat_box.setVisible(has_cutters)
             self.btn_assign_cut_mat.setVisible(False)
             self.btn_fill_cut_caps.setVisible(False)
-            if has_cutters:
-                self._sync_cut_material_combo(settings)
+            self.sticky_footer.setVisible(True)
+            self.footer_sec_row.setVisible(True)
 
             if not has_cutters:
-                self.guide_label.setText(
-                    f"Step 2 ({session.session_id}): Click '+ Add Box' to spawn at center, then move with G / R / S"
-                )
+                self.guide_label.setText(f"{session.session_id} · Place a box or draw a cut in 3D View")
+                self.summary_label.setText("Waiting for first cutter…")
+                self.btn_hero_commit.setVisible(False)
             else:
-                self.guide_label.setText(
-                    f"Step 2 ({session.session_id}): Adjust boxes, use Gear wheel in 3D View, or click APPLY"
+                self.guide_label.setText(f"{session.session_id} · {total_c} cutter(s) active")
+                self._sync_cut_material_combo(settings)
+                self.btn_hero_commit.setVisible(True)
+                has_output = bool(
+                    settings is None or settings.apply_keep_result or settings.apply_keep_pieces
                 )
+                can_apply = has_output and active_c > 0
+                self.btn_hero_commit.setEnabled(can_apply)
+                self.btn_hero_commit.setIcon(_qicon("apply_green"))
+                cut_word = "Cut" if active_c == 1 else "Cuts"
+                self.btn_hero_commit.setText(f"APPLY · {active_c} {cut_word}" if active_c > 0 else "APPLY")
+
+                if not has_output:
+                    self.summary_label.setText("⚠ Output: None (enable Main Mesh or Zone Pieces)")
+                    self.summary_label.setStyleSheet("color: #f87171; font-size: 11px; font-weight: bold;")
+                elif active_c == 0:
+                    self.summary_label.setText("All cutters muted — unmute to apply")
+                    self.summary_label.setStyleSheet("color: #fbbf24; font-size: 11px;")
+                else:
+                    summary = apple_bite.get_apply_preview_summary(scene)
+                    zone_str = ", ".join(
+                        f"{zone_registry.zone_token(z, scene)}({n})"
+                        for z, n in sorted(summary["zone_counts"].items())
+                    ) or "None"
+                    self.summary_label.setText(f"Output: Main {summary['main_count']} · {zone_str}")
+                    self.summary_label.setStyleSheet("color: #a6b2c6; font-size: 11px;")
 
             self._rebuild_cutter_rows(session)
 
-            if has_cutters:
-                summary = apple_bite.get_apply_preview_summary(scene)
-                zone_str = ", ".join(
-                    f"{zone_registry.zone_token(z, scene)}({n})"
-                    for z, n in sorted(summary["zone_counts"].items())
-                ) or "None"
-                self.summary_label.setText(f"Output: Main {summary['main_count']} | Zones: {zone_str}")
-
             if settings is not None:
                 active_z = str(settings.active_zone or "A")
+                zdef_cur = zone_registry.resolve_zone(active_z, scene)
+                zr, zg, zb = zdef_cur.color[0], zdef_cur.color[1], zdef_cur.color[2]
+                self.zone_swatch.setStyleSheet(
+                    f"border-radius: 7px; background-color: rgb({int(zr * 255)}, {int(zg * 255)}, {int(zb * 255)});"
+                )
+
                 zdefs = zone_registry.load_zones(scene)
                 zone_items = [(z.key, z.token, z.key) for z in zdefs]
                 sig = tuple(zone_items)
@@ -1168,7 +1789,7 @@ class FullDestrucWindow(QtWidgets.QWidget):
                     for key, label, _desc in zone_items:
                         self.cmb_zone.addItem(label, key)
                     self.cmb_zone.blockSignals(False)
-                active_idx = next((i for i, (key, _label, _d) in enumerate(zone_items) if key == active_z), -1)
+                active_idx = next((i for i, (key, _l, _d) in enumerate(zone_items) if key == active_z), -1)
                 if active_idx >= 0 and self.cmb_zone.currentIndex() != active_idx:
                     self.cmb_zone.blockSignals(True)
                     self.cmb_zone.setCurrentIndex(active_idx)
@@ -1181,10 +1802,12 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         btn.setProperty("active", is_act)
                         btn.style().unpolish(btn)
                         btn.style().polish(btn)
+
                 if self.chk_rough.isChecked() != bool(settings.enable_rough):
                     self.chk_rough.blockSignals(True)
                     self.chk_rough.setChecked(bool(settings.enable_rough))
                     self.chk_rough.blockSignals(False)
+
                 any_rough = bool(settings.enable_rough) or any(c.rough for c in session.cutters)
                 if self.rough_params_box.isVisible() != any_rough:
                     self.rough_params_box.setVisible(any_rough)
@@ -1211,10 +1834,9 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         self.lbl_rough_target.setText(lbl_txt)
 
                     inward_pct = inward_val * 100.0
-                    inward_ipct = int(round(inward_pct))
-                    if not self.sld_rough_inward.isSliderDown() and self.sld_rough_inward.value() != inward_ipct:
+                    if not self.sld_rough_inward.isSliderDown() and self.sld_rough_inward.value() != int(round(inward_pct)):
                         self.sld_rough_inward.blockSignals(True)
-                        self.sld_rough_inward.setValue(inward_ipct)
+                        self.sld_rough_inward.setValue(int(round(inward_pct)))
                         self.sld_rough_inward.blockSignals(False)
                     if not self.spn_rough_inward.hasFocus() and abs(self.spn_rough_inward.value() - inward_pct) > 0.5:
                         self.spn_rough_inward.blockSignals(True)
@@ -1222,10 +1844,9 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         self.spn_rough_inward.blockSignals(False)
 
                     jagged_pct = jagged_val * 100.0
-                    jagged_ipct = int(round(jagged_pct))
-                    if not self.sld_rough_jagged.isSliderDown() and self.sld_rough_jagged.value() != jagged_ipct:
+                    if not self.sld_rough_jagged.isSliderDown() and self.sld_rough_jagged.value() != int(round(jagged_pct)):
                         self.sld_rough_jagged.blockSignals(True)
-                        self.sld_rough_jagged.setValue(jagged_ipct)
+                        self.sld_rough_jagged.setValue(int(round(jagged_pct)))
                         self.sld_rough_jagged.blockSignals(False)
                     if not self.spn_rough_jagged.hasFocus() and abs(self.spn_rough_jagged.value() - jagged_pct) > 0.5:
                         self.spn_rough_jagged.blockSignals(True)
@@ -1236,30 +1857,27 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         self.spn_rough_scale.blockSignals(True)
                         self.spn_rough_scale.setValue(r_scl)
                         self.spn_rough_scale.blockSignals(False)
-
                     if not self.spn_rough_subdiv.hasFocus() and self.spn_rough_subdiv.value() != r_sub:
                         self.spn_rough_subdiv.blockSignals(True)
                         self.spn_rough_subdiv.setValue(r_sub)
                         self.spn_rough_subdiv.blockSignals(False)
-
                     if not self.spn_rough_seed.hasFocus() and abs(self.spn_rough_seed.value() - r_seed) > 1e-4:
                         self.spn_rough_seed.blockSignals(True)
                         self.spn_rough_seed.setValue(r_seed)
                         self.spn_rough_seed.blockSignals(False)
-                auto_fill = bool(getattr(settings, "apply_auto_fill_caps", True))
-                if self.chk_auto_fill.isChecked() != auto_fill:
-                    self.chk_auto_fill.blockSignals(True)
-                    self.chk_auto_fill.setChecked(auto_fill)
-                    self.chk_auto_fill.blockSignals(False)
-                line_bf = bool(getattr(settings, "apply_line_backfaces", True))
-                if self.chk_line_backfaces.isChecked() != line_bf:
-                    self.chk_line_backfaces.blockSignals(True)
-                    self.chk_line_backfaces.setChecked(line_bf)
-                    self.chk_line_backfaces.blockSignals(False)
-                if self.chk_zone_grid.isChecked() != bool(settings.show_zone_grid):
-                    self.chk_zone_grid.blockSignals(True)
-                    self.chk_zone_grid.setChecked(bool(settings.show_zone_grid))
-                    self.chk_zone_grid.blockSignals(False)
+
+                for chk, val in (
+                    (self.chk_keep_main, bool(getattr(settings, "apply_keep_result", True))),
+                    (self.chk_keep_pieces, bool(getattr(settings, "apply_keep_pieces", True))),
+                    (self.chk_auto_fill, bool(getattr(settings, "apply_auto_fill_caps", True))),
+                    (self.chk_line_backfaces, bool(getattr(settings, "apply_line_backfaces", True))),
+                    (self.chk_zone_grid, bool(getattr(settings, "show_zone_grid", True))),
+                ):
+                    if chk.isChecked() != val:
+                        chk.blockSignals(True)
+                        chk.setChecked(val)
+                        chk.blockSignals(False)
+
                 cur_vm = str(getattr(settings, "preview_display_mode", "ALL") or "ALL")
                 for mid, btn in self._view_mode_buttons.items():
                     is_m = mid == cur_vm
@@ -1271,15 +1889,3 @@ class FullDestrucWindow(QtWidgets.QWidget):
                         btn.setProperty("active", is_m)
                         btn.style().unpolish(btn)
                         btn.style().polish(btn)
-            if settings is not None:
-                cur_eng = getattr(settings, "boolean_solver", "RUST")
-                eng_idx = self.cmb_engine.findData(cur_eng)
-                if eng_idx >= 0 and self.cmb_engine.currentIndex() != eng_idx:
-                    self.cmb_engine.blockSignals(True)
-                    self.cmb_engine.setCurrentIndex(eng_idx)
-                    self.cmb_engine.blockSignals(False)
-                gpu_fd = bool(getattr(settings, "gpu_fast_drag", True))
-                if self.chk_gpu_fast_drag.isChecked() != gpu_fd:
-                    self.chk_gpu_fast_drag.blockSignals(True)
-                    self.chk_gpu_fast_drag.setChecked(gpu_fd)
-                    self.chk_gpu_fast_drag.blockSignals(False)

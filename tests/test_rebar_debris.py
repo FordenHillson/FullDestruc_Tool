@@ -349,6 +349,11 @@ def test_e13_main_panel_has_tool_rail_on_the_left() -> None:
             self.tool_ops = []
             self.op_ids = []
             self.props = []
+            self.popovers = []
+            self.scale_x = 1.0
+            self.scale_y = 1.0
+            self.enabled = True
+            self.alert = False
 
         def box(self):
             return self
@@ -369,8 +374,11 @@ def test_e13_main_panel_has_tool_rail_on_the_left() -> None:
         def separator(self, **kwargs):
             return None
 
-        def label(self, text="", icon="NONE"):
+        def label(self, text="", **kwargs):
             pass
+
+        def popover(self, panel="", **kwargs):
+            self.popovers.append(str(panel))
 
         def prop(self, data, prop_name, **kwargs):
             assert hasattr(data, prop_name), prop_name
@@ -381,7 +389,8 @@ def test_e13_main_panel_has_tool_rail_on_the_left() -> None:
             op = _Op()
             op.depress = bool(kwargs.get("depress", False))
             if op_id == "fdt.set_active_tool":
-                self.tool_ops.append((kwargs.get("icon", ""), op))
+                ico = kwargs.get("icon", "") or kwargs.get("icon_value", 0)
+                self.tool_ops.append((ico, op))
             return op
 
     class _DummyPanel:
@@ -397,16 +406,15 @@ def test_e13_main_panel_has_tool_rail_on_the_left() -> None:
         panel.layout = layout
         FDT_PT_main_panel.draw(panel, bpy.context)
 
-        assert [icon for icon, _op in layout.tool_ops] == [
-            "MOD_BOOLEAN", "MOD_CURVE", "BRUSH_DATA", "MOD_ARRAY"
-        ]
+        assert all(bool(ico) for ico, _op in layout.tool_ops), layout.tool_ops
         tools = [op.tool for _icon, op in layout.tool_ops]
         assert tools == ["APPLE_BITE", "REBAR", "CLEANUP", "BATCH"], tools
         assert [op.depress for _icon, op in layout.tool_ops] == [False, True, False, False]
         assert "fdt.rebar_create" in layout.op_ids
         assert "fdt.applebite_smart_start" not in layout.op_ids
-        # Engine is Apple Bite's setting only — it must not float above Rebar.
+        # Engine belongs to Apple Bite Settings popover only — never floats above Rebar.
         assert "boolean_solver" not in layout.props
+        assert "FDT_PT_popover_settings" not in layout.popovers
 
         settings.ui_active_tool = "APPLE_BITE"
         layout = _Layout()
@@ -414,7 +422,7 @@ def test_e13_main_panel_has_tool_rail_on_the_left() -> None:
         FDT_PT_main_panel.draw(panel, bpy.context)
         assert "fdt.applebite_smart_start" in layout.op_ids
         assert "fdt.rebar_create" not in layout.op_ids
-        assert "boolean_solver" in layout.props
+        assert "FDT_PT_popover_settings" in layout.popovers
     finally:
         settings.ui_active_tool = previous_tool
 

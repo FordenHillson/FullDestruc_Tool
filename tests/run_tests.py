@@ -29,6 +29,7 @@ import test_rebar_debris
 import test_rebar_generate
 import test_rebar_state
 import test_rebar_ops
+import test_ui_redesign
 
 SUITES = (
     ("apple_bite", test_apple_bite),
@@ -37,6 +38,7 @@ SUITES = (
     ("rebar_generate", test_rebar_generate),
     ("rebar_state", test_rebar_state),
     ("rebar_ops", test_rebar_ops),
+    ("ui_redesign", test_ui_redesign),
 )
 
 

@@ -570,8 +570,39 @@ class FDT_OT_applebite_exit(bpy.types.Operator):
 class FDT_OT_applebite_cancel(bpy.types.Operator):
     bl_idname = "fdt.applebite_cancel"
     bl_label = "Cancel & Restore Originals"
-    bl_description = "Cancel Apple Bite, restore original meshes from Protected Vault, and remove temporary cuts"
+    bl_description = "ยกเลิกงานตัดทั้งหมดและคืนโมเดลต้นฉบับจาก Protected Vault (ถ้าต้องการเก็บกล่องตัดไว้แก้ต่อให้ใช้ Pause แทน)"
     bl_options = {"REGISTER", "UNDO"}
+
+    _confirm_cutter_count: int = 0
+    _confirm_has_final: bool = False
+
+    def invoke(self, context, event):
+        session = load_session(context.scene)
+        if session is None:
+            return self.execute(context)
+        valid_cutters = session.get_valid_cutters(include_muted=True)
+        if not valid_cutters:
+            return self.execute(context)
+        cols = session.get_collections()
+        final_col = cols.get("final")
+        has_final = final_col is not None and len(final_col.objects) > 0
+        self._confirm_cutter_count = len(valid_cutters)
+        self._confirm_has_final = has_final
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        layout = self.layout
+        n = self._confirm_cutter_count
+        if self._confirm_has_final:
+            warn = layout.box()
+            warn.alert = True
+            warn.label(text="WARNING: Re-edit Session!", icon="ERROR")
+            warn.label(text=f"Canceling deletes ALL {n} cutter(s) AND the baked Final cut,")
+            warn.label(text="restoring the uncut original mesh.")
+            layout.label(text="Tip: Use 'Pause' instead if you want to keep your cutters.", icon="INFO")
+        else:
+            layout.label(text=f"Discard {n} cutter(s) and restore original mesh?", icon="ERROR")
+            layout.label(text="Tip: Use 'Pause' if you want to resume later.", icon="INFO")
 
     def execute(self, context):
         _remove_hud_handler()

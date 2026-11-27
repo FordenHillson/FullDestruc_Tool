@@ -545,10 +545,15 @@ class FDT_SceneSettings(bpy.types.PropertyGroup):
         default=True,
     )
 
-    # Scrollable Cutter Layers UIList state
+    # Scrollable Cutter Layers UIList state (collapsed by default for minimal single-screen N-Panel)
     ui_show_cutter_layers: BoolProperty(
         name="Cutter Layers",
         description="เปิดหรือยุบรายการ Cutter Layers",
+        default=False,
+    )
+    show_viewport_dock: BoolProperty(
+        name="Viewport Action Dock",
+        description="แสดงแถบเครื่องมือลอยแบบมินิมอลที่ขอบล่างหน้าต่าง 3D Viewport ระหว่างทำงาน",
         default=True,
     )
     cutter_layer_items: CollectionProperty(type=FDT_CutterLayerItem)

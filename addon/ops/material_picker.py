@@ -124,11 +124,17 @@ class FDT_OT_pick_surface_material(bpy.types.Operator):
 
 def draw_cut_material_row(layout: bpy.types.UILayout, settings, text: str = "Cut Material") -> bpy.types.UILayout:
     """Draw Cut Material selector + Eyedropper button, highlighted red when unset (like Red_Panda)."""
+    from ..ui import icons
+
     row = layout.row(align=True)
     if settings.cut_material is None:
         row.alert = True
     row.prop(settings, "cut_material", text=text)
-    row.operator(FDT_OT_pick_surface_material.bl_idname, text="", icon="EYEDROPPER")
+    row.operator(
+        FDT_OT_pick_surface_material.bl_idname,
+        text="",
+        **icons.icon_kw("eyedropper", "EYEDROPPER"),
+    )
     return row
 
 

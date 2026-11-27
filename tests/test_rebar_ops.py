@@ -444,8 +444,11 @@ class _MockLayout:
     def separator(self, **kwargs):
         return None
 
-    def label(self, text="", icon="NONE"):
+    def label(self, text="", **kwargs):
         self.labels.append(text)
+        return None
+
+    def popover(self, panel="", **kwargs):
         return None
 
     def prop(self, data, prop_name, **kwargs):
@@ -543,9 +546,8 @@ def test_d19_expanded_panel_draws_all_operators() -> None:
         # there must be no ambiguous "Re-bake" wording anywhere.
         assert "Bake" in layout.operator_texts
         assert "fdt.rebar_rebuild" not in layout.operators
-        assert any("ปรับค่าเห็นผลทันที" in text for text in layout.labels)
+        assert any("Live preview" in text for text in layout.labels)
         # Identity/status text must not be inserted between the button rows.
-        assert not [text for text in layout.labels if "กำลังปรับ" in text]
         assert not [t for t in layout.operator_texts if "Re-bake" in t]
 
         # After a re-cut the extra button appears, but only then.
@@ -554,7 +556,7 @@ def test_d19_expanded_panel_draws_all_operators() -> None:
         draw_rebar(stale_layout, bpy.context)
         assert "fdt.rebar_rebuild" in stale_layout.operators
         assert "Re-apply" in stale_layout.operator_texts
-        assert any("ผิวเปลี่ยนแล้ว" in text for text in stale_layout.labels)
+        assert any("Host changed" in text for text in stale_layout.labels)
 
         settings.ui_show_rebar = False
         settings.ui_show_basics = True
@@ -649,7 +651,7 @@ def test_d27_remove_follows_viewport_selection() -> None:
         settings.ui_show_rebar = True
         layout = _MockLayout()
         draw_rebar(layout, bpy.context)
-        assert any("จะลบ:" in text and sid8_1 in text for text in layout.labels)
+        assert any("Target:" in text and sid8_1 in text for text in layout.labels)
 
         assert bpy.ops.fdt.rebar_remove() == {"FINISHED"}
         assert st.find_entry(sid1) is None
