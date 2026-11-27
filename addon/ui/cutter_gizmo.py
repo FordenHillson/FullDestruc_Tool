@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import blf
 import bmesh
 import bpy
@@ -768,10 +770,313 @@ class FDT_GGT_cutter_gear(bpy.types.GizmoGroup):
         self.gear_gizmo.matrix_basis = Matrix.Translation(pos)
 
 
+_ALLOWED_SELECT_TOOLS = frozenset({
+    "builtin.select",
+    "builtin.select_box",
+    "builtin.select_circle",
+    "builtin.select_lasso",
+    "builtin.move",
+    "builtin.rotate",
+    "builtin.scale",
+    "builtin.transform",
+})
+
+
+def _is_select_compatible_tool(context: bpy.types.Context) -> bool:
+    """Return True when the active Edit Mode tool expects LMB click to select elements."""
+    try:
+        ws = getattr(context, "workspace", None)
+        if ws is None:
+            return True
+        tool = ws.tools.from_space_view3d_mode("EDIT_MESH", create=False)
+        if tool is None:
+            return True
+        tid = str(getattr(tool, "idname", "") or "")
+        return (not tid) or (tid in _ALLOWED_SELECT_TOOLS)
+    except Exception:
+        return True
+
+
+def _ray_intersect_triangle(
+    orig: tuple[float, float, float],
+    direction: tuple[float, float, float],
+    v0: tuple[float, float, float],
+    v1: tuple[float, float, float],
+    v2: tuple[float, float, float],
+) -> float | None:
+    """Möller–Trumbore ray-triangle intersection. Returns ray distance t >= 0 or None."""
+    eps = 1e-7
+    e1x, e1y, e1z = v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]
+    e2x, e2y, e2z = v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]
+
+    hx = direction[1] * e2z - direction[2] * e2y
+    hy = direction[2] * e2x - direction[0] * e2z
+    hz = direction[0] * e2y - direction[1] * e2x
+
+    a = e1x * hx + e1y * hy + e1z * hz
+    if -eps < a < eps:
+        return None
+    f = 1.0 / a
+
+    sx, sy, sz = orig[0] - v0[0], orig[1] - v0[1], orig[2] - v0[2]
+    u = f * (sx * hx + sy * hy + sz * hz)
+    if u < -1e-6 or u > 1.0 + 1e-6:
+        return None
+
+    qx = sy * e1z - sz * e1y
+    qy = sz * e1x - sx * e1z
+    qz = sx * e1y - sy * e1x
+
+    v = f * (direction[0] * qx + direction[1] * qy + direction[2] * qz)
+    if v < -1e-6 or (u + v) > 1.0 + 1e-6:
+        return None
+
+    t = f * (e2x * qx + e2y * qy + e2z * qz)
+    return t if t >= 0.0 else None
+
+
+def _pick_cutter_face_index(
+    faces_data: list[
+        tuple[
+            int,
+            tuple[float, float, float],
+            tuple[float, float, float],
+            list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]],
+            bool,
+        ]
+    ],
+    mouse_xy: tuple[float, float],
+    project_2d,
+    ray_origin: tuple[float, float, float],
+    ray_dir: tuple[float, float, float],
+    *,
+    dot_radius_px: float = 18.0,
+    allow_body_raycast: bool = True,
+    shift_extend: bool = False,
+) -> int | None:
+    """Pick a face of the active Edit Mode cutter ignoring all other boxes/objects.
+
+    Pass 1 hits the always-visible face center dots within `dot_radius_px` (with cycling when
+    multiple dots overlap in screen space). Pass 2 raycasts directly against the active cutter's
+    own triangles (preferring nearest front-facing hit, then back-facing hit).
+    """
+    mx, my = float(mouse_xy[0]), float(mouse_xy[1])
+    ox, oy, oz = ray_origin
+    dx, dy, dz = ray_dir
+
+    # Pass 1: Face center dot hit-test (works even behind other boxes, walls, or front faces)
+    dot_hits: list[tuple[float, float, int, bool]] = []
+    selected_count = sum(1 for item in faces_data if item[4])
+    for fidx, center_w, _nrm_w, _tris, is_sel in faces_data:
+        p2 = project_2d(center_w)
+        if p2 is None:
+            continue
+        dist_2d = math.hypot(p2[0] - mx, p2[1] - my)
+        if dist_2d <= dot_radius_px:
+            depth = (center_w[0] - ox) * dx + (center_w[1] - oy) * dy + (center_w[2] - oz) * dz
+            dot_hits.append((dist_2d, depth, fidx, is_sel))
+
+    if dot_hits:
+        dot_hits.sort(key=lambda h: (round(h[0] / 5.0), h[1]))
+        if not shift_extend and len(dot_hits) > 1 and selected_count == 1:
+            for pos, (_d2, _dep, _fidx, is_sel) in enumerate(dot_hits):
+                if is_sel:
+                    return dot_hits[(pos + 1) % len(dot_hits)][2]
+        return dot_hits[0][2]
+
+    if not allow_body_raycast:
+        return None
+
+    # Pass 2: 3D raycast against ONLY the active cutter's own faces (ignores all other boxes!)
+    front_hits: list[tuple[float, int]] = []
+    back_hits: list[tuple[float, int]] = []
+    for fidx, _center_w, nrm_w, tris, _is_sel in faces_data:
+        best_t: float | None = None
+        for v0, v1, v2 in tris:
+            t = _ray_intersect_triangle(ray_origin, ray_dir, v0, v1, v2)
+            if t is not None and (best_t is None or t < best_t):
+                best_t = t
+        if best_t is None:
+            continue
+        ndotd = nrm_w[0] * dx + nrm_w[1] * dy + nrm_w[2] * dz
+        if ndotd < 0.0:
+            front_hits.append((best_t, fidx))
+        else:
+            back_hits.append((best_t, fidx))
+
+    if front_hits:
+        front_hits.sort(key=lambda h: h[0])
+        return front_hits[0][1]
+    if back_hits:
+        back_hits.sort(key=lambda h: h[0])
+        return back_hits[0][1]
+    return None
+
+
+class FDT_OT_cutter_pick_face(bpy.types.Operator):
+    """Select an Edit Mode cutter face directly even when occluded by other boxes or meshes."""
+
+    bl_idname = "fdt.cutter_pick_face"
+    bl_label = "Pick Cutter Face (Through Occlusion)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def invoke(self, context, event):
+        if context.area is None or context.area.type != "VIEW_3D":
+            return {"PASS_THROUGH"}
+        if context.scene is None or not has_active_session(context.scene):
+            return {"PASS_THROUGH"}
+
+        obj = context.active_object
+        if (
+            obj is None
+            or obj.type != "MESH"
+            or obj.mode != "EDIT"
+            or not bool(obj.get(CUTTER_PROP, False))
+        ):
+            return {"PASS_THROUGH"}
+
+        ts = getattr(context, "tool_settings", None)
+        sel_mode = tuple(ts.mesh_select_mode) if ts is not None else (True, False, False)
+        show_verts, show_edges, show_faces = bool(sel_mode[0]), bool(sel_mode[1]), bool(sel_mode[2])
+        if not show_faces:
+            return {"PASS_THROUGH"}
+
+        if not _is_select_compatible_tool(context):
+            return {"PASS_THROUGH"}
+
+        region = context.region
+        rv3d = context.region_data
+        if region is None or rv3d is None:
+            return {"PASS_THROUGH"}
+
+        me = obj.data
+        if me is None:
+            return {"PASS_THROUGH"}
+        try:
+            bm = bmesh.from_edit_mesh(me)
+        except Exception:
+            return {"PASS_THROUGH"}
+        if not bm or len(bm.faces) == 0:
+            return {"PASS_THROUGH"}
+
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        mw = obj.matrix_world
+        try:
+            nrm_mat = mw.to_3x3().inverted_safe().transposed()
+        except Exception:
+            nrm_mat = mw.to_3x3()
+
+        # Precompute world-space triangles per face (handles concave n-gons via calc_loop_triangles)
+        tris_by_face: dict[int, list[tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]]] = {}
+        try:
+            for lt in bm.calc_loop_triangles():
+                f = lt[0].face
+                if not f.is_valid or f.hide:
+                    continue
+                p0 = mw @ lt[0].vert.co
+                p1 = mw @ lt[1].vert.co
+                p2 = mw @ lt[2].vert.co
+                tris_by_face.setdefault(f.index, []).append(
+                    ((p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z), (p2.x, p2.y, p2.z))
+                )
+        except Exception:
+            tris_by_face = {}
+
+        faces_data = []
+        for f in bm.faces:
+            if not f.is_valid or f.hide or len(f.verts) < 3:
+                continue
+            cw = mw @ f.calc_center_median()
+            nw = (nrm_mat @ f.normal).normalized()
+            f_tris = tris_by_face.get(f.index)
+            if not f_tris:
+                wverts = [mw @ v.co for v in f.verts]
+                p0 = wverts[0]
+                f_tris = []
+                for k in range(1, len(wverts) - 1):
+                    p1, p2 = wverts[k], wverts[k + 1]
+                    f_tris.append(((p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z), (p2.x, p2.y, p2.z)))
+            faces_data.append(
+                (
+                    f.index,
+                    (cw.x, cw.y, cw.z),
+                    (nw.x, nw.y, nw.z),
+                    f_tris,
+                    bool(f.select),
+                )
+            )
+
+        if not faces_data:
+            return {"PASS_THROUGH"}
+
+        mouse_2d = (float(event.mouse_region_x), float(event.mouse_region_y))
+        ray_origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse_2d)
+        ray_dir = view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse_2d).normalized()
+        if not rv3d.is_perspective:
+            ray_origin = ray_origin - ray_dir * 10000.0
+
+        def _proj(pt: tuple[float, float, float]) -> tuple[float, float] | None:
+            p2 = view3d_utils.location_3d_to_region_2d(region, rv3d, Vector(pt))
+            return (float(p2.x), float(p2.y)) if p2 is not None else None
+
+        pure_face_mode = show_faces and not show_verts and not show_edges
+        picked_idx = _pick_cutter_face_index(
+            faces_data,
+            mouse_2d,
+            _proj,
+            (ray_origin.x, ray_origin.y, ray_origin.z),
+            (ray_dir.x, ray_dir.y, ray_dir.z),
+            dot_radius_px=18.0,
+            allow_body_raycast=pure_face_mode,
+            shift_extend=bool(event.shift),
+        )
+        if picked_idx is None:
+            return {"PASS_THROUGH"}
+
+        target_face = bm.faces[picked_idx] if 0 <= picked_idx < len(bm.faces) else None
+        if target_face is None or not target_face.is_valid:
+            return {"PASS_THROUGH"}
+
+        selected_indices = {f.index for f in bm.faces if f.is_valid and not f.hide and f.select}
+        new_active = target_face
+        if event.shift:
+            if picked_idx in selected_indices and bm.faces.active == target_face:
+                selected_indices.discard(picked_idx)
+                new_active = next(
+                    (bm.faces[i] for i in selected_indices if 0 <= i < len(bm.faces) and bm.faces[i].is_valid),
+                    None,
+                )
+            else:
+                selected_indices.add(picked_idx)
+                new_active = target_face
+        else:
+            selected_indices = {picked_idx}
+            new_active = target_face
+
+        for f in bm.faces:
+            f.select = False
+        for e in bm.edges:
+            e.select = False
+        for v in bm.verts:
+            v.select = False
+        for idx in selected_indices:
+            if 0 <= idx < len(bm.faces) and bm.faces[idx].is_valid:
+                bm.faces[idx].select_set(True)
+        bm.faces.active = new_active
+        bm.select_flush_mode()
+        bmesh.update_edit_mesh(me, loop_triangles=False, destructive=False)
+        context.area.tag_redraw()
+        return {"FINISHED"}
+
+
+_addon_keymaps: list[tuple[bpy.types.KeyMap, bpy.types.KeyMapItem]] = []
+
 CLASSES = (
     FDT_MT_cutter_wheel,
     FDT_OT_applebite_pick_axis,
     FDT_OT_applebite_pick_layer_target,
+    FDT_OT_cutter_pick_face,
     FDT_GGT_cutter_gear,
 )
 
@@ -779,10 +1084,33 @@ CLASSES = (
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
+    wm = getattr(bpy.context, "window_manager", None)
+    kc = wm.keyconfigs.addon if wm else None
+    if kc is not None:
+        km = kc.keymaps.new(name="Mesh", space_type="EMPTY")
+        kmi_click = km.keymap_items.new(
+            FDT_OT_cutter_pick_face.bl_idname,
+            type="LEFTMOUSE",
+            value="CLICK",
+        )
+        kmi_shift = km.keymap_items.new(
+            FDT_OT_cutter_pick_face.bl_idname,
+            type="LEFTMOUSE",
+            value="CLICK",
+            shift=True,
+        )
+        _addon_keymaps.append((km, kmi_click))
+        _addon_keymaps.append((km, kmi_shift))
 
 
 def unregister():
     global _active_axis_picker, _active_layer_picker
+    for km, kmi in _addon_keymaps:
+        try:
+            km.keymap_items.remove(kmi)
+        except Exception:
+            pass
+    _addon_keymaps.clear()
     if _active_axis_picker is not None:
         _active_axis_picker._cleanup(None)
     if _active_layer_picker is not None:
